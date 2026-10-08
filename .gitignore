@@ -1,0 +1,5 @@
+node_modules/
+.env
+# Runtime state and photos; keep the folder itself (Container Manager needs it to exist).
+data/*
+!data/.gitkeep

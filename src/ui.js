@@ -1,0 +1,122 @@
+// The status page served at http://<nas>:<HTTP_PORT>/
+export const UI_HTML = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Photo frame</title>
+<style>
+  :root { --bg:#f6f5f2; --card:#fff; --ink:#1d1f22; --muted:#6b6f76; --line:#e3e1dc; --accent:#2f5d50; --on-accent:#fff; --warn:#a33a2c; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#16181b; --card:#1f2226; --ink:#e9e7e2; --muted:#9aa0a6; --line:#2e3238; --accent:#7fb8a4; --on-accent:#0f1c18; --warn:#e07a6a; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font:15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background:var(--bg); color:var(--ink); }
+  main { max-width:1100px; margin:0 auto; padding:24px 16px 48px; display:grid; gap:20px; grid-template-columns:minmax(0,1fr) minmax(0,1fr); }
+  header { grid-column:1/-1; display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; }
+  h1 { font-size:22px; margin:0; font-weight:650; }
+  .chip { font-size:13px; padding:2px 10px; border-radius:99px; border:1px solid var(--line); color:var(--muted); }
+  .chip.busy { color:var(--accent); border-color:var(--accent); }
+  .frame { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; }
+  .frame img { width:100%; height:auto; display:block; border-radius:4px; background:#ccc; }
+  .tabs { display:flex; gap:6px; margin-bottom:10px; flex-wrap:wrap; }
+  .tabs button, .actions button { font:inherit; border:1px solid var(--line); background:var(--card); color:var(--ink); border-radius:8px; padding:6px 12px; cursor:pointer; }
+  .tabs button.on { border-color:var(--accent); color:var(--accent); }
+  .actions { display:flex; gap:8px; flex-wrap:wrap; }
+  .actions button.primary { background:var(--accent); border-color:var(--accent); color:var(--on-accent); font-weight:600; }
+  .actions button:disabled { opacity:.5; cursor:default; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; display:grid; gap:14px; align-content:start; align-self:start; }
+  dl { margin:0; display:grid; grid-template-columns:auto 1fr; gap:6px 14px; }
+  dt { color:var(--muted); } dd { margin:0; overflow-wrap:anywhere; }
+  .err { color:var(--warn); }
+  .muted { color:var(--muted); font-size:13px; }
+  #sources { display:grid; gap:8px; grid-template-columns:1fr 1fr; }
+  #sources img { width:100%; border-radius:4px; }
+  a { color:var(--accent); }
+  @media (max-width:760px) { main { grid-template-columns:1fr; } }
+</style>
+</head>
+<body>
+<main>
+  <header><h1>Photo frame</h1><span id="state" class="chip">…</span></header>
+  <section class="frame">
+    <div class="tabs">
+      <button data-view="preview" class="on">As it will look</button>
+      <button data-view="sources">Original photos</button>
+      <button data-view="test">Test pattern</button>
+    </div>
+    <div id="view"></div>
+    <p class="muted" id="viewnote"></p>
+  </section>
+  <section class="card">
+    <div class="actions">
+      <button class="primary" data-act="next">Next photo now</button>
+      <button data-act="resend">Send again</button>
+      <button data-act="test-pattern">Show test pattern</button>
+      <button data-act="refresh-album">Re-read album</button>
+    </div>
+    <dl id="info"></dl>
+    <div id="error" class="err"></div>
+    <div><strong>Recent</strong><dl id="history" style="margin-top:8px"></dl></div>
+  </section>
+</main>
+<script>
+let view = 'preview', last = null;
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
+const fmt = (t) => t ? new Date(t).toLocaleString([], { dateStyle:'medium', timeStyle:'short' }) : '–';
+const day = (t) => t ? new Date(t).toLocaleDateString([], { dateStyle:'long' }) : 'unknown date';
+function renderView(s) {
+  const v = Date.now();
+  let html = '', note = '';
+  if (view === 'preview') {
+    if (s.current) { html = '<a href="/img/current/preview.png?' + v + '" target="_blank"><img src="/img/current/preview.jpg?' + s.current.renderedAt + '" alt="preview"></a>';
+      note = 'Simulated with the measured ink colours as your eye sees them, from a distance. Click for the full-size dither.'; }
+    else html = '<p class="muted">Nothing rendered yet. Press “Next photo now”.</p>';
+  } else if (view === 'sources') {
+    if (s.current) html = '<div id="sources">' + s.current.items.map((it, i) => '<img src="/img/current/source-' + (i+1) + '.jpg?' + s.current.renderedAt + '" alt="">').join('') + '</div>';
+  } else {
+    html = s.testPattern ? '<img src="/img/testpattern/preview.png?' + s.testPattern.at + '" alt="test pattern">' : '<p class="muted">Press “Show test pattern” to send one.</p>';
+    note = 'Use it once to check orientation (TOP at the top), colours and whether the display re-processes the image.';
+  }
+  $('#view').innerHTML = html; $('#viewnote').textContent = note;
+}
+function render(s) {
+  last = s;
+  $('#state').textContent = s.busy ? s.busy.what + '…' : 'idle';
+  $('#state').className = 'chip' + (s.busy ? ' busy' : '');
+  document.querySelectorAll('.actions button').forEach((b) => b.disabled = !!s.busy);
+  const c = s.current;
+  const tpShowing = s.testPattern && s.testPattern.sent && (!c || !c.pushedAt || s.testPattern.at > c.pushedAt);
+  const onFrame = tpShowing ? 'the test pattern (until the next update)'
+    : c ? c.items.map((it) => day(it.takenAt)).join(' + ') + (c.dryRun ? ' <span class="muted">(dry run: EMDX_HOST not set)</span>' : c.pushed ? '' : ' <span class="err">(not on the display yet)</span>') : '–';
+  const rows = [
+    ['On the frame', onFrame],
+    ['Layout', c ? esc(c.kind) : '–'],
+    ['Sent', c && c.pushedAt ? fmt(c.pushedAt) : '–'],
+    ['Next update', fmt(s.nextRun)],
+    ['Battery', s.battery ? esc(s.battery.batteryPercent + '%' + (s.battery.pluggedIn ? ' (charging)' : '')) : '–'],
+    ['This round', s.cycle ? esc(s.cycle.shown + ' of ' + s.cycle.total + ' photos shown (round ' + s.cycle.n + ')') : '–'],
+    ['Album', s.library ? esc(s.library.titles.join(', ') + ' · ' + s.library.count + ' photos · read ' ) + fmt(s.library.fetchedAt) : '–'],
+  ];
+  $('#info').innerHTML = rows.map(([k, v]) => '<dt>' + k + '</dt><dd>' + v + '</dd>').join('');
+  $('#error').textContent = s.lastError ? 'Last problem (' + fmt(s.lastError.at) + '): ' + s.lastError.message : '';
+  $('#history').innerHTML = (s.history || []).slice(0, 8).map((h) => '<dt>' + fmt(h.at) + '</dt><dd>' + (h.ok ? esc(h.kind) + (h.dates && h.dates.length ? ' · ' + h.dates.map(day).join(' + ') : '') : '<span class="err">' + esc(h.error) + '</span>') + '</dd>').join('');
+  renderView(s);
+}
+async function refresh() {
+  try { const r = await fetch('/api/status'); render(await r.json()); } catch (e) { $('#state').textContent = 'offline'; }
+  setTimeout(refresh, last && last.busy ? 2500 : 15000);
+}
+document.querySelectorAll('.tabs button').forEach((b) => b.onclick = () => {
+  view = b.dataset.view; document.querySelectorAll('.tabs button').forEach((x) => x.classList.toggle('on', x === b)); if (last) renderView(last);
+});
+document.querySelectorAll('.actions button').forEach((b) => b.onclick = async () => {
+  b.disabled = true;
+  const r = await fetch('/api/' + b.dataset.act, { method:'POST' });
+  if (!r.ok) { const j = await r.json().catch(() => ({})); alert(j.error || 'Failed'); }
+  if (b.dataset.act === 'test-pattern') { view = 'test'; document.querySelectorAll('.tabs button').forEach((x) => x.classList.toggle('on', x.dataset.view === 'test')); }
+  setTimeout(async () => { const r2 = await fetch('/api/status'); render(await r2.json()); }, 600);
+});
+refresh();
+</script>
+</body>
+</html>`;

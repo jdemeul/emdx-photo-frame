@@ -1,0 +1,15 @@
+services:
+  photo-frame:
+    build: .
+    image: emdx-photo-frame:latest
+    container_name: emdx-photo-frame
+    # Host networking: the display downloads each image from this container's
+    # web server, and Wake-on-LAN broadcasts must reach the LAN.
+    network_mode: host
+    restart: unless-stopped
+    init: true
+    env_file: .env
+    volumes:
+      - ./data:/data
+      # Optional extra source: a folder of photos on the NAS (then set PHOTO_DIR=/photos)
+      # - /volume1/photo/frame:/photos:ro

@@ -1,0 +1,40 @@
+{
+  "name": "emdx-photo-frame",
+  "version": "1.0.0",
+  "description": "Shows a different photo from a shared Google Photos album on a Samsung EMDX e-paper display every day, with smart cropping and Spectra 6 dithering.",
+  "keywords": [
+    "e-paper",
+    "eink",
+    "samsung",
+    "emdx",
+    "spectra-6",
+    "dithering",
+    "google-photos",
+    "synology",
+    "photo-frame"
+  ],
+  "homepage": "https://github.com/jdemeul/emdx-photo-frame#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jdemeul/emdx-photo-frame.git"
+  },
+  "author": "Jonas Demeulemeester",
+  "license": "MIT",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "emdx-photo-frame": "src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js serve",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@weejewel/samsung-mdc": "^1.0.1",
+    "croner": "^10.0.1",
+    "sharp": "^0.35.5"
+  }
+}
