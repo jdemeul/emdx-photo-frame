@@ -6,7 +6,7 @@ It runs as a single Docker container. It was written for a Synology NAS (tested 
 
 - **Shuffle without repeats:** every photo in the album is shown once before anything repeats. Photos added to the album later join the current round.
 - **Odd shapes get paired:** on a portrait frame, landscape and square photos are shown two at a time, stacked, preferably two taken around the same time. Portrait photos fill the frame on their own, smart-cropped around the most interesting part.
-- **Dithering on the NAS:** colours are mapped into the gamut of the measured Spectra 6 inks, then dithered with a blue-noise mask. Greys use only black and white, skin only white/red/yellow, and you get no worm or streak artefacts.
+- **The display does the final dithering:** the NAS crops, tones and sends the photo, and the panel's own algorithm turns it into ink dots. A NAS-side ditherer (gamut mapping plus blue noise) is included as `DITHER=local`, but on the EM32DX the panel's own processing looked clearly better side by side (see [Findings](#findings-nas-vs-panel-dithering)).
 
 ## 1. What you need
 
@@ -36,7 +36,7 @@ Open `http://<NAS-IP>:8321`.
 1. Press **Show test pattern** and walk over to the display. The panel takes 20–50 s to redraw.
    - **"▲ TOP"** must be at the top and all four corner marks visible. If it is sideways or upside down, set `ROTATE=90`, `180` or `270` in `.env` and restart the project.
    - The **six swatches** should be the six inks.
-   - Compare the two sets of colour bands. If the **"Dithered by the NAS"** bands look clean and the 1-px patterns look like even grey, the display shows our pixels as sent. If the display's own processing (the **"Smooth"** bands) looks better to you, set `DITHER=device`.
+   - The two sets of colour bands compare the NAS ditherer (`DITHER=local`) with the display's own processing (**"Smooth"**, the default `DITHER=device`). On an EM32DX the display's own looked better. If the NAS bands look better on your panel, set `DITHER=local`.
 2. Press **Next photo now**.
 
 From then on it updates every day at 06:00 (`SCHEDULE`). If the display can't be reached, it retries 3× at 20-minute intervals.
@@ -70,23 +70,23 @@ Other commands (`docker exec emdx-photo-frame node src/index.js <cmd>` on the NA
 | `PANEL` / `ORIENTATION` / `ROTATE` | EM32DX / landscape / 0 | EM13DX also known; or set `PANEL_WIDTH`/`PANEL_HEIGHT` |
 | `SCHEDULE`, `TZ` | `0 6 * * *`, Europe/Brussels | Cron syntax |
 | `ODD_PHOTOS` | pair | `pair`, `crop` (smart-crop to fill) or `fit` (white margin) |
-| `DITHER` | local | `device` sends the toned photo and lets the display dither |
-| `DITHER_METHOD` | bluenoise | `diffusion` for classic error diffusion (`DITHER_KERNEL`: floyd-steinberg, stucki, jarvis, sierra, atkinson) |
-| `SATURATION`, `CONTRAST`, `GAMMA`, `SHARPEN` | 1.3, 0.25, 1.0, 0.8 | Tone tweaks before dithering |
-| `PALETTE` | measured Spectra 6 | JSON of measured ink colours, if you photograph/measure your own panel |
-| `OUTPUT_COLORS` | device | `measured` writes the measured RGB values into the PNG instead of pure colours |
+| `DITHER` | device | The display dithers. `local` dithers on the NAS instead (see [Findings](#findings-nas-vs-panel-dithering)) |
+| `SATURATION`, `CONTRAST` | 1.0, 0.1 | Tone tweaks before sending. With `DITHER=local` the defaults are 1.3, 0.25 |
+| `GAMMA`, `SHARPEN` | 1.0, 0.8 | Midtone lift and sharpening before sending |
+| `DITHER_METHOD` | bluenoise | `DITHER=local` only. `diffusion` for classic error diffusion (`DITHER_KERNEL`: floyd-steinberg, stucki, jarvis, sierra, atkinson) |
+| `PALETTE` | measured Spectra 6 | `DITHER=local` only. JSON of measured ink colours, if you photograph/measure your own panel |
+| `OUTPUT_COLORS` | device | `DITHER=local` only. `measured` writes the measured RGB values into the PNG instead of pure colours |
 | `UI_PASSWORD` | — | Protects the web page (basic auth) |
 
 ## 6. How it works
 
 1. **Album.** Google closed the Photos Library API for existing albums in March 2025. The official alternatives are the Picker API (pick by hand) and the Ambient API (partner program only). So this reads the album the way its public web page does: the first page of items is embedded in the HTML, and later pages come from the same endpoint the page uses. This is unofficial and may break if Google changes the page. The last good list is cached, so the frame keeps going meanwhile. Videos are skipped.
 2. **Crop/layout.** libvips' attention-based smart crop (sharp) is used, with EXIF orientation honoured. Pairs split the frame in proportion to the photos' shapes, so both lose about the same amount.
-3. **Tone.** Gentle auto-levels, an S-curve and a saturation boost are applied in Oklab.
-4. **Gamut.** The image's white and black are mapped to the paper white and ink black. Colours the inks can't make are pulled toward grey until they fit inside the convex hull of the six measured ink colours, which is everything dithering can reproduce.
-5. **Dither.** Each colour is written as an exact mix of at most five inks: a grey from black and white, plus the hull face around its hue. A 64×64 blue-noise mask then picks one ink per pixel in those proportions. The PNG sent to the display uses pure colours (#FF0000 etc.). The preview on the web page uses the measured colours.
-6. **Push.** The NAS sends Wake-on-LAN, connects with Samsung MDC (TLS + PIN) and sends command `0xC7` with a URL. The display then downloads a small JSON schedule and the PNG from this container. This trick comes from [node-samsung-emdx](https://github.com/WeeJeWel/node-samsung-emdx), and the MDC client from [@weejewel/samsung-mdc](https://github.com/WeeJeWel/node-samsung-mdc), both by Emile Nijssen.
-
-The measured palette comes from [epdoptimize](https://github.com/paperlesspaper/epdoptimize). The album item format follows [google-photos-album-image-url-fetch](https://github.com/yumetodo/google-photos-album-image-url-fetch) and [gphotos-scraper](https://github.com/jmsalazardev/gphotos-scraper).
+3. **Tone.** Gentle auto-levels, an S-curve and (optionally) a saturation boost are applied in Oklab.
+4. **Dither.** By default the NAS sends the toned photo as a PNG at the panel's native resolution and the display dithers it. With `DITHER=local` the NAS does it instead:
+   - *Gamut:* the image's white and black are mapped to the paper white and ink black. Colours the inks can't make are pulled toward grey until they fit inside the convex hull of the six measured ink colours, which is everything dithering can reproduce.
+   - *Dither:* each colour is written as an exact mix of at most five inks: a grey from black and white, plus the hull face around its hue. A 64×64 blue-noise mask then picks one ink per pixel in those proportions. The PNG uses pure colours (#FF0000 etc.); the web preview uses the measured colours.
+5. **Push.** The NAS sends Wake-on-LAN, connects with Samsung MDC (TLS + PIN) and sends command `0xC7` with a URL. The display then downloads a small JSON schedule and the PNG from this container. This trick comes from [node-samsung-emdx](https://github.com/WeeJeWel/node-samsung-emdx), and the MDC client from [@weejewel/samsung-mdc](https://github.com/WeeJeWel/node-samsung-mdc), both by Emile Nijssen.
 
 ## 7. Troubleshooting
 
@@ -94,10 +94,26 @@ The measured palette comes from [epdoptimize](https://github.com/paperlesspaper/
 - **"Incorrect PIN"**: check `EMDX_PIN`. After several wrong PINs the display may block MDC for a while.
 - **"Could not connect"**: the display is asleep or offline. Set `EMDX_MAC` for Wake-on-LAN, check Network Standby, or raise `WAKE_WAIT_SEC`.
 - **Album errors**: run `check-album`. If it fails while the link opens fine in a browser, Google probably changed the page format. The frame keeps using the cached list in the meantime.
-- **Photos too dark or flat on the panel**: try `GAMMA=1.15`, `CONTRAST=0.35` or `SATURATION=1.5`.
+- **Photos too dark or flat on the panel**: try `SATURATION=1.15`, `CONTRAST=0.2` or `GAMMA=1.15`.
 - **Project won't start, `./data` not found**: create an empty `data` folder next to `docker-compose.yml`.
 
 Logs: Container Manager → Container → emdx-photo-frame → Log.
+
+## Findings: NAS vs panel dithering
+
+The test pattern shows the same colour bands twice: dithered on the NAS, and left to the display. Zoomed in on a phone photo of an EM32DX (left: NAS, right: panel; rows: dark grey, green/blue, red/orange):
+
+![NAS dithering (left) vs the panel's own (right)](docs/dither-nas-vs-panel.jpg)
+
+- **Colour:** the panel trades lightness for saturation. It shows a real orange, a dark green and an actual blue, where the NAS version keeps the original lightness and comes out pale (salmon, grey-teal, hardly any blue).
+- **Texture:** in dark greys the NAS mixes only black and white, which leaves bright specks on black. The panel mixes black with blue, a much quieter texture.
+- **Brightness:** the two grey ramps are about equally bright, and the display shows the NAS image pixel for pixel (the blue-noise pattern is visible). So the difference is the algorithm: Samsung's is tuned to its own inks.
+
+Beating it on the NAS would take a chroma-preserving gamut mapping, low-contrast ink pairs for dark tones, and calibration against photos of the panel.
+
+## Credits
+
+The measured palette comes from [epdoptimize](https://github.com/paperlesspaper/epdoptimize). The album item format follows [google-photos-album-image-url-fetch](https://github.com/yumetodo/google-photos-album-image-url-fetch) and [gphotos-scraper](https://github.com/jmsalazardev/gphotos-scraper).
 
 ## Development
 

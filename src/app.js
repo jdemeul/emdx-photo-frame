@@ -302,6 +302,7 @@ export class FrameApp {
       lastError: st.lastError || null,
       history: st.history.slice(0, 10),
       testPattern: st.testPattern || null,
+      dither: this.cfg.image.dither,
     };
   }
 }

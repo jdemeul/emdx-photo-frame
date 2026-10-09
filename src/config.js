@@ -118,6 +118,10 @@ export function loadConfig() {
   const displayHost = str('EMDX_HOST');
   const httpPort = num('HTTP_PORT', 8321);
 
+  // Default: let the display do the final dithering. On the EM32DX its own algorithm
+  // beat the NAS ditherer side by side (deeper colours, quieter dark tones).
+  const dither = oneOf('DITHER', 'device', ['device', 'local']);
+
   const cfg = {
     dataDir: str('DATA_DIR', '/data'),
     albumUrls,
@@ -165,11 +169,12 @@ export function loadConfig() {
     },
 
     image: {
-      dither: oneOf('DITHER', 'local', ['local', 'device']),
+      dither,
       method: oneOf('DITHER_METHOD', 'bluenoise', ['bluenoise', 'diffusion']),
       kernel: oneOf('DITHER_KERNEL', 'floyd-steinberg', ['floyd-steinberg', 'stucki', 'jarvis', 'sierra', 'atkinson']),
-      saturation: num('SATURATION', 1.3),
-      contrast: num('CONTRAST', 0.25),
+      // The display boosts colour itself, so start gentler when it does the dithering.
+      saturation: num('SATURATION', dither === 'device' ? 1.0 : 1.3),
+      contrast: num('CONTRAST', dither === 'device' ? 0.1 : 0.25),
       gamma: num('GAMMA', 1.0),
       autoLevels: bool('AUTO_LEVELS', true),
       sharpen: num('SHARPEN', 0.8),

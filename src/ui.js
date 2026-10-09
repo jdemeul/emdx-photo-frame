@@ -39,7 +39,7 @@ export const UI_HTML = `<!doctype html>
   <header><h1>Photo frame</h1><span id="state" class="chip">…</span></header>
   <section class="frame">
     <div class="tabs">
-      <button data-view="preview" class="on">As it will look</button>
+      <button data-view="preview" class="on">Preview</button>
       <button data-view="sources">Original photos</button>
       <button data-view="test">Test pattern</button>
     </div>
@@ -69,7 +69,9 @@ function renderView(s) {
   let html = '', note = '';
   if (view === 'preview') {
     if (s.current) { html = '<a href="/img/current/preview.png?' + v + '" target="_blank"><img src="/img/current/preview.jpg?' + s.current.renderedAt + '" alt="preview"></a>';
-      note = 'Simulated with the measured ink colours as your eye sees them, from a distance. Click for the full-size dither.'; }
+      note = s.dither === 'device'
+        ? 'The photo as sent. The display dithers it itself, so on the panel the colours look softer. Click for full size.'
+        : 'Simulated with the measured ink colours as your eye sees them, from a distance. Click for the full-size dither.'; }
     else html = '<p class="muted">Nothing rendered yet. Press “Next photo now”.</p>';
   } else if (view === 'sources') {
     if (s.current) html = '<div id="sources">' + s.current.items.map((it, i) => '<img src="/img/current/source-' + (i+1) + '.jpg?' + s.current.renderedAt + '" alt="">').join('') + '</div>';

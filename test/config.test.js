@@ -1,0 +1,43 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import sharp from 'sharp';
+import { loadConfig, DEVICE_PALETTE } from '../src/config.js';
+import { buildPaletteModel } from '../src/color.js';
+import { composeCanvas, renderCanvas } from '../src/render.js';
+
+function withEnv(vars, fn) {
+  const saved = {};
+  for (const k of Object.keys(vars)) { saved[k] = process.env[k]; if (vars[k] == null) delete process.env[k]; else process.env[k] = vars[k]; }
+  try { return fn(); } finally {
+    for (const k of Object.keys(vars)) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
+  }
+}
+
+test('the display does the dithering by default, with gentler tone defaults', () => {
+  const dev = withEnv({ DITHER: null, SATURATION: null, CONTRAST: null }, loadConfig);
+  assert.equal(dev.image.dither, 'device');
+  assert.equal(dev.image.saturation, 1.0);
+  assert.equal(dev.image.contrast, 0.1);
+  const local = withEnv({ DITHER: 'local', SATURATION: null, CONTRAST: null }, loadConfig);
+  assert.equal(local.image.saturation, 1.3);
+  assert.equal(local.image.contrast, 0.25);
+  const explicit = withEnv({ DITHER: null, SATURATION: '1.2', CONTRAST: null }, loadConfig);
+  assert.equal(explicit.image.saturation, 1.2);
+});
+
+test('device mode sends the toned photo at panel size, without palette quantisation', async () => {
+  const cfg = withEnv({ DITHER: null, ORIENTATION: 'portrait' }, loadConfig);
+  const model = buildPaletteModel(cfg.image.measuredPalette, DEVICE_PALETTE);
+  const w = 300, h = 400;
+  const raw = Buffer.alloc(w * h * 3);
+  for (let i = 0; i < w * h; i++) { raw[i * 3] = (i % w) * 0.8; raw[i * 3 + 1] = (i / w) * 0.6; raw[i * 3 + 2] = 120; }
+  const photo = await sharp(raw, { raw: { width: w, height: h, channels: 3 } }).jpeg().toBuffer();
+  const canvas = await composeCanvas(cfg, { kind: 'cover', items: [{ width: w, height: h }] }, [photo]);
+  const out = await renderCanvas(cfg, model, canvas);
+  const { data, info } = await sharp(out.devicePng).raw().toBuffer({ resolveWithObject: true });
+  assert.deepEqual([info.width, info.height], [1440, 2560]);
+  const colours = new Set();
+  for (let i = 0; i < data.length; i += info.channels * 97) colours.add((data[i] << 16) | (data[i + 1] << 8) | data[i + 2]);
+  assert.ok(colours.size > 50, `expected a full-colour image, got ${colours.size} colours`);
+  assert.equal(out.inkShare, null);
+});
