@@ -1,4 +1,4 @@
-// End to end: mock Google album -> pick/pair -> dither -> fake EMDX downloads it -> deep sleep.
+// End to end: mock Google album -> pick/pair -> dither -> fake EMDX downloads it -> sleep -> Wake-on-LAN.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -32,11 +32,11 @@ before(async () => {
     DITHER: 'local', // this test checks the NAS ditherer's palette-only output
     FETCH_TIMEOUT_SEC: '20',
     CONNECT_ATTEMPTS: '2',
-    // Yearly, so the "update due in a few minutes, stay awake" rule never kicks in
-    // during a test run; the wake-up time of day is the same as with '0 6 * * *'.
-    SCHEDULE: '0 6 1 1 *',
-    TZ: 'Europe/Brussels',
-    SLEEP_MODE: 'deep',
+    EMDX_MAC: emdx.mac,
+    WOL_BROADCAST: '127.0.0.1',
+    WOL_PORT: String(emdx.wolPort),
+    WAKE_WAIT_SEC: '0.2',
+    SLEEP_MODE: '', // the default
     SLEEP_DELAY_SEC: '1',
   });
 });
@@ -96,34 +96,45 @@ test('a full day: album -> render -> display downloads a palette-only PNG', { sk
     const page = await (await fetch('http://127.0.0.1:18321/')).text();
     assert.match(page, /Photo frame/);
 
-    // Deep sleep: every push armed the display's daily wake-up timer for 05:58 (2 min
-    // before the update), and SLEEP_DELAY_SEC later it was re-armed, its network
-    // standby switched off and powered off.
+    // Sleep (default: standby): SLEEP_DELAY_SEC after the last update the NAS checked
+    // that network standby was on (it was) and powered the display off. Nothing tried
+    // the timer command (0x25).
+    const cmds = () => emdx.events.filter((e) => e.startsWith('cmd:'));
     await until(() => app.state.sleep?.asleep);
-    assert.equal(app.state.sleep.wakeLabel, '05:58');
-    const cmds = emdx.events.filter((e) => e.startsWith('cmd:'));
-    assert.equal(cmds.filter((e) => e === 'cmd:25:1,2,5,58,1').length, 5, cmds.join(' '));
-    assert.deepEqual(cmds.slice(-3), ['cmd:25:1,2,5,58,1', 'cmd:b5:0', 'cmd:11:0']);
-    assert.deepEqual([emdx.state.awake, emdx.state.networkStandby], [false, false]);
+    assert.deepEqual(cmds().slice(-2), ['cmd:b5', 'cmd:11:0']);
+    assert.ok(!cmds().some((e) => e.startsWith('cmd:25')));
+    assert.deepEqual([emdx.state.awake, emdx.state.networkStandby], [false, true]);
     const asleep = await (await fetch('http://127.0.0.1:18321/api/status')).json();
-    assert.equal(asleep.sleep.mode, 'deep');
-    assert.equal(asleep.sleep.asleep, true);
+    assert.deepEqual([asleep.sleep.mode, asleep.sleep.asleep], ['standby', true]);
 
-    // While it sleeps it can't be reached: a manual update says why, and doesn't retry.
+    // The next update wakes it with Wake-on-LAN, and it goes back to sleep after.
+    const woken = await app.next('manual');
+    assert.ok(woken.pushed);
+    assert.ok(emdx.events.includes('wol'));
+    await until(() => app.state.sleep?.asleep && !emdx.state.awake);
+
+    // Deep sleep switches network standby off too...
+    cfg.sleep.mode = 'deep';
+    await app.resend();
+    await until(() => app.state.sleep?.asleep && !emdx.state.awake);
+    assert.deepEqual(cmds().slice(-3), ['cmd:b5', 'cmd:b5:0', 'cmd:11:0']);
+    assert.equal(emdx.state.networkStandby, false);
+
+    // ...so if Wake-on-LAN can't reach it then, an update says what to do, and doesn't retry.
     cfg.display.connectAttempts = 1;
-    await assert.rejects(app.next('manual'), /deep sleep until 05:58.*power button/);
-    assert.equal(app.state.current.pushed, false);
+    await assert.rejects(app.resend(), /Wake-on-LAN may not reach it: press its power button.*SLEEP_MODE=standby/);
+    assert.ok(emdx.events.includes('wol-unheard'));
     assert.equal(app.state.history[0].ok, false);
     assert.equal(app.retryTimer, null);
-    assert.ok(emdx.events.includes('refused'));
 
-    // Someone presses its button: "Send again" works, and it goes back to sleep.
+    // Someone presses its button: "Send again" works, and back in standby mode
+    // network standby is switched on again before it sleeps.
     emdx.wake();
-    const sent = await app.resend();
-    assert.ok(sent.pushed);
-    assert.equal(emdx.state.awake, true);
+    cfg.sleep.mode = 'standby';
+    assert.ok((await app.resend()).pushed);
     await until(() => app.state.sleep?.asleep && !emdx.state.awake);
-    assert.deepEqual(emdx.events.filter((e) => e.startsWith('cmd:')).slice(-3), ['cmd:25:1,2,5,58,1', 'cmd:b5:0', 'cmd:11:0']);
+    assert.deepEqual(cmds().slice(-3), ['cmd:b5', 'cmd:b5:1', 'cmd:11:0']);
+    assert.equal(emdx.state.networkStandby, true);
   } finally {
     app.cancelSleep();
     await server.close();

@@ -1,7 +1,10 @@
 // A fake Samsung EMDX for tests: speaks the MDC handshake (banner, TLS, PIN),
 // answers commands, and on 0xC7 downloads content.json + the image like the
 // real display does. Power-off (0x11 0x00) puts it to sleep: it then refuses
-// connections until wake() (its timer firing, or someone pressing the button).
+// connections until a Wake-on-LAN packet for its MAC arrives (only heard with
+// network standby on) or wake() (someone pressing its button). Like the EM32DX,
+// it refuses (NAKs) 0x25 with a timer payload.
+import dgram from 'node:dgram';
 import net from 'node:net';
 import tls from 'node:tls';
 import fs from 'node:fs';
@@ -21,12 +24,12 @@ function reply(sock, displayId, cmd, payload = [], ack = true) {
   sock.write(Buffer.from([0xaa, ...body, checksum]));
 }
 
-export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage = true } = {}) {
+export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage = true, mac = '02:00:00:00:00:01' } = {}) {
   const { key, cert } = makeCert();
-  // Events look like 'auth', 'cmd:1b', 'cmd:25:1,2,5,58,1' (hex command, decimal payload).
+  // Events look like 'auth', 'cmd:1b', 'cmd:b5:1' (hex command, decimal payload), 'wol'.
   const events = [];
   const received = [];
-  const state = { awake: true, networkStandby: true, onTimer: null };
+  const state = { awake: true, networkStandby: true };
   const server = net.createServer((raw) => {
     raw.on('error', () => {});
     if (!state.awake) { // asleep: nothing answers
@@ -49,7 +52,8 @@ export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage =
       const payload = data.subarray(4, 4 + len);
       events.push(`cmd:${cmd.toString(16)}${len && cmd !== 0xc7 ? `:${[...payload].join(',')}` : ''}`);
       if (cmd === 0x1b) return reply(sock, id, cmd, [0x73, 0x00, 0x01, 0x00, battery, 0x00, 0x02]);
-      if (cmd === 0x25 && len) state.onTimer = [...payload];
+      if (cmd === 0x25 && len > 1) return reply(sock, id, cmd, [0x01], false);
+      if (cmd === 0xb5 && !len) return reply(sock, id, cmd, [state.networkStandby ? 0x01 : 0x00]);
       if (cmd === 0xb5 && len) state.networkStandby = payload[0] === 0x01;
       if (cmd === 0x11 && len && payload[0] === 0x00) {
         reply(sock, id, cmd, [0x00]);
@@ -76,12 +80,25 @@ export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage =
     });
   });
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
+
+  // Wake-on-LAN: 6 x 0xFF followed by the MAC 16 times.
+  const magic = Buffer.concat([Buffer.alloc(6, 0xff), ...Array(16).fill(Buffer.from(mac.replace(/:/g, ''), 'hex'))]);
+  const wol = dgram.createSocket('udp4');
+  wol.on('message', (msg) => {
+    if (!msg.equals(magic)) return events.push('wol-other');
+    events.push(state.networkStandby ? 'wol' : 'wol-unheard');
+    if (state.networkStandby) state.awake = true;
+  });
+  await new Promise((r) => wol.bind(0, '127.0.0.1', r));
+
   return {
     port: server.address().port,
+    wolPort: wol.address().port,
+    mac,
     events,
     received,
     state,
     wake() { state.awake = true; },
-    close: () => new Promise((r) => server.close(r)),
+    close: () => new Promise((r) => { wol.close(); server.close(r); }),
   };
 }

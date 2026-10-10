@@ -116,6 +116,10 @@ export function loadConfig() {
     .filter(Boolean);
 
   const displayHost = str('EMDX_HOST');
+  const mac = str('EMDX_MAC');
+  if (mac && mac.replace(/[^0-9a-f]/gi, '').length !== 12) {
+    throw new Error(`EMDX_MAC must be a MAC address like 00:11:22:33:44:55 (got "${mac}")`);
+  }
   const httpPort = num('HTTP_PORT', 8321);
 
   // Default: let the display do the final dithering. On the EM32DX its own algorithm
@@ -131,8 +135,9 @@ export function loadConfig() {
       host: displayHost,
       port: num('EMDX_PORT', 1515),
       pin: str('EMDX_PIN', '000000'),
-      mac: str('EMDX_MAC'),
+      mac,
       wolBroadcast: str('WOL_BROADCAST', '255.255.255.255'),
+      wolPort: num('WOL_PORT', 9),
       wakeWaitSec: num('WAKE_WAIT_SEC', 4),
       connectAttempts: num('CONNECT_ATTEMPTS', 6),
       fetchTimeoutSec: num('FETCH_TIMEOUT_SEC', 180),
@@ -153,14 +158,13 @@ export function loadConfig() {
     retries: num('RETRIES', 3),
 
     // What the display does once a photo is up.
-    //   deep    - arm its wake-up timer for the next update, Wi-Fi off, power off (least battery)
-    //   standby - power off but keep the Wi-Fi listener on, so Wake-on-LAN can wake it any time
+    //   standby - power off, Wi-Fi listener (network standby) on: the NAS wakes it with Wake-on-LAN
+    //   deep    - power off with the Wi-Fi listener off too; only if `sleep-test deep` shows
+    //             that Wake-on-LAN still wakes it
     //   off     - leave it to the display's own settings (e.g. when it is on mains power)
     sleep: {
-      mode: oneOf('SLEEP_MODE', 'deep', ['deep', 'standby', 'off']),
+      mode: oneOf('SLEEP_MODE', 'standby', ['standby', 'deep', 'off']),
       delaySec: num('SLEEP_DELAY_SEC', 120), // let the panel finish redrawing first
-      wakeLeadMin: num('WAKE_LEAD_MIN', 2), // wake this long before the scheduled update
-      wakeWindowMin: num('WAKE_WINDOW_MIN', 15), // keep trying to reach a waking display this long
     },
 
     panel: {

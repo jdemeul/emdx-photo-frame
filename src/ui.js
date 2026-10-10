@@ -53,7 +53,6 @@ export const UI_HTML = `<!doctype html>
       <button data-act="test-pattern">Show test pattern</button>
       <button data-act="refresh-album">Re-read album</button>
     </div>
-    <p class="muted" id="hint" hidden>The display is in deep sleep and can't hear the NAS until its timer wakes it. To send something now, press its power button first.</p>
     <dl id="info"></dl>
     <div id="error" class="err"></div>
     <div><strong>Recent</strong><dl id="history" style="margin-top:8px"></dl></div>
@@ -87,8 +86,7 @@ function sleepText(s) {
   const hm = (t) => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   if (!z) return '–';
   if (z.mode === 'off') return 'sleeps by its own settings (SLEEP_MODE=off)';
-  if (z.asleep) return z.mode === 'deep' ? 'deep sleep' + (z.wakeLabel ? ', its timer wakes it at ' + z.wakeLabel : '') : 'asleep, Wake-on-LAN wakes it';
-  if (z.woke) return 'its timer was due to wake it at ' + z.wakeLabel;
+  if (z.asleep) return z.mode === 'deep' ? 'in deep sleep (network standby off)' : 'asleep, the next update wakes it';
   if (z.pending && z.sleepAt) return 'awake, goes to sleep at ' + hm(z.sleepAt);
   return 'awake';
 }
@@ -112,7 +110,6 @@ function render(s) {
     ['Album', s.library ? esc(s.library.titles.join(', ') + ' · ' + s.library.count + ' photos · read ' ) + fmt(s.library.fetchedAt) : '–'],
   ];
   $('#info').innerHTML = rows.map(([k, v]) => '<dt>' + k + '</dt><dd>' + v + '</dd>').join('');
-  $('#hint').hidden = !(s.sleep && s.sleep.asleep && s.sleep.mode === 'deep');
   $('#error').textContent = s.lastError ? 'Last problem (' + fmt(s.lastError.at) + '): ' + s.lastError.message : '';
   $('#history').innerHTML = (s.history || []).slice(0, 8).map((h) => '<dt>' + fmt(h.at) + '</dt><dd>' + (h.ok ? esc(h.kind) + (h.dates && h.dates.length ? ' · ' + h.dates.map(day).join(' + ') : '') : '<span class="err">' + esc(h.error) + '</span>') + '</dd>').join('');
   renderView(s);

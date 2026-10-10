@@ -4,30 +4,29 @@
 //   node src/index.js serve            run the scheduler + web UI (default; what the container does)
 //   node src/index.js once             show the next photo now, then exit
 //   node src/index.js check-album      read the album(s) and print what was found
-//   node src/index.js display-info     connect to the display and print name/battery/timer (changes nothing)
+//   node src/index.js display-info     connect to the display and print name/battery/network standby (changes nothing)
 //   node src/index.js test-pattern     send the calibration image to the display
-//   node src/index.js sleep [mode]     put the display to sleep now (deep | standby; default SLEEP_MODE)
-//   node src/index.js sleep-test [min] deep-sleep the display with its timer set a few minutes ahead, and check it wakes
+//   node src/index.js sleep [mode]     put the display to sleep now (standby | deep; default SLEEP_MODE)
+//   node src/index.js sleep-test [mode] put the display to sleep, then check that Wake-on-LAN wakes it
 //   node src/index.js render <img...>  render local image files to <DATA_DIR>/render-test (no display needed)
 import fs from 'node:fs';
 import path from 'node:path';
 import { Cron } from 'croner';
 import { loadConfig, describeConfig, DEVICE_PALETTE } from './config.js';
-import { log, stamp } from './log.js';
+import { log } from './log.js';
 import { Store } from './state.js';
 import { buildPaletteModel } from './color.js';
 import { FrameApp } from './app.js';
 import { createServer } from './server.js';
 import { fetchAlbum } from './sources/googleAlbum.js';
-import { readDisplayInfo, putToSleep, probeDisplay } from './display.js';
-import { wakeTimeFor, timeOfDay } from './schedule.js';
+import { readDisplayInfo, putToSleep, probeDisplay, sendWakeOnLan } from './display.js';
 import { composeCanvas, renderCanvas } from './render.js';
 
 process.on('unhandledRejection', (err) => log.error('Unhandled error:', err));
 
 // A display in deep sleep doesn't answer at all; say what to do about it.
 function asleepHint(err) {
-  if (err.unreachable) err.message = `${err.what}. Is it on the network? If it is in deep sleep, press its power button first.`;
+  if (err.unreachable) err.message = `${err.what}. Is it on the network? If it is asleep and Wake-on-LAN doesn't reach it, press its power button first.`;
   throw err;
 }
 
@@ -55,54 +54,52 @@ async function main() {
   }
 
   if (cmd === 'sleep') {
-    const mode = args[0] || cfg.sleep.mode;
-    if (!['deep', 'standby'].includes(mode)) throw new Error('Usage: sleep [deep|standby]');
-    const wake = mode === 'deep' ? wakeTimeFor(cfg) : null;
-    await putToSleep(cfg, { mode, wake }).catch(asleepHint);
-    log.info(mode === 'deep' ? `Display is in deep sleep; its timer wakes it at ${wake.label}.` : 'Display is asleep with network standby on.');
+    const mode = args[0] || (cfg.sleep.mode === 'off' ? 'standby' : cfg.sleep.mode);
+    if (!['standby', 'deep'].includes(mode)) throw new Error('Usage: sleep [standby|deep]');
+    await putToSleep(cfg, { mode }).catch(asleepHint);
+    log.info(mode === 'deep' ? 'Display is in deep sleep (network standby off).' : 'Display is asleep with network standby on.');
     return;
   }
 
+  // Can the NAS wake the display from this kind of sleep? Sleep, wait until it stops
+  // answering, then try Wake-on-LAN for 90 s.
   if (cmd === 'sleep-test') {
     const wait = (ms) => new Promise((r) => setTimeout(r, ms));
-    const minutes = Math.max(2, Number(args[0] || 5));
-    const at = new Date(Math.ceil((Date.now() + minutes * 60000) / 60000) * 60000);
-    const wake = timeOfDay(cfg, at);
-    log.info(`Putting the display into deep sleep with its wake-up timer at ${wake.label}…`);
-    await putToSleep(cfg, { mode: 'deep', wake }).catch(asleepHint);
-    const sentAt = Date.now();
-    const deadline = at.getTime() + 10 * 60000;
-    log.info(`Watching for it to fall asleep and wake up again (until ${stamp(new Date(deadline))})…`);
-    let slept = false;
-    while (Date.now() < deadline) {
+    const mode = args[0] || (cfg.sleep.mode === 'deep' ? 'deep' : 'standby');
+    if (!['standby', 'deep'].includes(mode)) throw new Error('Usage: sleep-test [standby|deep]');
+    if (!cfg.display.mac) throw new Error('Set EMDX_MAC first: Wake-on-LAN is how the NAS wakes the display.');
+    const routine = cfg.sleep.mode === 'deep' ? 'deep' : 'standby';
+    const recover = 'Press its power button to wake it, then run "node src/index.js sleep standby" ' +
+      '(or press "Next photo now" on the web page).';
+
+    log.info(`Putting the display to sleep (${mode === 'deep' ? 'deep: network standby off' : 'standby: network standby on'})…`);
+    await putToSleep(cfg, { mode }).catch(asleepHint);
+    let asleep = false;
+    for (let i = 0; i < 8 && !asleep; i++) {
       await wait(15000);
-      const up = await probeDisplay(cfg);
-      if (!up) {
-        if (!slept) log.info('It stopped answering: asleep.');
-        slept = true;
-      } else if (!slept && Date.now() - sentAt > 120000) {
-        throw new Error('It still answers 2 minutes after being told to sleep, so it did not go into deep sleep.');
-      } else if (slept) {
-        const late = Math.round((Date.now() - at.getTime()) / 1000);
-        // Waking takes a moment (and we look every 15 s), so up to ~2.5 min late is normal.
-        const off = late < -30 || late > 150
-          ? ` Its clock looks ${late < 0 ? 'ahead' : 'behind'} by about ${Math.max(1, Math.round(Math.abs(late) / 60))} min: ` +
-            'check its time and time zone in the Samsung E-Paper app.'
-          : '';
-        log.info(`It woke up and answered ${late >= 0 ? `${late} s after` : `${-late} s before`} ${wake.label}. ` +
-          `Deep sleep with the wake-up timer works.${off}`);
-        // Back to the configured routine (with SLEEP_MODE=off: undo the test, i.e. no timer, network standby on).
-        const mode = cfg.sleep.mode === 'deep' ? 'deep' : 'standby';
-        const w = mode === 'deep' ? wakeTimeFor(cfg) : null;
-        await putToSleep(cfg, { mode, wake: w });
-        log.info(w ? `Back to the normal routine: in deep sleep until ${w.label}.` : 'Back to normal: asleep with network standby on.');
+      asleep = !(await probeDisplay(cfg));
+    }
+    if (!asleep) {
+      log.info('It still answers 2 minutes after the power-off command, so the NAS can reach it without Wake-on-LAN.');
+      if (mode !== routine) await putToSleep(cfg, { mode: routine });
+      return;
+    }
+    log.info('It stopped answering: asleep. Waking it with Wake-on-LAN…');
+    const start = Date.now();
+    while (Date.now() - start < 90000) {
+      await sendWakeOnLan(cfg);
+      await wait(5000);
+      if (await probeDisplay(cfg)) {
+        log.info(`Wake-on-LAN woke it after ${Math.round((Date.now() - start) / 1000)} s: SLEEP_MODE=${mode} works with this display.`);
+        await putToSleep(cfg, { mode: routine });
+        log.info(`Back to sleep (${routine}).`);
         return;
       }
     }
     throw new Error(
-      `The display did not wake within 10 minutes of ${wake.label}. Check its time and time zone in the ` +
-        'Samsung E-Paper app, or use SLEEP_MODE=standby. Press its power button to wake it, then run ' +
-        '"node src/index.js sleep standby" to turn its network standby back on.',
+      mode === 'deep'
+        ? `Wake-on-LAN did not wake it from deep sleep, so deep sleep can't be used with this display: keep SLEEP_MODE=standby. ${recover}`
+        : `Wake-on-LAN did not wake it. Check EMDX_MAC, and try WOL_BROADCAST set to your network's broadcast address (e.g. 192.168.1.255). ${recover}`,
     );
   }
 

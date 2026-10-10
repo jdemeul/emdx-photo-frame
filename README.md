@@ -7,7 +7,7 @@ It runs as a single Docker container. It was written for a Synology NAS (tested 
 - **Shuffle without repeats:** every photo in the album is shown once before anything repeats. Photos added to the album later join the current round.
 - **Odd shapes get paired:** on a portrait frame, landscape and square photos are shown two at a time, stacked, preferably two taken around the same time. Portrait photos fill the frame on their own, smart-cropped around the most interesting part.
 - **The display does the final dithering:** the NAS crops, tones and sends the photo, and the panel's own algorithm turns it into ink dots. A NAS-side ditherer (gamut mapping plus blue noise) is included as `DITHER=local`, but on the EM32DX the panel's own processing looked clearly better side by side (see [Findings](#findings-nas-vs-panel-dithering)).
-- **Sleeps between updates:** two minutes after each photo, the NAS puts the display into deep sleep with its wake-up timer set for the next update. That is the most frugal way to run it on battery (see [Sleep and battery](#6-sleep-and-battery)).
+- **Sleeps between updates:** two minutes after each photo, the NAS powers the display off. Only its Wi-Fi listener stays on, so the next update can wake it with Wake-on-LAN (see [Sleep and battery](#6-sleep-and-battery)).
 
 ## 1. What you need
 
@@ -15,11 +15,11 @@ It runs as a single Docker container. It was written for a Synology NAS (tested 
 |---|---|
 | **Album share link** | Google Photos → the album → Share → *Create link*. It looks like `https://photos.app.goo.gl/…` (the full `https://photos.google.com/share/…?key=…` address works too). Anyone with this link can view the album. |
 | **Display IP address** | Router or the Samsung E-Paper app. Give the display a fixed DHCP lease. |
-| **Display MAC address** | Router/app. Lets the NAS wake the display (Wake-on-LAN). |
+| **Display MAC address** | Router/app. Lets the NAS wake the display from sleep (Wake-on-LAN). |
 | **Display PIN** | The 6-digit device security PIN you set when configuring the display in the Samsung E-Paper app. |
 | **NAS IP address** | DSM → Control Panel → Network. |
 
-On the display (via the Samsung E-Paper app): set **Orientation** to match how it hangs (`.env.example` assumes portrait), and check its **date, time and time zone**. In deep sleep (the default) it wakes itself up for each update by its own clock. The NAS switches the display's Network Standby on and off as needed.
+On the display (via the Samsung E-Paper app): set **Orientation** to match how it hangs (`.env.example` assumes portrait) and turn **Network Standby** on. Network Standby is the Wi-Fi listener that lets Wake-on-LAN wake the display; the NAS also switches it on each time it puts the display to sleep.
 
 ## 2. Install on a Synology NAS (Container Manager)
 
@@ -39,9 +39,9 @@ Open `http://<NAS-IP>:8321`.
    - The **six swatches** should be the six inks.
    - The two sets of colour bands compare the NAS ditherer (`DITHER=local`) with the display's own processing (**"Smooth"**, the default `DITHER=device`). On an EM32DX the display's own looked better. If the NAS bands look better on your panel, set `DITHER=local`.
 2. Press **Next photo now**.
-3. Check that the display wakes itself up from deep sleep. Two minutes after an update it is already asleep, so press its power button first. Then, over SSH, run `sudo docker exec emdx-photo-frame node src/index.js sleep-test`. It puts the display into deep sleep with its wake-up timer 5 minutes ahead, then reports when it answers again (about 7 minutes in all). Run it on a Saturday or Sunday to also confirm that the timer's "every day" includes weekends.
+3. Check that the NAS can wake the display: over SSH, run `sudo docker exec emdx-photo-frame node src/index.js sleep-test`. It puts the display to sleep, waits until it stops answering, then wakes it with Wake-on-LAN and puts it back to sleep (under a minute when it works).
 
-From then on it updates every day at 06:00 (`SCHEDULE`). Two minutes later the display goes into deep sleep, and its timer wakes it at 05:58 for the next update. If the display can't be reached at 06:00, it retries 3× at 20-minute intervals.
+From then on it updates every day at 06:00 (`SCHEDULE`), and two minutes after each update the display goes back to sleep. If the display can't be reached at 06:00, it retries 3× at 20-minute intervals.
 
 ## 4. Try it on a laptop first (optional)
 
@@ -59,9 +59,9 @@ Then open http://localhost:8321 and press **Next photo now** a few times to prev
 Other commands (`sudo docker exec emdx-photo-frame node src/index.js <cmd>` on the NAS):
 
 - `check-album`: read the album and print what was found.
-- `display-info`: connect to the display and print its name, battery, Network Standby and wake-up timer. Changes nothing on the display.
-- `sleep [deep|standby]`: put the display to sleep now (default: `SLEEP_MODE`).
-- `sleep-test [minutes]`: check that the display wakes itself from deep sleep (see [First run](#3-first-run)).
+- `display-info`: connect to the display and print its name, battery and Network Standby. Changes nothing on the display.
+- `sleep [standby|deep]`: put the display to sleep now (default: `SLEEP_MODE`).
+- `sleep-test [standby|deep]`: check that Wake-on-LAN wakes the display from that kind of sleep (see [First run](#3-first-run) and [Sleep and battery](#6-sleep-and-battery)).
 - `once`, `test-pattern`: show the next photo or the test pattern. These start their own web server, so use them only while the service is stopped (e.g. with `docker run --rm`); while it runs, use the buttons on its web page.
 
 ## 5. Settings (`.env`)
@@ -79,33 +79,26 @@ Other commands (`sudo docker exec emdx-photo-frame node src/index.js <cmd>` on t
 | `DITHER_METHOD` | bluenoise | `DITHER=local` only. `diffusion` for classic error diffusion (`DITHER_KERNEL`: floyd-steinberg, stucki, jarvis, sierra, atkinson) |
 | `PALETTE` | measured Spectra 6 | `DITHER=local` only. JSON of measured ink colours, if you photograph/measure your own panel |
 | `OUTPUT_COLORS` | device | `DITHER=local` only. `measured` writes the measured RGB values into the PNG instead of pure colours |
-| `SLEEP_MODE` | deep | After each update: `deep`, `standby` or `off` (see [Sleep and battery](#6-sleep-and-battery)) |
+| `SLEEP_MODE` | standby | After each update: `standby`, `deep` or `off` (see [Sleep and battery](#6-sleep-and-battery)) |
 | `SLEEP_DELAY_SEC` | 120 | Time for the panel to redraw before it is sent to sleep |
-| `WAKE_LEAD_MIN`, `WAKE_WINDOW_MIN` | 2, 15 | Deep sleep: wake this long before each update, and keep trying to reach the waking display this long |
+| `WOL_BROADCAST`, `WOL_PORT` | 255.255.255.255, 9 | Where the Wake-on-LAN packet goes. Try your network's broadcast address (e.g. 192.168.1.255) if the display doesn't wake |
 | `UI_PASSWORD` | — | Protects the web page (basic auth) |
 
 ## 6. Sleep and battery
 
-E-paper keeps its picture without power, but a display that stays reachable over Wi-Fi does use battery. So once the panel has redrawn (`SLEEP_DELAY_SEC`), the NAS sends the display to sleep. `SLEEP_MODE` picks how:
+E-paper keeps its picture without power, but a display that stays awake on Wi-Fi uses battery. So once the panel has redrawn (`SLEEP_DELAY_SEC`), the NAS powers the display off. `SLEEP_MODE` picks how deeply it sleeps:
 
-| | `deep` (default) | `standby` | `off` |
+| | `standby` (default) | `deep` | `off` |
 |---|---|---|---|
-| After an update | wake-up timer set for the next update, Network Standby off, power off | Network Standby on, power off | nothing: the display follows its own settings |
-| What wakes it for the next update | its own timer, at 05:58 for a 06:00 update | the NAS, with Wake-on-LAN (needs `EMDX_MAC`) | the NAS, with Wake-on-LAN if Network Standby is on |
-| Web page buttons between updates | only after you press the display's power button | work | work while it is reachable |
-| Battery with one update a day (Samsung's figures for its deep sleep and sleep modes) | up to 80 days | up to 70 days | depends on its settings |
+| After an update | Network Standby on, power off | Network Standby off, power off | nothing: the display follows its own settings |
+| What wakes it for the next update | the NAS, with Wake-on-LAN (needs `EMDX_MAC`) | only Wake-on-LAN, if it still gets through without Network Standby | the NAS, with Wake-on-LAN |
+| Battery with one update a day (Samsung's figures for its sleep and deep sleep modes) | up to 70 days | up to 80 days | depends on its settings |
 
-Samsung's battery figures are for the 32" EMDX, from pre-release lab tests ([product page](https://www.samsung.com/au/business/smart-signage/others/color-e-paper-emdx-a-lh32emdiagbxxy/)). Deep sleep buys roughly ten extra days per charge. The price is that the display can't be reached between updates; the web page says so while it sleeps.
+Samsung's battery figures are for the 32" EMDX, from pre-release lab tests ([product page](https://www.samsung.com/au/business/smart-signage/others/color-e-paper-emdx-a-lh32emdiagbxxy/)).
 
-About deep sleep:
+Deep sleep would buy roughly ten extra days per charge, but the display must still be woken for the next update. With Network Standby off, its Wi-Fi listener is off too, so Wake-on-LAN may not get through. And there is no known way to make it wake itself on a schedule over MDC: the EM32DX refuses the "on-timer" command (`0x25`) listed in some notes. To find out whether `deep` works on yours, run `sudo docker exec emdx-photo-frame node src/index.js sleep-test deep`. If Wake-on-LAN doesn't wake it, press the display's power button, run `sleep standby`, and keep the default.
 
-- The timer runs on the display's own clock, so its time and time zone must be right. `sleep-test` checks that it wakes on time.
-- The timer is set at the start of each update, in case the display dozes off by itself before the NAS sends it to sleep. It repeats daily, so a missed update doesn't leave the display asleep for good.
-- It suits a schedule with one update a day, or several (the timer is reset for the next one each time). With updates on only some days, the display still wakes every day at that time; use `standby` then.
-- At the scheduled time the NAS keeps trying to reach the waking display for up to 15 minutes (`WAKE_WINDOW_MIN`), in case its clock runs a little behind.
-- Going back from `deep` to `off`: the display keeps its timer, with Network Standby off. Run `sleep standby` once to undo both.
-
-The sleep and timer commands (MDC `0x11` power, `0xB5` Network Standby, `0x25` on-timer) follow the EMDX command notes in [taylorRichie/node-samsung-emdx](https://github.com/taylorRichie/node-samsung-emdx/blob/main/docs/MDC-COMMANDS.md).
+The sleep commands (MDC `0x11` power, `0xB5` Network Standby) follow the EMDX command notes in [taylorRichie/node-samsung-emdx](https://github.com/taylorRichie/node-samsung-emdx/blob/main/docs/MDC-COMMANDS.md).
 
 ## 7. How it works
 
@@ -121,8 +114,8 @@ The sleep and timer commands (MDC `0x11` power, `0xB5` Network Standby, `0x25` o
 
 - **"accepted the command but never downloaded"**: the display can't reach `http://SERVER_HOST:HTTP_PORT`. Check `SERVER_HOST`, the DSM firewall, and that the display and the NAS are on the same network.
 - **"Incorrect PIN"**: check `EMDX_PIN`. After several wrong PINs the display may block MDC for a while.
-- **"Could not connect"**: the display is asleep or offline. In deep sleep (the default) that is normal between updates: press its power button first. Otherwise set `EMDX_MAC` for Wake-on-LAN, or raise `WAKE_WAIT_SEC`.
-- **Missed updates in deep sleep**: run `sleep-test`. If the display wakes late or not at all, fix its date, time and time zone in the Samsung E-Paper app, or use `SLEEP_MODE=standby`.
+- **"Could not connect"**: the display is asleep or offline. Set `EMDX_MAC` for Wake-on-LAN, run `sleep-test`, try `WOL_BROADCAST` set to your network's broadcast address, or raise `WAKE_WAIT_SEC`. In `deep` sleep, press its power button and go back to `SLEEP_MODE=standby`.
+- **"the display refused MDC command …"**: this firmware doesn't support that command. Please open an issue with the full message.
 - **Album errors**: run `check-album`. If it fails while the link opens fine in a browser, Google probably changed the page format. The frame keeps using the cached list in the meantime.
 - **Photos too dark or flat on the panel**: try `SATURATION=1.15`, `CONTRAST=0.2` or `GAMMA=1.15`.
 - **Project won't start, `./data` not found**: create an empty `data` folder next to `docker-compose.yml`.

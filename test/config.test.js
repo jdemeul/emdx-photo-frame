@@ -25,12 +25,16 @@ test('the display does the dithering by default, with gentler tone defaults', ()
   assert.equal(explicit.image.saturation, 1.2);
 });
 
-test('the display goes into deep sleep after each update by default', () => {
-  const unset = { SLEEP_MODE: null, SLEEP_DELAY_SEC: null, WAKE_LEAD_MIN: null, WAKE_WINDOW_MIN: null };
-  const def = withEnv(unset, loadConfig);
-  assert.deepEqual(def.sleep, { mode: 'deep', delaySec: 120, wakeLeadMin: 2, wakeWindowMin: 15 });
-  assert.equal(withEnv({ ...unset, SLEEP_MODE: 'Standby' }, loadConfig).sleep.mode, 'standby');
-  assert.throws(() => withEnv({ ...unset, SLEEP_MODE: 'hibernate' }, loadConfig), /SLEEP_MODE must be one of deep, standby, off/);
+test('the display sleeps with network standby on by default', () => {
+  const unset = { SLEEP_MODE: null, SLEEP_DELAY_SEC: null };
+  assert.deepEqual(withEnv(unset, loadConfig).sleep, { mode: 'standby', delaySec: 120 });
+  assert.equal(withEnv({ ...unset, SLEEP_MODE: 'Deep' }, loadConfig).sleep.mode, 'deep');
+  assert.throws(() => withEnv({ ...unset, SLEEP_MODE: 'hibernate' }, loadConfig), /SLEEP_MODE must be one of standby, deep, off/);
+});
+
+test('a malformed EMDX_MAC is caught when the config loads', () => {
+  assert.equal(withEnv({ EMDX_MAC: '02:00:00:00:00:01' }, loadConfig).display.mac, '02:00:00:00:00:01');
+  assert.throws(() => withEnv({ EMDX_MAC: '02:00:00:00:01' }, loadConfig), /EMDX_MAC must be a MAC address/);
 });
 
 test('device mode sends the toned photo at panel size, without palette quantisation', async () => {
