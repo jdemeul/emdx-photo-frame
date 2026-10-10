@@ -84,8 +84,9 @@ export function createServer(cfg, app) {
     if (!cfg.server.uiPassword) return true;
     const h = req.headers.authorization || '';
     if (!h.startsWith('Basic ')) return false;
-    const [, pass] = Buffer.from(h.slice(6), 'base64').toString().split(':');
-    const a = Buffer.from(pass || '');
+    const decoded = Buffer.from(h.slice(6), 'base64').toString();
+    const pass = decoded.slice(decoded.indexOf(':') + 1); // the password may contain colons
+    const a = Buffer.from(pass);
     const b = Buffer.from(cfg.server.uiPassword);
     return a.length === b.length && crypto.timingSafeEqual(a, b);
   }

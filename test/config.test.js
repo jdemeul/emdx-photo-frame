@@ -25,6 +25,14 @@ test('the display does the dithering by default, with gentler tone defaults', ()
   assert.equal(explicit.image.saturation, 1.2);
 });
 
+test('the display goes into deep sleep after each update by default', () => {
+  const unset = { SLEEP_MODE: null, SLEEP_DELAY_SEC: null, WAKE_LEAD_MIN: null, WAKE_WINDOW_MIN: null };
+  const def = withEnv(unset, loadConfig);
+  assert.deepEqual(def.sleep, { mode: 'deep', delaySec: 120, wakeLeadMin: 2, wakeWindowMin: 15 });
+  assert.equal(withEnv({ ...unset, SLEEP_MODE: 'Standby' }, loadConfig).sleep.mode, 'standby');
+  assert.throws(() => withEnv({ ...unset, SLEEP_MODE: 'hibernate' }, loadConfig), /SLEEP_MODE must be one of deep, standby, off/);
+});
+
 test('device mode sends the toned photo at panel size, without palette quantisation', async () => {
   const cfg = withEnv({ DITHER: null, ORIENTATION: 'portrait' }, loadConfig);
   const model = buildPaletteModel(cfg.image.measuredPalette, DEVICE_PALETTE);

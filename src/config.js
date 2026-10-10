@@ -152,6 +152,17 @@ export function loadConfig() {
     retryMinutes: num('RETRY_MINUTES', 20),
     retries: num('RETRIES', 3),
 
+    // What the display does once a photo is up.
+    //   deep    - arm its wake-up timer for the next update, Wi-Fi off, power off (least battery)
+    //   standby - power off but keep the Wi-Fi listener on, so Wake-on-LAN can wake it any time
+    //   off     - leave it to the display's own settings (e.g. when it is on mains power)
+    sleep: {
+      mode: oneOf('SLEEP_MODE', 'deep', ['deep', 'standby', 'off']),
+      delaySec: num('SLEEP_DELAY_SEC', 120), // let the panel finish redrawing first
+      wakeLeadMin: num('WAKE_LEAD_MIN', 2), // wake this long before the scheduled update
+      wakeWindowMin: num('WAKE_WINDOW_MIN', 15), // keep trying to reach a waking display this long
+    },
+
     panel: {
       name: panelName,
       width,
@@ -193,7 +204,7 @@ export function describeConfig(cfg) {
     `display: ${d.host || '(EMDX_HOST not set)'}:${d.port}${d.mac ? `, WoL ${d.mac}` : ''}`,
     `panel: ${cfg.panel.name} ${cfg.panel.width}x${cfg.panel.height} (${cfg.panel.orientation}, rotate ${cfg.panel.rotate})`,
     `server: http://${cfg.server.publicHost}:${cfg.server.port}`,
-    `schedule: "${cfg.schedule}" (${cfg.timezone})`,
+    `schedule: "${cfg.schedule}" (${cfg.timezone}), sleep: ${cfg.sleep.mode}`,
     `image: dither=${cfg.image.dither} method=${cfg.image.method} kernel=${cfg.image.kernel} sat=${cfg.image.saturation} contrast=${cfg.image.contrast}`,
   ].join('\n  ');
 }

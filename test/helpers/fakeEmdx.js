@@ -1,6 +1,7 @@
 // A fake Samsung EMDX for tests: speaks the MDC handshake (banner, TLS, PIN),
 // answers commands, and on 0xC7 downloads content.json + the image like the
-// real display does.
+// real display does. Power-off (0x11 0x00) puts it to sleep: it then refuses
+// connections until wake() (its timer firing, or someone pressing the button).
 import net from 'node:net';
 import tls from 'node:tls';
 import fs from 'node:fs';
@@ -22,10 +23,17 @@ function reply(sock, displayId, cmd, payload = [], ack = true) {
 
 export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage = true } = {}) {
   const { key, cert } = makeCert();
+  // Events look like 'auth', 'cmd:1b', 'cmd:25:1,2,5,58,1' (hex command, decimal payload).
   const events = [];
   const received = [];
+  const state = { awake: true, networkStandby: true, onTimer: null };
   const server = net.createServer((raw) => {
     raw.on('error', () => {});
+    if (!state.awake) { // asleep: nothing answers
+      events.push('refused');
+      raw.destroy();
+      return;
+    }
     raw.write('MDCSTART<<TLS>>');
     const sock = new tls.TLSSocket(raw, { isServer: true, key, cert });
     sock.on('error', () => {});
@@ -39,8 +47,15 @@ export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage =
       if (data[0] !== 0xaa) return;
       const cmd = data[1], id = data[2], len = data[3];
       const payload = data.subarray(4, 4 + len);
-      events.push(`cmd:${cmd.toString(16)}`);
+      events.push(`cmd:${cmd.toString(16)}${len && cmd !== 0xc7 ? `:${[...payload].join(',')}` : ''}`);
       if (cmd === 0x1b) return reply(sock, id, cmd, [0x73, 0x00, 0x01, 0x00, battery, 0x00, 0x02]);
+      if (cmd === 0x25 && len) state.onTimer = [...payload];
+      if (cmd === 0xb5 && len) state.networkStandby = payload[0] === 0x01;
+      if (cmd === 0x11 && len && payload[0] === 0x00) {
+        reply(sock, id, cmd, [0x00]);
+        state.awake = false;
+        return;
+      }
       if (cmd === 0xc7) {
         const url = payload.subarray(3, 3 + payload[2]).toString();
         reply(sock, id, cmd, []);
@@ -65,6 +80,8 @@ export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage =
     port: server.address().port,
     events,
     received,
+    state,
+    wake() { state.awake = true; },
     close: () => new Promise((r) => server.close(r)),
   };
 }
