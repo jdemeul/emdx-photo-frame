@@ -60,8 +60,8 @@ Other commands (`sudo docker exec emdx-photo-frame node src/index.js <cmd>` on t
 
 - `check-album`: read the album and print what was found.
 - `display-info`: connect to the display and print its name, battery and Network Standby. Changes nothing on the display.
-- `sleep [standby|deep]`: put the display to sleep now (default: `SLEEP_MODE`).
-- `sleep-test [standby|deep]`: check that Wake-on-LAN wakes the display from that kind of sleep (see [First run](#3-first-run) and [Sleep and battery](#6-sleep-and-battery)).
+- `sleep`: put the display to sleep now (Network Standby on, power off).
+- `sleep-test [minutes]`: check that Wake-on-LAN wakes the display from sleep, optionally after letting it sleep that many more minutes (see [Sleep and battery](#6-sleep-and-battery)).
 - `once`, `test-pattern`: show the next photo or the test pattern. These start their own web server, so use them only while the service is stopped (e.g. with `docker run --rm`); while it runs, use the buttons on its web page.
 
 ## 5. Settings (`.env`)
@@ -79,24 +79,21 @@ Other commands (`sudo docker exec emdx-photo-frame node src/index.js <cmd>` on t
 | `DITHER_METHOD` | bluenoise | `DITHER=local` only. `diffusion` for classic error diffusion (`DITHER_KERNEL`: floyd-steinberg, stucki, jarvis, sierra, atkinson) |
 | `PALETTE` | measured Spectra 6 | `DITHER=local` only. JSON of measured ink colours, if you photograph/measure your own panel |
 | `OUTPUT_COLORS` | device | `DITHER=local` only. `measured` writes the measured RGB values into the PNG instead of pure colours |
-| `SLEEP_MODE` | standby | After each update: `standby`, `deep` or `off` (see [Sleep and battery](#6-sleep-and-battery)) |
+| `SLEEP_MODE` | standby | After each update: `standby` (sleep, woken by Wake-on-LAN) or `off` (see [Sleep and battery](#6-sleep-and-battery)) |
 | `SLEEP_DELAY_SEC` | 120 | Time for the panel to redraw before it is sent to sleep |
 | `WOL_BROADCAST`, `WOL_PORT` | 255.255.255.255, 9 | Where the Wake-on-LAN packet goes. Try your network's broadcast address (e.g. 192.168.1.255) if the display doesn't wake |
 | `UI_PASSWORD` | — | Protects the web page (basic auth) |
 
 ## 6. Sleep and battery
 
-E-paper keeps its picture without power, but a display that stays awake on Wi-Fi uses battery. So once the panel has redrawn (`SLEEP_DELAY_SEC`), the NAS powers the display off. `SLEEP_MODE` picks how deeply it sleeps:
+E-paper keeps its picture without power, but a display that stays awake on Wi-Fi uses battery. So once the panel has redrawn (`SLEEP_DELAY_SEC`), the NAS makes sure the display's Network Standby is on and powers it off. Network Standby keeps a Wi-Fi listener running, so the next update can wake the display with Wake-on-LAN. `SLEEP_MODE=off` leaves sleeping to the display's own settings instead.
 
-| | `standby` (default) | `deep` | `off` |
-|---|---|---|---|
-| After an update | Network Standby on, power off | Network Standby off, power off | nothing: the display follows its own settings |
-| What wakes it for the next update | the NAS, with Wake-on-LAN (needs `EMDX_MAC`) | only Wake-on-LAN, if it still gets through without Network Standby | the NAS, with Wake-on-LAN |
-| Battery with one update a day (Samsung's figures for its sleep and deep sleep modes) | up to 70 days | up to 80 days | depends on its settings |
+Samsung quotes up to 70 days per charge in this sleep mode with one update a day, and up to 80 days in deep sleep, where Network Standby is off too ([product page](https://www.samsung.com/au/business/smart-signage/others/color-e-paper-emdx-a-lh32emdiagbxxy/), pre-release lab tests). Deep sleep isn't offered here, because nothing woke an EM32DX reliably from it:
 
-Samsung's battery figures are for the 32" EMDX, from pre-release lab tests ([product page](https://www.samsung.com/au/business/smart-signage/others/color-e-paper-emdx-a-lh32emdiagbxxy/)).
+- There is no usable wake-up timer: the EM32DX refuses the "on-timer" command (MDC `0x25`) listed in some notes.
+- Wake-on-LAN woke it half a minute after it went into deep sleep, but not seven hours later.
 
-Deep sleep would buy roughly ten extra days per charge, but the display must still be woken for the next update. With Network Standby off, its Wi-Fi listener is off too, so Wake-on-LAN may not get through. And there is no known way to make it wake itself on a schedule over MDC: the EM32DX refuses the "on-timer" command (`0x25`) listed in some notes. To find out whether `deep` works on yours, run `sudo docker exec emdx-photo-frame node src/index.js sleep-test deep`. If Wake-on-LAN doesn't wake it, press the display's power button, run `sleep standby`, and keep the default.
+`sleep-test [minutes]` checks the setup: it puts the display to sleep, waits until it stops answering plus the given minutes, then wakes it with Wake-on-LAN.
 
 The sleep commands (MDC `0x11` power, `0xB5` Network Standby) follow the EMDX command notes in [taylorRichie/node-samsung-emdx](https://github.com/taylorRichie/node-samsung-emdx/blob/main/docs/MDC-COMMANDS.md).
 
@@ -114,7 +111,7 @@ The sleep commands (MDC `0x11` power, `0xB5` Network Standby) follow the EMDX co
 
 - **"accepted the command but never downloaded"**: the display can't reach `http://SERVER_HOST:HTTP_PORT`. Check `SERVER_HOST`, the DSM firewall, and that the display and the NAS are on the same network.
 - **"Incorrect PIN"**: check `EMDX_PIN`. After several wrong PINs the display may block MDC for a while.
-- **"Could not connect"**: the display is asleep or offline. Set `EMDX_MAC` for Wake-on-LAN, run `sleep-test`, try `WOL_BROADCAST` set to your network's broadcast address, or raise `WAKE_WAIT_SEC`. In `deep` sleep, press its power button and go back to `SLEEP_MODE=standby`.
+- **"Could not connect"**: the display is asleep or offline. Set `EMDX_MAC` for Wake-on-LAN, check its battery and that Network Standby is on, run `sleep-test`, try `WOL_BROADCAST` set to your network's broadcast address, or raise `WAKE_WAIT_SEC`. Pressing the display's power button wakes it.
 - **"the display refused MDC command …"**: this firmware doesn't support that command. Please open an issue with the full message.
 - **Album errors**: run `check-album`. If it fails while the link opens fine in a browser, Google probably changed the page format. The frame keeps using the cached list in the meantime.
 - **Photos too dark or flat on the panel**: try `SATURATION=1.15`, `CONTRAST=0.2` or `GAMMA=1.15`.

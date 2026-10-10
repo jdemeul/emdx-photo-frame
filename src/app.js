@@ -250,12 +250,10 @@ export class FrameApp {
   // Say why a sleeping display could not be reached, and what to do about it.
   explainUnreachable(err) {
     if (!err.unreachable || this.cfg.sleep.mode === 'off') return err;
-    const hint = !this.cfg.display.mac
-      ? 'Set EMDX_MAC so the NAS can wake it from sleep with Wake-on-LAN.'
-      : this.cfg.sleep.mode === 'deep'
-        ? 'In deep sleep Wake-on-LAN may not reach it: press its power button, and use SLEEP_MODE=standby if this keeps happening.'
-        : null;
-    if (!hint) return err;
+    const hint = this.cfg.display.mac
+      ? 'Wake-on-LAN did not wake it: check its battery and that its Network Standby is on ' +
+        '(sleep-test checks the setup). Pressing its power button wakes it too.'
+      : 'Set EMDX_MAC so the NAS can wake it from sleep with Wake-on-LAN.';
     const e = new Error(`${err.what || err.message}. ${hint}`);
     e.unreachable = true;
     return e;
@@ -343,11 +341,9 @@ export class FrameApp {
     }
     const { mode } = this.cfg.sleep;
     return this.exclusive('Putting the display to sleep', async () => {
-      await putToSleep(this.cfg, { mode });
+      await putToSleep(this.cfg);
       this.state.sleep = { mode, asleep: true, sleptAt: Date.now() };
-      log.info(mode === 'deep'
-        ? 'Display is in deep sleep (network standby off).'
-        : `Display is asleep${this.cfg.display.mac ? '; Wake-on-LAN wakes it for the next update' : ''}.`);
+      log.info(`Display is asleep${this.cfg.display.mac ? '; Wake-on-LAN wakes it for the next update' : ''}.`);
       this.store.save();
     });
   }

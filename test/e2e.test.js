@@ -113,24 +113,19 @@ test('a full day: album -> render -> display downloads a palette-only PNG', { sk
     assert.ok(emdx.events.includes('wol'));
     await until(() => app.state.sleep?.asleep && !emdx.state.awake);
 
-    // Deep sleep switches network standby off too...
-    cfg.sleep.mode = 'deep';
-    await app.resend();
-    await until(() => app.state.sleep?.asleep && !emdx.state.awake);
-    assert.deepEqual(cmds().slice(-3), ['cmd:b5', 'cmd:b5:0', 'cmd:11:0']);
-    assert.equal(emdx.state.networkStandby, false);
-
-    // ...so if Wake-on-LAN can't reach it then, an update says what to do, and doesn't retry.
+    // If its Wi-Fi stops hearing Wake-on-LAN while it sleeps (network standby switched
+    // off, as an EM32DX in deep sleep does after a while), an update says what to do,
+    // and a manual one doesn't retry.
+    emdx.state.networkStandby = false;
     cfg.display.connectAttempts = 1;
-    await assert.rejects(app.resend(), /Wake-on-LAN may not reach it: press its power button.*SLEEP_MODE=standby/);
+    await assert.rejects(app.resend(), /Wake-on-LAN did not wake it: check its battery and that its Network Standby is on/);
     assert.ok(emdx.events.includes('wol-unheard'));
     assert.equal(app.state.history[0].ok, false);
     assert.equal(app.retryTimer, null);
 
-    // Someone presses its button: "Send again" works, and back in standby mode
-    // network standby is switched on again before it sleeps.
+    // Someone presses its button: "Send again" works, and network standby is switched
+    // back on before it goes to sleep.
     emdx.wake();
-    cfg.sleep.mode = 'standby';
     assert.ok((await app.resend()).pushed);
     await until(() => app.state.sleep?.asleep && !emdx.state.awake);
     assert.deepEqual(cmds().slice(-3), ['cmd:b5', 'cmd:b5:1', 'cmd:11:0']);

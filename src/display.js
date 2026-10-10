@@ -5,9 +5,11 @@
 //
 // Sleep uses two more MDC commands that the EM32DX accepts (see the command notes in
 // github.com/taylorRichie/node-samsung-emdx): 0x11 power (0x00 = off) and 0xB5 network
-// standby, the Wi-Fi listener that Wake-on-LAN needs. There is no known way to make
-// the display wake itself on a timer: the EM32DX refuses 0x25, which those notes list
-// as an on-timer (on Samsung's other screens 0x25 is brightness).
+// standby, the Wi-Fi listener that Wake-on-LAN needs. Deep sleep (network standby off)
+// is not used: there is no known way to make the display wake itself on a timer (the
+// EM32DX refuses 0x25, which those notes list as an on-timer; on Samsung's other screens
+// 0x25 is brightness), and Wake-on-LAN reached it half a minute into deep sleep but
+// not seven hours later.
 import dgram from 'node:dgram';
 import { Device } from '@weejewel/samsung-mdc';
 import { log } from './log.js';
@@ -155,22 +157,21 @@ export async function pushToDisplay(cfg, server, png) {
   );
 }
 
-// Put the display to sleep: network standby on (standby) or off (deep), then power off.
-// If network standby can't be set as wanted, it stays awake rather than risk being
-// powered off out of reach.
-export async function putToSleep(cfg, { mode }) {
-  const want = mode === 'deep' ? 0x00 : 0x01;
+// Put the display to sleep: make sure network standby is on, so Wake-on-LAN can wake
+// it, then power off. If network standby can't be switched on, the display stays
+// awake rather than risk being powered off out of reach.
+export async function putToSleep(cfg) {
   const device = await connect(cfg, { windowSec: 60, quiet: true });
   try {
-    let current = null;
+    let on = false;
     try {
-      current = (await cmd(device, CMD_NETWORK_STANDBY, [], 'Reading network standby'))[0];
+      on = (await cmd(device, CMD_NETWORK_STANDBY, [], 'Reading network standby'))[0] === 0x01;
     } catch (err) {
       log.debug(err.message);
     }
-    if (current !== want) {
+    if (!on) {
       await sleep(300); // the display drops responses if commands come too fast
-      await cmd(device, CMD_NETWORK_STANDBY, [want], want ? 'Turning on network standby' : 'Turning off network standby');
+      await cmd(device, CMD_NETWORK_STANDBY, [0x01], 'Turning on network standby');
     }
     await sleep(300);
     try {

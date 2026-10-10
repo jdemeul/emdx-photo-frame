@@ -6,8 +6,8 @@
 //   node src/index.js check-album      read the album(s) and print what was found
 //   node src/index.js display-info     connect to the display and print name/battery/network standby (changes nothing)
 //   node src/index.js test-pattern     send the calibration image to the display
-//   node src/index.js sleep [mode]     put the display to sleep now (standby | deep; default SLEEP_MODE)
-//   node src/index.js sleep-test [mode] put the display to sleep, then check that Wake-on-LAN wakes it
+//   node src/index.js sleep            put the display to sleep now (network standby on, power off)
+//   node src/index.js sleep-test [min] put the display to sleep, wait [min] more minutes, check Wake-on-LAN wakes it
 //   node src/index.js render <img...>  render local image files to <DATA_DIR>/render-test (no display needed)
 import fs from 'node:fs';
 import path from 'node:path';
@@ -24,7 +24,7 @@ import { composeCanvas, renderCanvas } from './render.js';
 
 process.on('unhandledRejection', (err) => log.error('Unhandled error:', err));
 
-// A display in deep sleep doesn't answer at all; say what to do about it.
+// A sleeping display that Wake-on-LAN doesn't reach answers nothing; say what to do about it.
 function asleepHint(err) {
   if (err.unreachable) err.message = `${err.what}. Is it on the network? If it is asleep and Wake-on-LAN doesn't reach it, press its power button first.`;
   throw err;
@@ -34,6 +34,9 @@ async function main() {
   const [cmd = 'serve', ...args] = process.argv.slice(2);
   const cfg = loadConfig();
   const model = buildPaletteModel(cfg.image.measuredPalette, DEVICE_PALETTE);
+  if (cfg.sleep.deepRequested) {
+    log.warn('SLEEP_MODE=deep is no longer supported (Wake-on-LAN stops reaching an EM32DX in deep sleep after a while); using standby.');
+  }
 
   if (cmd === 'check-album') {
     if (!cfg.albumUrls.length) throw new Error('Set ALBUM_URLS first');
@@ -54,26 +57,22 @@ async function main() {
   }
 
   if (cmd === 'sleep') {
-    const mode = args[0] || (cfg.sleep.mode === 'off' ? 'standby' : cfg.sleep.mode);
-    if (!['standby', 'deep'].includes(mode)) throw new Error('Usage: sleep [standby|deep]');
-    await putToSleep(cfg, { mode }).catch(asleepHint);
-    log.info(mode === 'deep' ? 'Display is in deep sleep (network standby off).' : 'Display is asleep with network standby on.');
+    await putToSleep(cfg).catch(asleepHint);
+    log.info('Display is asleep with network standby on.');
     return;
   }
 
-  // Can the NAS wake the display from this kind of sleep? Sleep, wait until it stops
-  // answering, then try Wake-on-LAN for 90 s.
+  // Can the NAS wake the display? Put it to sleep, wait until it stops answering (and
+  // then [minutes] more: some displays stop hearing Wake-on-LAN only after a while),
+  // then try Wake-on-LAN for 90 s.
   if (cmd === 'sleep-test') {
     const wait = (ms) => new Promise((r) => setTimeout(r, ms));
-    const mode = args[0] || (cfg.sleep.mode === 'deep' ? 'deep' : 'standby');
-    if (!['standby', 'deep'].includes(mode)) throw new Error('Usage: sleep-test [standby|deep]');
+    const minutes = Math.max(0, Number(args[0] || 0));
+    if (!Number.isFinite(minutes)) throw new Error('Usage: sleep-test [minutes]');
     if (!cfg.display.mac) throw new Error('Set EMDX_MAC first: Wake-on-LAN is how the NAS wakes the display.');
-    const routine = cfg.sleep.mode === 'deep' ? 'deep' : 'standby';
-    const recover = 'Press its power button to wake it, then run "node src/index.js sleep standby" ' +
-      '(or press "Next photo now" on the web page).';
 
-    log.info(`Putting the display to sleep (${mode === 'deep' ? 'deep: network standby off' : 'standby: network standby on'})…`);
-    await putToSleep(cfg, { mode }).catch(asleepHint);
+    log.info('Putting the display to sleep (network standby on)…');
+    await putToSleep(cfg).catch(asleepHint);
     let asleep = false;
     for (let i = 0; i < 8 && !asleep; i++) {
       await wait(15000);
@@ -81,25 +80,28 @@ async function main() {
     }
     if (!asleep) {
       log.info('It still answers 2 minutes after the power-off command, so the NAS can reach it without Wake-on-LAN.');
-      if (mode !== routine) await putToSleep(cfg, { mode: routine });
       return;
     }
-    log.info('It stopped answering: asleep. Waking it with Wake-on-LAN…');
+    log.info('It stopped answering: asleep.');
+    if (minutes) {
+      log.info(`Letting it sleep for ${minutes} more minute${minutes === 1 ? '' : 's'}…`);
+      await wait(minutes * 60000);
+    }
+    log.info('Waking it with Wake-on-LAN…');
     const start = Date.now();
     while (Date.now() - start < 90000) {
       await sendWakeOnLan(cfg);
       await wait(5000);
       if (await probeDisplay(cfg)) {
-        log.info(`Wake-on-LAN woke it after ${Math.round((Date.now() - start) / 1000)} s: SLEEP_MODE=${mode} works with this display.`);
-        await putToSleep(cfg, { mode: routine });
-        log.info(`Back to sleep (${routine}).`);
+        log.info(`Wake-on-LAN woke it after ${Math.round((Date.now() - start) / 1000)} s.`);
+        await putToSleep(cfg);
+        log.info('Back to sleep.');
         return;
       }
     }
     throw new Error(
-      mode === 'deep'
-        ? `Wake-on-LAN did not wake it from deep sleep, so deep sleep can't be used with this display: keep SLEEP_MODE=standby. ${recover}`
-        : `Wake-on-LAN did not wake it. Check EMDX_MAC, and try WOL_BROADCAST set to your network's broadcast address (e.g. 192.168.1.255). ${recover}`,
+      'Wake-on-LAN did not wake it. Check EMDX_MAC, and try WOL_BROADCAST set to your network\'s broadcast ' +
+        'address (e.g. 192.168.1.255). Press its power button to wake it.',
     );
   }
 
