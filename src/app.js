@@ -6,7 +6,7 @@ import { fetchAlbum, fetchItemInfo, sizedUrl, downloadImage } from './sources/go
 import { scanFolder } from './sources/folder.js';
 import { syncBag, planNext, markShown } from './selector.js';
 import { composeCanvas, renderCanvas, planCells } from './render.js';
-import { pushToDisplay, putToSleep } from './display.js';
+import { pushToDisplay, putToSleep, readDisplayInfo } from './display.js';
 import { renderTestPattern } from './testPattern.js';
 
 const DAY = 24 * 3600 * 1000;
@@ -247,6 +247,12 @@ export class FrameApp {
     return inputs;
   }
 
+  // Unless sleep is left to the display, make sure its network standby is on during each
+  // update: it may doze off by itself before the NAS sends it to sleep.
+  pushOptions() {
+    return { networkStandby: this.cfg.sleep.mode !== 'off' };
+  }
+
   // Say why a sleeping display could not be reached, and what to do about it.
   explainUnreachable(err) {
     if (!err.unreachable || this.cfg.sleep.mode === 'off') return err;
@@ -278,7 +284,8 @@ export class FrameApp {
       return current;
     }
     try {
-      const { battery } = await pushToDisplay(this.cfg, this.server, png);
+      const { battery, networkStandbyWas } = await pushToDisplay(this.cfg, this.server, png, this.pushOptions());
+      st.networkStandbyWas = { value: networkStandbyWas, at: Date.now() };
       current.pushed = true;
       current.pushedAt = Date.now();
       if (battery) st.battery = { ...battery, at: Date.now() };
@@ -341,9 +348,22 @@ export class FrameApp {
     }
     const { mode } = this.cfg.sleep;
     return this.exclusive('Putting the display to sleep', async () => {
-      await putToSleep(this.cfg);
-      this.state.sleep = { mode, asleep: true, sleptAt: Date.now() };
-      log.info(`Display is asleep${this.cfg.display.mac ? '; Wake-on-LAN wakes it for the next update' : ''}.`);
+      let self = false;
+      try {
+        await putToSleep(this.cfg);
+      } catch (err) {
+        // Out of reach already: it went to sleep by itself after the update. Its network
+        // standby was switched on during the update, so Wake-on-LAN can still wake it.
+        if (!err.unreachable) {
+          this.state.sleep = { ...this.state.sleep, error: err.message };
+          throw err;
+        }
+        self = true;
+      }
+      this.state.sleep = { mode, asleep: true, sleptAt: Date.now(), self };
+      log.info(self
+        ? 'The display had already gone to sleep by itself.'
+        : `Display is asleep${this.cfg.display.mac ? '; Wake-on-LAN wakes it for the next update' : ''}.`);
       this.store.save();
     });
   }
@@ -377,7 +397,7 @@ export class FrameApp {
       if (push && this.cfg.display.host) {
         this.setBusy('Sending the test pattern');
         try {
-          await pushToDisplay(this.cfg, this.server, devicePng);
+          await pushToDisplay(this.cfg, this.server, devicePng, this.pushOptions());
         } catch (err) {
           if (!err.unreachable) this.markAwake();
           throw this.explainUnreachable(err);
@@ -388,6 +408,22 @@ export class FrameApp {
         this.store.save();
       }
     });
+  }
+
+  // Read the display's name, battery and network standby (wakes it with Wake-on-LAN).
+  displayInfo() {
+    return this.exclusive('Reading the display', async () => {
+      const info = await readDisplayInfo(this.cfg);
+      this.markAwake();
+      this.scheduleSleep();
+      return info;
+    });
+  }
+
+  // Put the display to sleep now (instead of waiting for SLEEP_DELAY_SEC).
+  async sleepRightAway() {
+    this.cancelSleep();
+    await this.sleepNow();
   }
 
   addHistory(entry) {
@@ -413,6 +449,7 @@ export class FrameApp {
       testPattern: st.testPattern || null,
       dither: this.cfg.image.dither,
       sleep: this.cfg.display.host ? this.sleepStatus() : null,
+      networkStandbyWas: st.networkStandbyWas || null,
     };
   }
 

@@ -29,7 +29,8 @@ export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage =
   // Events look like 'auth', 'cmd:1b', 'cmd:b5:1' (hex command, decimal payload), 'wol'.
   const events = [];
   const received = [];
-  const state = { awake: true, networkStandby: true };
+  // hearsWol: false simulates a sleeping display that Wake-on-LAN doesn't reach at all.
+  const state = { awake: true, networkStandby: true, hearsWol: true };
   const server = net.createServer((raw) => {
     raw.on('error', () => {});
     if (!state.awake) { // asleep: nothing answers
@@ -86,8 +87,9 @@ export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage =
   const wol = dgram.createSocket('udp4');
   wol.on('message', (msg) => {
     if (!msg.equals(magic)) return events.push('wol-other');
-    events.push(state.networkStandby ? 'wol' : 'wol-unheard');
-    if (state.networkStandby) state.awake = true;
+    const heard = state.networkStandby && state.hearsWol;
+    events.push(heard ? 'wol' : 'wol-unheard');
+    if (heard) state.awake = true;
   });
   await new Promise((r) => wol.bind(0, '127.0.0.1', r));
 

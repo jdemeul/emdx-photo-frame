@@ -122,11 +122,32 @@ async function connect(cfg, { windowSec = 0, quiet = false } = {}) {
   throw e;
 }
 
-// Push an image. Returns { battery }; throws when the display never fetched the image.
-export async function pushToDisplay(cfg, server, png) {
+// Make sure network standby (the Wi-Fi listener Wake-on-LAN needs) is on.
+// Returns whether it already was: true, false, or null when it couldn't be read.
+async function ensureNetworkStandby(device) {
+  let was = null;
+  try {
+    was = (await cmd(device, CMD_NETWORK_STANDBY, [], 'Reading network standby'))[0] === 0x01;
+  } catch (err) {
+    log.debug(err.message);
+  }
+  if (was !== true) {
+    await sleep(300); // the display drops responses if commands come too fast
+    await cmd(device, CMD_NETWORK_STANDBY, [0x01], 'Turning on network standby');
+    log.info(was === false ? 'Network standby was off; switched it on.' : 'Switched network standby on.');
+  }
+  return was;
+}
+
+// Push an image. With `networkStandby`, also make sure network standby is on: the
+// display may go to sleep by itself soon after the update, before the NAS sends it
+// to sleep, and it then needs network standby for Wake-on-LAN to wake it next time.
+// Returns { battery, networkStandbyWas }; throws when the display never fetched the image.
+export async function pushToDisplay(cfg, server, png, { networkStandby = false } = {}) {
   const d = cfg.display;
   const push = server.registerPush(png, 'png');
   let battery = null;
+  let networkStandbyWas = null;
   try {
     for (let attempt = 1; attempt <= d.pushAttempts; attempt++) {
       const device = await connect(cfg);
@@ -136,6 +157,15 @@ export async function pushToDisplay(cfg, server, png) {
         } catch (err) {
           log.debug(`No battery info: ${err.message}`);
         }
+        if (networkStandby) {
+          await sleep(300);
+          try {
+            networkStandbyWas = await ensureNetworkStandby(device);
+          } catch (err) {
+            log.warn(`Could not switch network standby on: ${err.message}`);
+          }
+          await sleep(300);
+        }
         log.info(`Asking the display to download ${push.contentUrl}`);
         await withTimeout(device.setContentDownload({ url: push.contentUrl }), 15000, 'Sending the content URL');
       } finally {
@@ -144,7 +174,7 @@ export async function pushToDisplay(cfg, server, png) {
       const ok = await push.waitForImage(d.fetchTimeoutSec * 1000);
       if (ok) {
         log.info('The display downloaded the image; it will refresh in a moment.');
-        return { battery };
+        return { battery, networkStandbyWas };
       }
       log.warn(`The display did not fetch the image within ${d.fetchTimeoutSec}s (attempt ${attempt}/${d.pushAttempts}).`);
     }
@@ -161,18 +191,9 @@ export async function pushToDisplay(cfg, server, png) {
 // it, then power off. If network standby can't be switched on, the display stays
 // awake rather than risk being powered off out of reach.
 export async function putToSleep(cfg) {
-  const device = await connect(cfg, { windowSec: 60, quiet: true });
+  const device = await connect(cfg, { windowSec: cfg.display.sleepWindowSec ?? 60, quiet: true });
   try {
-    let on = false;
-    try {
-      on = (await cmd(device, CMD_NETWORK_STANDBY, [], 'Reading network standby'))[0] === 0x01;
-    } catch (err) {
-      log.debug(err.message);
-    }
-    if (!on) {
-      await sleep(300); // the display drops responses if commands come too fast
-      await cmd(device, CMD_NETWORK_STANDBY, [0x01], 'Turning on network standby');
-    }
+    await ensureNetworkStandby(device);
     await sleep(300);
     try {
       await cmd(device, CMD_POWER, [0x00], 'Powering off');

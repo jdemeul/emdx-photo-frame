@@ -86,7 +86,7 @@ Other commands (`sudo docker exec emdx-photo-frame node src/index.js <cmd>` on t
 
 ## 6. Sleep and battery
 
-E-paper keeps its picture without power, but a display that stays awake on Wi-Fi uses battery. So once the panel has redrawn (`SLEEP_DELAY_SEC`), the NAS makes sure the display's Network Standby is on and powers it off. Network Standby keeps a Wi-Fi listener running, so the next update can wake the display with Wake-on-LAN. `SLEEP_MODE=off` leaves sleeping to the display's own settings instead.
+E-paper keeps its picture without power, but a display that stays awake on Wi-Fi uses battery. So once the panel has redrawn (`SLEEP_DELAY_SEC`), the NAS powers the display off. Network Standby keeps a Wi-Fi listener running while it sleeps, so the next update can wake it with Wake-on-LAN. The display may also go to sleep by itself before the NAS gets to it (the "sleep time" set in the Samsung E-Paper app), so the NAS switches Network Standby on during every update, not just when it sends the display to sleep. `SLEEP_MODE=off` leaves sleeping and Network Standby to the display's own settings instead.
 
 Samsung quotes up to 70 days per charge in this sleep mode with one update a day, and up to 80 days in deep sleep, where Network Standby is off too ([product page](https://www.samsung.com/au/business/smart-signage/others/color-e-paper-emdx-a-lh32emdiagbxxy/), pre-release lab tests). Deep sleep isn't offered here, because nothing woke an EM32DX reliably from it:
 
@@ -111,7 +111,7 @@ The sleep commands (MDC `0x11` power, `0xB5` Network Standby) follow the EMDX co
 
 - **"accepted the command but never downloaded"**: the display can't reach `http://SERVER_HOST:HTTP_PORT`. Check `SERVER_HOST`, the DSM firewall, and that the display and the NAS are on the same network.
 - **"Incorrect PIN"**: check `EMDX_PIN`. After several wrong PINs the display may block MDC for a while.
-- **"Could not connect"**: the display is asleep or offline. Set `EMDX_MAC` for Wake-on-LAN, check its battery and that Network Standby is on, run `sleep-test`, try `WOL_BROADCAST` set to your network's broadcast address, or raise `WAKE_WAIT_SEC`. Pressing the display's power button wakes it.
+- **"Could not connect"**: the display is asleep or offline. Set `EMDX_MAC` for Wake-on-LAN, check its battery, run `sleep-test`, try `WOL_BROADCAST` set to your network's broadcast address, or raise `WAKE_WAIT_SEC`. If it fell asleep while Network Standby was off, Wake-on-LAN can't reach it: press its power button and send a photo, which switches Network Standby back on.
 - **"the display refused MDC command …"**: this firmware doesn't support that command. Please open an issue with the full message.
 - **Album errors**: run `check-album`. If it fails while the link opens fine in a browser, Google probably changed the page format. The frame keeps using the cached list in the meantime.
 - **Photos too dark or flat on the panel**: try `SATURATION=1.15`, `CONTRAST=0.2` or `GAMMA=1.15`.

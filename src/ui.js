@@ -86,7 +86,8 @@ function sleepText(s) {
   const hm = (t) => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   if (!z) return '–';
   if (z.mode === 'off') return 'sleeps by its own settings (SLEEP_MODE=off)';
-  if (z.asleep) return 'asleep, the next update wakes it';
+  if (z.asleep) return 'asleep' + (z.self ? ' (went to sleep by itself)' : '') + ', the next update wakes it';
+  if (z.error) return 'awake? could not put it to sleep: ' + z.error;
   if (z.pending && z.sleepAt) return 'awake, goes to sleep at ' + hm(z.sleepAt);
   return 'awake';
 }

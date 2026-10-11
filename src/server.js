@@ -147,14 +147,21 @@ export function createServer(cfg, app) {
       '/api/resend': () => app.resend(),
       '/api/test-pattern': () => app.testPattern(),
       '/api/refresh-album': () => app.refreshLibrary(),
+      '/api/sleep': () => app.sleepRightAway(),
     };
-    if (actions[p] && req.method === 'POST') {
+    const isAction = actions[p] || p === '/api/display-info';
+    if (isAction && req.method === 'POST') {
       // Only accept button presses from this page (no cross-site requests).
       const origin = req.headers.origin;
       let sameHost = true;
       try { sameHost = !origin || new URL(origin).host === req.headers.host; } catch { sameHost = false; }
       if (!sameHost) return json(res, 403, { error: 'Cross-origin request refused' });
       if (app.busy) return json(res, 409, { error: `Busy: ${app.busy.what}` });
+      if (p === '/api/display-info') {
+        // Wakes the display and reads it; answers when done.
+        app.displayInfo().then((info) => json(res, 200, info), (err) => json(res, 502, { error: err.message }));
+        return;
+      }
       actions[p]().catch((err) => log.error(`${p} failed:`, err));
       return json(res, 202, { ok: true });
     }

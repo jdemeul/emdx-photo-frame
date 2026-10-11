@@ -123,13 +123,36 @@ test('a full day: album -> render -> display downloads a palette-only PNG', { sk
     assert.equal(app.state.history[0].ok, false);
     assert.equal(app.retryTimer, null);
 
-    // Someone presses its button: "Send again" works, and network standby is switched
-    // back on before it goes to sleep.
+    // Someone presses its button: "Send again" works, and the update itself switches
+    // network standby back on (the display may doze off before the NAS sends it to sleep).
     emdx.wake();
+    const before = cmds().length;
     assert.ok((await app.resend()).pushed);
-    await until(() => app.state.sleep?.asleep && !emdx.state.awake);
-    assert.deepEqual(cmds().slice(-3), ['cmd:b5', 'cmd:b5:1', 'cmd:11:0']);
+    assert.deepEqual(cmds().slice(before).filter((e) => !e.startsWith('cmd:1b')), ['cmd:b5', 'cmd:b5:1', 'cmd:c7']);
     assert.equal(emdx.state.networkStandby, true);
+    assert.equal(app.state.networkStandbyWas.value, false);
+    await until(() => app.state.sleep?.asleep && !emdx.state.awake);
+    assert.deepEqual(cmds().slice(-2), ['cmd:b5', 'cmd:11:0']);
+
+    // If it has already gone to sleep by itself (out of reach) when the NAS wants to send
+    // it to sleep, that counts as asleep rather than as a problem.
+    emdx.wake();
+    cfg.display.sleepWindowSec = 1;
+    assert.ok((await app.resend()).pushed);
+    emdx.state.awake = false;
+    emdx.state.hearsWol = false;
+    await until(() => app.state.sleep?.asleep);
+    assert.equal(app.state.sleep.self, true);
+    const selfSlept = await (await fetch('http://127.0.0.1:18321/api/status')).json();
+    assert.deepEqual([selfSlept.sleep.asleep, selfSlept.sleep.self], [true, true]);
+    emdx.state.hearsWol = true;
+
+    // Display info for diagnosis: Wake-on-LAN wakes it, the reading includes network
+    // standby, and it is sent back to sleep afterwards.
+    const info = await (await fetch('http://127.0.0.1:18321/api/display-info', { method: 'POST' })).json();
+    assert.equal(info.networkStandby, 'on');
+    assert.equal(info.battery.batteryPercent, 87);
+    await until(() => app.state.sleep?.asleep && !emdx.state.awake);
   } finally {
     app.cancelSleep();
     await server.close();
