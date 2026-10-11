@@ -34,9 +34,6 @@ async function main() {
   const [cmd = 'serve', ...args] = process.argv.slice(2);
   const cfg = loadConfig();
   const model = buildPaletteModel(cfg.image.measuredPalette, DEVICE_PALETTE);
-  if (cfg.sleep.deepRequested) {
-    log.warn('SLEEP_MODE=deep is no longer supported (Wake-on-LAN stops reaching an EM32DX in deep sleep after a while); using standby.');
-  }
 
   if (cmd === 'check-album') {
     if (!cfg.albumUrls.length) throw new Error('Set ALBUM_URLS first');

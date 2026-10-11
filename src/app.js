@@ -284,8 +284,7 @@ export class FrameApp {
       return current;
     }
     try {
-      const { battery, networkStandbyWas } = await pushToDisplay(this.cfg, this.server, png, this.pushOptions());
-      st.networkStandbyWas = { value: networkStandbyWas, at: Date.now() };
+      const { battery } = await pushToDisplay(this.cfg, this.server, png, this.pushOptions());
       current.pushed = true;
       current.pushedAt = Date.now();
       if (battery) st.battery = { ...battery, at: Date.now() };
@@ -410,12 +409,16 @@ export class FrameApp {
     });
   }
 
-  // Read the display's name, battery and network standby (wakes it with Wake-on-LAN).
+  // "Check display": read its name, firmware, battery and network standby. This wakes
+  // it (Wake-on-LAN), so it is sent back to sleep SLEEP_DELAY_SEC later.
   displayInfo() {
-    return this.exclusive('Reading the display', async () => {
+    return this.exclusive('Checking the display', async () => {
       const info = await readDisplayInfo(this.cfg);
       this.markAwake();
       this.scheduleSleep();
+      if (info.battery?.batteryPercent != null) this.state.battery = { ...info.battery, at: Date.now() };
+      this.state.displayCheck = { ...info, at: Date.now() };
+      this.store.save();
       return info;
     });
   }
@@ -449,7 +452,7 @@ export class FrameApp {
       testPattern: st.testPattern || null,
       dither: this.cfg.image.dither,
       sleep: this.cfg.display.host ? this.sleepStatus() : null,
-      networkStandbyWas: st.networkStandbyWas || null,
+      displayCheck: st.displayCheck || null,
     };
   }
 

@@ -122,12 +122,6 @@ export function loadConfig() {
   }
   const httpPort = num('HTTP_PORT', 8321);
 
-  // Sleep after each update. `deep` (network standby off too) is no longer offered:
-  // an EM32DX in deep sleep stops hearing Wake-on-LAN after a while. Treat it as standby.
-  const sleepSetting = (str('SLEEP_MODE', 'standby') || '').toLowerCase();
-  const sleepMode = sleepSetting === 'deep' ? 'standby' : sleepSetting;
-  if (!['standby', 'off'].includes(sleepMode)) throw new Error(`SLEEP_MODE must be standby or off (got "${sleepSetting}")`);
-
   // Default: let the display do the final dithering. On the EM32DX its own algorithm
   // beat the NAS ditherer side by side (deeper colours, quieter dark tones).
   const dither = oneOf('DITHER', 'device', ['device', 'local']);
@@ -168,8 +162,7 @@ export function loadConfig() {
     //             update can wake it with Wake-on-LAN
     //   off     - leave it to the display's own settings (e.g. when it is on mains power)
     sleep: {
-      mode: sleepMode,
-      deepRequested: sleepSetting === 'deep', // old setting, now treated as standby
+      mode: oneOf('SLEEP_MODE', 'standby', ['standby', 'off']),
       delaySec: num('SLEEP_DELAY_SEC', 120), // let the panel finish redrawing first
     },
 

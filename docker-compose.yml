@@ -10,6 +10,11 @@ services:
     init: true
     env_file: .env
     volumes:
-      - ./data:/data
+      # State, the current image and previews. A Docker volume rather than a folder in
+      # the project, so replacing or re-copying the project folder doesn't wipe it.
+      - frame-data:/data
       # Optional extra source: a folder of photos on the NAS (then set PHOTO_DIR=/photos)
       # - /volume1/photo/frame:/photos:ro
+
+volumes:
+  frame-data:

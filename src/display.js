@@ -140,14 +140,13 @@ async function ensureNetworkStandby(device) {
 }
 
 // Push an image. With `networkStandby`, also make sure network standby is on: the
-// display may go to sleep by itself soon after the update, before the NAS sends it
-// to sleep, and it then needs network standby for Wake-on-LAN to wake it next time.
-// Returns { battery, networkStandbyWas }; throws when the display never fetched the image.
+// display may go to sleep by itself before the NAS sends it to sleep, and it then
+// needs network standby for Wake-on-LAN to wake it next time.
+// Returns { battery }; throws when the display never fetched the image.
 export async function pushToDisplay(cfg, server, png, { networkStandby = false } = {}) {
   const d = cfg.display;
   const push = server.registerPush(png, 'png');
   let battery = null;
-  let networkStandbyWas = null;
   try {
     for (let attempt = 1; attempt <= d.pushAttempts; attempt++) {
       const device = await connect(cfg);
@@ -160,7 +159,7 @@ export async function pushToDisplay(cfg, server, png, { networkStandby = false }
         if (networkStandby) {
           await sleep(300);
           try {
-            networkStandbyWas = await ensureNetworkStandby(device);
+            await ensureNetworkStandby(device);
           } catch (err) {
             log.warn(`Could not switch network standby on: ${err.message}`);
           }
@@ -174,7 +173,7 @@ export async function pushToDisplay(cfg, server, png, { networkStandby = false }
       const ok = await push.waitForImage(d.fetchTimeoutSec * 1000);
       if (ok) {
         log.info('The display downloaded the image; it will refresh in a moment.');
-        return { battery, networkStandbyWas };
+        return { battery };
       }
       log.warn(`The display did not fetch the image within ${d.fetchTimeoutSec}s (attempt ${attempt}/${d.pushAttempts}).`);
     }

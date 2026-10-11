@@ -52,6 +52,7 @@ export const UI_HTML = `<!doctype html>
       <button data-act="resend">Send again</button>
       <button data-act="test-pattern">Show test pattern</button>
       <button data-act="refresh-album">Re-read album</button>
+      <button data-act="display-info" title="Wakes the display and reads its battery and Network Standby">Check display</button>
     </div>
     <dl id="info"></dl>
     <div id="error" class="err"></div>
@@ -91,6 +92,10 @@ function sleepText(s) {
   if (z.pending && z.sleepAt) return 'awake, goes to sleep at ' + hm(z.sleepAt);
   return 'awake';
 }
+function checkText(c) {
+  if (!c) return '–';
+  return esc(fmt(c.at) + ' · Network Standby ' + c.networkStandby + ' · ' + c.name + ', firmware ' + c.software);
+}
 function render(s) {
   last = s;
   $('#state').textContent = s.busy ? s.busy.what + '…' : 'idle';
@@ -107,6 +112,7 @@ function render(s) {
     ['Next update', fmt(s.nextRun)],
     ['Battery', s.battery ? esc(s.battery.batteryPercent + '%' + (s.battery.pluggedIn ? ' (charging)' : '')) : '–'],
     ['Display', esc(sleepText(s))],
+    ['Last check', checkText(s.displayCheck)],
     ['This round', s.cycle ? esc(s.cycle.shown + ' of ' + s.cycle.total + ' photos shown (round ' + s.cycle.n + ')') : '–'],
     ['Album', s.library ? esc(s.library.titles.join(', ') + ' · ' + s.library.count + ' photos · read ' ) + fmt(s.library.fetchedAt) : '–'],
   ];

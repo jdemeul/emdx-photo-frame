@@ -19,16 +19,16 @@ It runs as a single Docker container. It was written for a Synology NAS (tested 
 | **Display PIN** | The 6-digit device security PIN you set when configuring the display in the Samsung E-Paper app. |
 | **NAS IP address** | DSM → Control Panel → Network. |
 
-On the display (via the Samsung E-Paper app): set **Orientation** to match how it hangs (`.env.example` assumes portrait) and turn **Network Standby** on. Network Standby is the Wi-Fi listener that lets Wake-on-LAN wake the display; the NAS also switches it on each time it puts the display to sleep.
+On the display (via the Samsung E-Paper app): set **Orientation** to match how it hangs (`.env.example` assumes portrait) and turn **Network Standby** on. Network Standby is the Wi-Fi listener that lets Wake-on-LAN wake the display; the NAS also switches it on at every update.
 
 ## 2. Install on a Synology NAS (Container Manager)
 
-1. Copy this folder to the NAS, e.g. `/volume1/docker/emdx-photo-frame` (File Station, a mapped drive, or `git clone`). Keep the empty `data` folder: Container Manager won't start the project if it's missing.
+1. Copy this folder to the NAS, e.g. `/volume1/docker/emdx-photo-frame` (File Station, a mapped drive, or `git clone`).
 2. In that folder, copy `.env.example` to `.env` and fill in `ALBUM_URLS`, `EMDX_HOST`, `EMDX_PIN`, `EMDX_MAC` and `SERVER_HOST`.
 3. DSM → **Container Manager** → **Project** → **Create**. Choose the folder; it picks up `docker-compose.yml`. Let it build and start. The first build takes a few minutes. (Over SSH instead: `cd /volume1/docker/emdx-photo-frame && sudo docker compose up -d --build`.)
 4. If the DSM firewall is on, allow TCP **8321** from your LAN. The display downloads each image from that port.
 
-The container uses host networking and restarts automatically. Its state, the current image and previews live in `./data`.
+The container uses host networking and restarts automatically. Its state (which photos were shown, history), the current image and previews live in a Docker volume, `frame-data`, so updating by copying a new version of the folder over the old one keeps them. To start over, stop the project and delete the volume over SSH: `sudo docker volume ls` shows its name (ending in `frame-data`), and `sudo docker volume rm <name>` removes it.
 
 ## 3. First run
 
@@ -88,12 +88,23 @@ Other commands (`sudo docker exec emdx-photo-frame node src/index.js <cmd>` on t
 
 E-paper keeps its picture without power, but a display that stays awake on Wi-Fi uses battery. So once the panel has redrawn (`SLEEP_DELAY_SEC`), the NAS powers the display off. Network Standby keeps a Wi-Fi listener running while it sleeps, so the next update can wake it with Wake-on-LAN. The display may also go to sleep by itself before the NAS gets to it (the "sleep time" set in the Samsung E-Paper app), so the NAS switches Network Standby on during every update, not just when it sends the display to sleep. `SLEEP_MODE=off` leaves sleeping and Network Standby to the display's own settings instead.
 
-Samsung quotes up to 70 days per charge in this sleep mode with one update a day, and up to 80 days in deep sleep, where Network Standby is off too ([product page](https://www.samsung.com/au/business/smart-signage/others/color-e-paper-emdx-a-lh32emdiagbxxy/), pre-release lab tests). Deep sleep isn't offered here, because nothing woke an EM32DX reliably from it:
-
-- There is no usable wake-up timer: the EM32DX refuses the "on-timer" command (MDC `0x25`) listed in some notes.
-- Wake-on-LAN woke it half a minute after it went into deep sleep, but not seven hours later.
+Samsung quotes up to 70 days per charge in this sleep mode with one update a day, and up to 80 days in deep sleep, where Network Standby is off too ([product page](https://www.samsung.com/au/business/smart-signage/others/color-e-paper-emdx-a-lh32emdiagbxxy/), pre-release lab tests). Deep sleep isn't offered here, because nothing woke an EM32DX reliably from it.
 
 `sleep-test [minutes]` checks the setup: it puts the display to sleep, waits until it stops answering plus the given minutes, then wakes it with Wake-on-LAN.
+
+### Findings: sleep and wake-up on an EM32DX
+
+Tested in October 2026 on an EM32DX (firmware S-RSEDWWC-1130.7) on 5 GHz Wi-Fi:
+
+| What | Result |
+|---|---|
+| Wake-up timer (MDC `0x25`, listed as an on-timer in some notes) | Refused (NAK). On Samsung's other screens `0x25` is brightness. |
+| Deep sleep (Network Standby off), then Wake-on-LAN | Woke it half a minute after it fell asleep, not seven hours later. |
+| Sleep with Network Standby on, then Wake-on-LAN | Woke it within seconds after 5, 15, 30 and 60 minutes asleep, and at 06:00 after a night on battery. |
+
+- **One earlier night it didn't wake** at 06:00 in this sleep mode either, nor later that morning. The battery was down to about 20% then; whether that was the cause isn't known.
+- **Battery:** near empty, the reading dropped about 3 percentage points an hour while the display slept between test wake-ups (19% to 10% over one morning). After a recharge it read 94% at the next morning's update, unplugged. The web page shows the reading after every update, so the drain over a normal week will tell whether Samsung's figures hold.
+- **Bluetooth:** Samsung's E-Paper app monitors the display over Bluetooth. The NAS has none, so Wake-on-LAN is its only way to wake the display.
 
 The sleep commands (MDC `0x11` power, `0xB5` Network Standby) follow the EMDX command notes in [taylorRichie/node-samsung-emdx](https://github.com/taylorRichie/node-samsung-emdx/blob/main/docs/MDC-COMMANDS.md).
 
@@ -111,11 +122,11 @@ The sleep commands (MDC `0x11` power, `0xB5` Network Standby) follow the EMDX co
 
 - **"accepted the command but never downloaded"**: the display can't reach `http://SERVER_HOST:HTTP_PORT`. Check `SERVER_HOST`, the DSM firewall, and that the display and the NAS are on the same network.
 - **"Incorrect PIN"**: check `EMDX_PIN`. After several wrong PINs the display may block MDC for a while.
+- **Is the display reachable, and how is it set?** The web page's **Check display** button wakes it and shows its battery, firmware and Network Standby (`display-info` does the same on the command line).
 - **"Could not connect"**: the display is asleep or offline. Set `EMDX_MAC` for Wake-on-LAN, check its battery, run `sleep-test`, try `WOL_BROADCAST` set to your network's broadcast address, or raise `WAKE_WAIT_SEC`. If it fell asleep while Network Standby was off, Wake-on-LAN can't reach it: press its power button and send a photo, which switches Network Standby back on.
 - **"the display refused MDC command …"**: this firmware doesn't support that command. Please open an issue with the full message.
 - **Album errors**: run `check-album`. If it fails while the link opens fine in a browser, Google probably changed the page format. The frame keeps using the cached list in the meantime.
 - **Photos too dark or flat on the panel**: try `SATURATION=1.15`, `CONTRAST=0.2` or `GAMMA=1.15`.
-- **Project won't start, `./data` not found**: create an empty `data` folder next to `docker-compose.yml`.
 
 Logs: Container Manager → Container → emdx-photo-frame → Log.
 

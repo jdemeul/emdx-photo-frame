@@ -130,7 +130,6 @@ test('a full day: album -> render -> display downloads a palette-only PNG', { sk
     assert.ok((await app.resend()).pushed);
     assert.deepEqual(cmds().slice(before).filter((e) => !e.startsWith('cmd:1b')), ['cmd:b5', 'cmd:b5:1', 'cmd:c7']);
     assert.equal(emdx.state.networkStandby, true);
-    assert.equal(app.state.networkStandbyWas.value, false);
     await until(() => app.state.sleep?.asleep && !emdx.state.awake);
     assert.deepEqual(cmds().slice(-2), ['cmd:b5', 'cmd:11:0']);
 
@@ -147,11 +146,13 @@ test('a full day: album -> render -> display downloads a palette-only PNG', { sk
     assert.deepEqual([selfSlept.sleep.asleep, selfSlept.sleep.self], [true, true]);
     emdx.state.hearsWol = true;
 
-    // Display info for diagnosis: Wake-on-LAN wakes it, the reading includes network
-    // standby, and it is sent back to sleep afterwards.
+    // "Check display": Wake-on-LAN wakes it, the reading (with network standby) shows
+    // on the page, and it is sent back to sleep afterwards.
     const info = await (await fetch('http://127.0.0.1:18321/api/display-info', { method: 'POST' })).json();
     assert.equal(info.networkStandby, 'on');
     assert.equal(info.battery.batteryPercent, 87);
+    const checked = await (await fetch('http://127.0.0.1:18321/api/status')).json();
+    assert.equal(checked.displayCheck.networkStandby, 'on');
     await until(() => app.state.sleep?.asleep && !emdx.state.awake);
   } finally {
     app.cancelSleep();
