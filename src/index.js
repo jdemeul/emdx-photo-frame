@@ -19,7 +19,7 @@ import { buildPaletteModel } from './color.js';
 import { FrameApp } from './app.js';
 import { createServer } from './server.js';
 import { fetchAlbum } from './sources/googleAlbum.js';
-import { readDisplayInfo, putToSleep, probeDisplay, sendWakeOnLan } from './display.js';
+import { readDisplayInfo, putToSleep, confirmAsleep, probeDisplay, sendWakeOnLan } from './display.js';
 import { composeCanvas, renderCanvas } from './render.js';
 
 process.on('unhandledRejection', (err) => log.error('Unhandled error:', err));
@@ -53,9 +53,19 @@ async function main() {
     return;
   }
 
-  if (cmd === 'sleep') {
+  // Put the display to sleep, then wait until it stops answering (the same check the
+  // service makes after every update).
+  const sleepAndConfirm = async () => {
     await putToSleep(cfg).catch(asleepHint);
-    log.info('Display is asleep with network standby on.');
+    const { confirmSec, confirmEverySec } = cfg.sleep;
+    const after = await confirmAsleep(cfg, { timeoutSec: confirmSec, everySec: confirmEverySec });
+    if (after === null) throw new Error(`The display still answers ${confirmSec} s after the power-off command: it did not go to sleep.`);
+    return after;
+  };
+
+  if (cmd === 'sleep') {
+    const after = await sleepAndConfirm();
+    log.info(`Display is asleep (it stopped answering after ${after} s), with network standby on.`);
     return;
   }
 
@@ -69,17 +79,7 @@ async function main() {
     if (!cfg.display.mac) throw new Error('Set EMDX_MAC first: Wake-on-LAN is how the NAS wakes the display.');
 
     log.info('Putting the display to sleep (network standby on)…');
-    await putToSleep(cfg).catch(asleepHint);
-    let asleep = false;
-    for (let i = 0; i < 8 && !asleep; i++) {
-      await wait(15000);
-      asleep = !(await probeDisplay(cfg));
-    }
-    if (!asleep) {
-      log.info('It still answers 2 minutes after the power-off command, so the NAS can reach it without Wake-on-LAN.');
-      return;
-    }
-    log.info('It stopped answering: asleep.');
+    log.info(`It stopped answering after ${await sleepAndConfirm()} s: asleep.`);
     if (minutes) {
       log.info(`Letting it sleep for ${minutes} more minute${minutes === 1 ? '' : 's'}…`);
       await wait(minutes * 60000);
@@ -91,8 +91,7 @@ async function main() {
       await wait(5000);
       if (await probeDisplay(cfg)) {
         log.info(`Wake-on-LAN woke it after ${Math.round((Date.now() - start) / 1000)} s.`);
-        await putToSleep(cfg);
-        log.info('Back to sleep.');
+        log.info(`Back to sleep (it stopped answering after ${await sleepAndConfirm()} s).`);
         return;
       }
     }
@@ -153,12 +152,14 @@ async function main() {
   if (cmd !== 'serve') throw new Error(`Unknown command "${cmd}"`);
   const job = new Cron(cfg.schedule, { timezone: cfg.timezone, protect: true }, () => app.scheduled());
   app.cron = job;
+  app.startSleepWatch();
   log.info(`Next update: ${job.nextRun()?.toISOString()} (UI: http://${cfg.server.publicHost}:${cfg.server.port}/)`);
   if (cfg.runOnStart) app.scheduled('start');
 
   const stop = async (sig) => {
     log.info(`${sig} received, shutting down`);
     job.stop();
+    app.stopSleepWatch();
     await server.close();
     process.exit(0);
   };

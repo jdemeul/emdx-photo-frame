@@ -6,7 +6,7 @@ import { fetchAlbum, fetchItemInfo, sizedUrl, downloadImage } from './sources/go
 import { scanFolder } from './sources/folder.js';
 import { syncBag, planNext, markShown } from './selector.js';
 import { composeCanvas, renderCanvas, planCells } from './render.js';
-import { pushToDisplay, putToSleep, readDisplayInfo } from './display.js';
+import { pushToDisplay, putToSleep, readDisplayInfo, confirmAsleep, probeDisplay } from './display.js';
 import { renderTestPattern } from './testPattern.js';
 
 const DAY = 24 * 3600 * 1000;
@@ -24,6 +24,7 @@ export class FrameApp {
     this.retryCount = 0;
     this.retryTimer = null;
     this.sleepTimer = null;
+    this.watchTimer = null;
     const st = this.state;
     st.excluded ||= {};
     st.history ||= [];
@@ -289,7 +290,10 @@ export class FrameApp {
       current.pushedAt = Date.now();
       if (battery) st.battery = { ...battery, at: Date.now() };
       markShown(st, current.ids);
-      this.addHistory({ ok: true, kind: current.kind, ids: current.ids, dates: current.items.map((i) => i.takenAt) });
+      this.addHistory({
+        ok: true, kind: current.kind, ids: current.ids, dates: current.items.map((i) => i.takenAt),
+        battery: battery?.batteryPercent ?? null,
+      });
       st.lastError = null;
       this.retryCount = 0;
       clearTimeout(this.retryTimer); // a pending retry would skip a photo now
@@ -345,26 +349,90 @@ export class FrameApp {
       }, 30000);
       return;
     }
-    const { mode } = this.cfg.sleep;
+    const { mode, confirmSec, confirmEverySec, checkMin } = this.cfg.sleep;
+    const pause = (sec) => new Promise((r) => setTimeout(r, sec * 1000));
+    // Sends the sleep command, then makes sure it worked: the display must stop answering
+    // (probed without Wake-on-LAN). An awake display keeps using its battery, so a failure
+    // gets a second try. A display that is out of reach already went to sleep by itself;
+    // its network standby was switched on during the update, so Wake-on-LAN still wakes it.
     return this.exclusive('Putting the display to sleep', async () => {
-      let self = false;
-      try {
-        await putToSleep(this.cfg);
-      } catch (err) {
-        // Out of reach already: it went to sleep by itself after the update. Its network
-        // standby was switched on during the update, so Wake-on-LAN can still wake it.
-        if (!err.unreachable) {
-          this.state.sleep = { ...this.state.sleep, error: err.message };
-          throw err;
+      let problem = null;
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        if (problem) {
+          log.warn(`The display did not go to sleep (${problem}); trying again.`);
+          await pause(confirmEverySec);
         }
-        self = true;
+        let reached = true;
+        try {
+          const { battery } = await putToSleep(this.cfg);
+          if (battery?.batteryPercent != null) this.state.battery = { ...battery, at: Date.now() };
+        } catch (err) {
+          if (!err.unreachable) { problem = err.message; continue; }
+          reached = false;
+        }
+        const after = reached ? await confirmAsleep(this.cfg, { timeoutSec: confirmSec, everySec: confirmEverySec }) : 0;
+        if (after === null) { problem = `it still answered ${confirmSec} s after the power-off command`; continue; }
+        const self = !reached && attempt === 1;
+        this.state.sleep = { mode, asleep: true, sleptAt: Date.now(), self, confirmedAfter: after };
+        log.info(self ? 'The display had already gone to sleep by itself.'
+          : `Display is asleep: it stopped answering ${after} s after the power-off command` +
+            `${this.cfg.display.mac ? '. Wake-on-LAN wakes it for the next update' : ''}.`);
+        this.store.save();
+        return;
       }
-      this.state.sleep = { mode, asleep: true, sleptAt: Date.now(), self };
-      log.info(self
-        ? 'The display had already gone to sleep by itself.'
-        : `Display is asleep${this.cfg.display.mac ? '; Wake-on-LAN wakes it for the next update' : ''}.`);
+      const b = this.state.battery;
+      const charging = b?.pluggedIn && Date.now() - b.at < 10 * 60000;
+      const message = `The display did not go to sleep, after two tries: ${problem}. ` +
+        (charging ? 'It is charging, so for now that costs no battery.' : 'Awake, it keeps using its battery.') +
+        (checkMin ? ` The NAS tries again at its next sleep check (every ${checkMin} min).` : '');
+      this.state.sleep = { mode, asleep: false, error: message, at: Date.now() };
       this.store.save();
+      throw new Error(message);
     });
+  }
+
+  // ---------- sleep check ----------
+  // Every SLEEP_CHECK_MIN minutes, unless the display is meant to be awake (an update, a
+  // pending sleep or a pending retry), check that it is asleep: probe it without Wake-on-LAN,
+  // so a sleeping display stays asleep. One that answers is put back to sleep, and noted.
+  startSleepWatch() {
+    const { mode, checkMin } = this.cfg.sleep;
+    if (!checkMin || mode === 'off' || !this.cfg.display.host) return;
+    clearInterval(this.watchTimer);
+    this.watchTimer = setInterval(() => {
+      this.checkAsleep().catch((err) => log.warn(`Sleep check: ${err.message}`));
+    }, checkMin * 60000);
+  }
+
+  stopSleepWatch() {
+    clearInterval(this.watchTimer);
+    this.watchTimer = null;
+  }
+
+  async checkAsleep() {
+    if (this.busy || this.sleepTimer || this.retryTimer) return null;
+    // Holding the lock: the display takes one connection at a time.
+    const awake = await this.exclusive('Checking that the display is asleep', () => probeDisplay(this.cfg));
+    const st = this.state;
+    st.lastCheck = { at: Date.now(), awake };
+    if (!awake) {
+      this.store.save();
+      return false;
+    }
+    log.warn('Sleep check: the display is awake although it should be asleep; putting it back to sleep.');
+    const event = { at: Date.now(), wasAsleep: this.believedAsleep() };
+    st.wakeEvents = [event, ...(st.wakeEvents || [])].slice(0, 20);
+    this.markAwake();
+    this.store.save();
+    try {
+      await this.sleepNow();
+      event.putBack = true;
+    } finally {
+      const b = st.battery; // read while putting it back to sleep
+      if (b?.at >= event.at) Object.assign(event, { battery: b.batteryPercent ?? null, charging: !!b.pluggedIn });
+      this.store.save();
+    }
+    return true;
   }
 
   // For one-shot commands: wait for the pending sleep instead of exiting before it.
@@ -453,6 +521,9 @@ export class FrameApp {
       dither: this.cfg.image.dither,
       sleep: this.cfg.display.host ? this.sleepStatus() : null,
       displayCheck: st.displayCheck || null,
+      check: this.cfg.display.host && this.cfg.sleep.mode !== 'off' && this.cfg.sleep.checkMin
+        ? { everyMin: this.cfg.sleep.checkMin, last: st.lastCheck || null, wakeEvents: (st.wakeEvents || []).slice(0, 10) }
+        : null,
     };
   }
 

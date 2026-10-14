@@ -164,6 +164,10 @@ export function loadConfig() {
     sleep: {
       mode: oneOf('SLEEP_MODE', 'standby', ['standby', 'off']),
       delaySec: num('SLEEP_DELAY_SEC', 120), // let the panel finish redrawing first
+      // Every this many minutes, check that the display is really asleep (0 = never).
+      checkMin: num('SLEEP_CHECK_MIN', 30),
+      confirmSec: 150, // after a sleep command, how long to wait for it to stop answering
+      confirmEverySec: 15,
     },
 
     panel: {

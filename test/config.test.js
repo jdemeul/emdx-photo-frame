@@ -27,7 +27,9 @@ test('the display does the dithering by default, with gentler tone defaults', ()
 
 test('the display sleeps with network standby on by default', () => {
   const unset = { SLEEP_MODE: null, SLEEP_DELAY_SEC: null };
-  assert.deepEqual(withEnv(unset, loadConfig).sleep, { mode: 'standby', delaySec: 120 });
+  const def = withEnv({ ...unset, SLEEP_CHECK_MIN: null }, loadConfig).sleep;
+  assert.deepEqual([def.mode, def.delaySec, def.checkMin], ['standby', 120, 30]);
+  assert.equal(withEnv({ ...unset, SLEEP_CHECK_MIN: '0' }, loadConfig).sleep.checkMin, 0);
   assert.equal(withEnv({ ...unset, SLEEP_MODE: 'Off' }, loadConfig).sleep.mode, 'off');
   assert.throws(() => withEnv({ ...unset, SLEEP_MODE: 'deep' }, loadConfig), /SLEEP_MODE must be one of standby, off/);
 });

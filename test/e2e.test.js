@@ -53,6 +53,8 @@ test('a full day: album -> render -> display downloads a palette-only PNG', { sk
   const { createServer } = await import('../src/server.js');
 
   const cfg = loadConfig();
+  cfg.sleep.confirmSec = 2; // check every 0.2 s for 2 s that it really went to sleep
+  cfg.sleep.confirmEverySec = 0.2;
   const model = buildPaletteModel(cfg.image.measuredPalette, DEVICE_PALETTE);
   const app = new FrameApp(cfg, new Store(cfg.dataDir), model);
   const server = createServer(cfg, app);
@@ -101,6 +103,8 @@ test('a full day: album -> render -> display downloads a palette-only PNG', { sk
     // the timer command (0x25).
     const cmds = () => emdx.events.filter((e) => e.startsWith('cmd:'));
     await until(() => app.state.sleep?.asleep);
+    assert.equal(typeof app.state.sleep.confirmedAfter, 'number'); // it stopped answering
+    assert.equal(app.state.history[0].battery, 87);
     assert.deepEqual(cmds().slice(-2), ['cmd:b5', 'cmd:11:0']);
     assert.ok(!cmds().some((e) => e.startsWith('cmd:25')));
     assert.deepEqual([emdx.state.awake, emdx.state.networkStandby], [false, true]);
@@ -154,6 +158,37 @@ test('a full day: album -> render -> display downloads a palette-only PNG', { sk
     const checked = await (await fetch('http://127.0.0.1:18321/api/status')).json();
     assert.equal(checked.displayCheck.networkStandby, 'on');
     await until(() => app.state.sleep?.asleep && !emdx.state.awake);
+
+    // A display that acknowledges the sleep command but stays awake: the NAS notices that it
+    // still answers and sends it to sleep again...
+    const powerOffs = () => cmds().filter((e) => e === 'cmd:11:0').length;
+    emdx.wake();
+    emdx.state.ignoresPowerOff = 1;
+    let offs = powerOffs();
+    await app.sleepNow();
+    assert.deepEqual([app.state.sleep.asleep, emdx.state.awake, powerOffs() - offs], [true, false, 2]);
+    // ...and if that doesn't work either, the page says so instead of reporting it asleep.
+    emdx.wake();
+    emdx.state.ignoresPowerOff = Infinity;
+    offs = powerOffs();
+    await assert.rejects(app.sleepNow(), /did not go to sleep, after two tries: it still answered .* keeps using its battery/);
+    assert.deepEqual([app.state.sleep.asleep, emdx.state.awake, powerOffs() - offs], [false, true, 2]);
+    assert.match((await (await fetch('http://127.0.0.1:18321/api/status')).json()).sleep.error, /did not go to sleep/);
+
+    // The sleep check finds it awake and puts it back to sleep (now it obeys), noting it.
+    emdx.state.ignoresPowerOff = 0;
+    assert.equal(await app.checkAsleep(), true);
+    assert.equal(emdx.state.awake, false);
+    assert.equal(app.state.sleep.asleep, true);
+    const { putBack, battery, charging } = app.state.wakeEvents[0];
+    assert.deepEqual([putBack, battery, charging], [true, 87, false]);
+    // ...and leaves a sleeping display alone (probing without Wake-on-LAN doesn't wake it).
+    const seen = emdx.events.length;
+    assert.equal(await app.checkAsleep(), false);
+    assert.equal(emdx.state.awake, false);
+    assert.ok(!emdx.events.slice(seen).includes('wol'));
+    const watched = await (await fetch('http://127.0.0.1:18321/api/status')).json();
+    assert.deepEqual([watched.check.everyMin, watched.check.last.awake, watched.check.wakeEvents.length], [30, false, 1]);
   } finally {
     app.cancelSleep();
     await server.close();

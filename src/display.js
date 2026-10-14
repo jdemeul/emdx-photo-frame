@@ -188,10 +188,17 @@ export async function pushToDisplay(cfg, server, png, { networkStandby = false }
 
 // Put the display to sleep: make sure network standby is on, so Wake-on-LAN can wake
 // it, then power off. If network standby can't be switched on, the display stays
-// awake rather than risk being powered off out of reach.
+// awake rather than risk being powered off out of reach. Returns { battery }.
 export async function putToSleep(cfg) {
   const device = await connect(cfg, { windowSec: cfg.display.sleepWindowSec ?? 60, quiet: true });
+  let battery = null;
   try {
+    try {
+      battery = await withTimeout(device.getBatteryState(), 6000, 'Reading battery');
+    } catch (err) {
+      log.debug(`No battery info: ${err.message}`);
+    }
+    await sleep(300);
     await ensureNetworkStandby(device);
     await sleep(300);
     try {
@@ -203,6 +210,19 @@ export async function putToSleep(cfg) {
   } finally {
     await close(device);
   }
+  return { battery };
+}
+
+// After a sleep command: did it really go to sleep? Probe without Wake-on-LAN (which
+// would wake it) until it stops answering. Returns the seconds that took, or null if
+// it still answers after `timeoutSec`.
+export async function confirmAsleep(cfg, { timeoutSec = 150, everySec = 15 } = {}) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutSec * 1000) {
+    await sleep(everySec * 1000);
+    if (!(await probeDisplay(cfg))) return Math.round((Date.now() - start) / 1000);
+  }
+  return null;
 }
 
 // One quick connection attempt without Wake-on-LAN: is the display awake right now?

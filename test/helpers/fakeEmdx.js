@@ -29,8 +29,10 @@ export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage =
   // Events look like 'auth', 'cmd:1b', 'cmd:b5:1' (hex command, decimal payload), 'wol'.
   const events = [];
   const received = [];
-  // hearsWol: false simulates a sleeping display that Wake-on-LAN doesn't reach at all.
-  const state = { awake: true, networkStandby: true, hearsWol: true };
+  // hearsWol: false simulates a sleeping display that Wake-on-LAN doesn't reach at all;
+  // ignoresPowerOff: how many power-off commands it acknowledges but then stays awake
+  // (Infinity: all of them).
+  const state = { awake: true, networkStandby: true, hearsWol: true, ignoresPowerOff: 0, pluggedIn: false };
   const server = net.createServer((raw) => {
     raw.on('error', () => {});
     if (!state.awake) { // asleep: nothing answers
@@ -52,13 +54,14 @@ export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage =
       const cmd = data[1], id = data[2], len = data[3];
       const payload = data.subarray(4, 4 + len);
       events.push(`cmd:${cmd.toString(16)}${len && cmd !== 0xc7 ? `:${[...payload].join(',')}` : ''}`);
-      if (cmd === 0x1b) return reply(sock, id, cmd, [0x73, 0x00, 0x01, 0x00, battery, 0x00, 0x02]);
+      if (cmd === 0x1b) return reply(sock, id, cmd, [0x73, 0x00, 0x01, 0x00, battery, 0x00, state.pluggedIn ? 0x02 : 0x00]);
       if (cmd === 0x25 && len > 1) return reply(sock, id, cmd, [0x01], false);
       if (cmd === 0xb5 && !len) return reply(sock, id, cmd, [state.networkStandby ? 0x01 : 0x00]);
       if (cmd === 0xb5 && len) state.networkStandby = payload[0] === 0x01;
       if (cmd === 0x11 && len && payload[0] === 0x00) {
         reply(sock, id, cmd, [0x00]);
-        state.awake = false;
+        if (state.ignoresPowerOff > 0) state.ignoresPowerOff--;
+        else state.awake = false;
         return;
       }
       if (cmd === 0xc7) {
