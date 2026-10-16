@@ -248,19 +248,38 @@ export class FrameApp {
     return inputs;
   }
 
-  // Unless sleep is left to the display, make sure its network standby is on during each
-  // update: it may doze off by itself before the NAS sends it to sleep.
-  pushOptions() {
-    return { networkStandby: this.cfg.sleep.mode !== 'off' };
+  // How an update treats network standby and finds the display. Network standby is set
+  // during each update (standby: on, deep: off), as the display may doze off by itself
+  // before the NAS sends it to sleep. In deep sleep Wake-on-LAN doesn't reach it, so a
+  // scheduled update waits WAKE_WINDOW_MIN for it to wake itself (its screen protection
+  // time) instead of sending Wake-on-LAN.
+  pushOptions(reason = 'manual') {
+    const { mode, wakeWindowMin } = this.cfg.sleep;
+    if (mode === 'off') return { networkStandby: null };
+    if (mode === 'standby') return { networkStandby: true };
+    return {
+      networkStandby: false,
+      connect: reason === 'schedule' ? { windowSec: wakeWindowMin * 60, wol: false, quiet: true } : {},
+    };
   }
 
   // Say why a sleeping display could not be reached, and what to do about it.
-  explainUnreachable(err) {
-    if (!err.unreachable || this.cfg.sleep.mode === 'off') return err;
-    const hint = this.cfg.display.mac
-      ? 'Wake-on-LAN did not wake it: check its battery and that its Network Standby is on ' +
-        '(sleep-test checks the setup). Pressing its power button wakes it too.'
-      : 'Set EMDX_MAC so the NAS can wake it from sleep with Wake-on-LAN.';
+  explainUnreachable(err, reason = 'manual') {
+    const { mode, wakeWindowMin } = this.cfg.sleep;
+    if (!err.unreachable || mode === 'off') return err;
+    let hint;
+    if (mode === 'deep') {
+      hint = reason === 'schedule'
+        ? `It did not wake by itself within ${wakeWindowMin} minutes: check that its screen protection time ` +
+          '(Samsung E-Paper app) matches SCHEDULE. Pressing its power button wakes it for a few minutes: ' +
+          'then press "Send again".'
+        : 'It is in deep sleep, where Wake-on-LAN does not reach it: press its power button, then try again.';
+    } else {
+      hint = this.cfg.display.mac
+        ? 'Wake-on-LAN did not wake it: check its battery and that its Network Standby is on ' +
+          '(sleep-test checks the setup). Pressing its power button wakes it too.'
+        : 'Set EMDX_MAC so the NAS can wake it from sleep with Wake-on-LAN.';
+    }
     const e = new Error(`${err.what || err.message}. ${hint}`);
     e.unreachable = true;
     return e;
@@ -285,14 +304,16 @@ export class FrameApp {
       return current;
     }
     try {
-      const { battery } = await pushToDisplay(this.cfg, this.server, png, this.pushOptions());
+      const opts = this.pushOptions(reason);
+      if (opts.connect?.windowSec) log.info(`Waiting up to ${this.cfg.sleep.wakeWindowMin} min for the display to wake itself…`);
+      const { battery, waitedSec } = await pushToDisplay(this.cfg, this.server, png, opts);
       current.pushed = true;
       current.pushedAt = Date.now();
       if (battery) st.battery = { ...battery, at: Date.now() };
       markShown(st, current.ids);
       this.addHistory({
         ok: true, kind: current.kind, ids: current.ids, dates: current.items.map((i) => i.takenAt),
-        battery: battery?.batteryPercent ?? null,
+        battery: battery?.batteryPercent ?? null, waited: waitedSec ?? undefined,
       });
       st.lastError = null;
       this.retryCount = 0;
@@ -303,10 +324,11 @@ export class FrameApp {
       return current;
     } catch (err) {
       if (!err.unreachable) this.markAwake();
-      const e = this.explainUnreachable(err);
+      const e = this.explainUnreachable(err, reason);
       this.addHistory({ ok: false, error: e.message });
       this.store.save();
-      if (SCHEDULED.has(reason)) this.scheduleRetry();
+      // In deep sleep the display won't wake for a retry; a sleep check catches it awake.
+      if (SCHEDULED.has(reason) && this.cfg.sleep.mode !== 'deep') this.scheduleRetry();
       throw e;
     }
   }
@@ -351,10 +373,11 @@ export class FrameApp {
     }
     const { mode, confirmSec, confirmEverySec, checkMin } = this.cfg.sleep;
     const pause = (sec) => new Promise((r) => setTimeout(r, sec * 1000));
-    // Sends the sleep command, then makes sure it worked: the display must stop answering
-    // (probed without Wake-on-LAN). An awake display keeps using its battery, so a failure
-    // gets a second try. A display that is out of reach already went to sleep by itself;
-    // its network standby was switched on during the update, so Wake-on-LAN still wakes it.
+    // Sends the sleep command (network standby on for standby, off for deep sleep), then
+    // makes sure it worked: the display must stop answering (probed without Wake-on-LAN).
+    // An awake display keeps using its battery, so a failure gets a second try. A display
+    // that is out of reach already went to sleep by itself, with network standby as the
+    // last update set it.
     return this.exclusive('Putting the display to sleep', async () => {
       let problem = null;
       for (let attempt = 1; attempt <= 2; attempt++) {
@@ -364,7 +387,7 @@ export class FrameApp {
         }
         let reached = true;
         try {
-          const { battery } = await putToSleep(this.cfg);
+          const { battery } = await putToSleep(this.cfg, { networkStandby: mode === 'standby' });
           if (battery?.batteryPercent != null) this.state.battery = { ...battery, at: Date.now() };
         } catch (err) {
           if (!err.unreachable) { problem = err.message; continue; }
@@ -374,9 +397,10 @@ export class FrameApp {
         if (after === null) { problem = `it still answered ${confirmSec} s after the power-off command`; continue; }
         const self = !reached && attempt === 1;
         this.state.sleep = { mode, asleep: true, sleptAt: Date.now(), self, confirmedAfter: after };
+        const next = mode === 'deep' ? '. It wakes itself at its screen protection time'
+          : this.cfg.display.mac ? '. Wake-on-LAN wakes it for the next update' : '';
         log.info(self ? 'The display had already gone to sleep by itself.'
-          : `Display is asleep: it stopped answering ${after} s after the power-off command` +
-            `${this.cfg.display.mac ? '. Wake-on-LAN wakes it for the next update' : ''}.`);
+          : `Display is asleep: it stopped answering ${after} s after the power-off command${next}.`);
         this.store.save();
         return;
       }
@@ -393,8 +417,11 @@ export class FrameApp {
 
   // ---------- sleep check ----------
   // Every SLEEP_CHECK_MIN minutes, unless the display is meant to be awake (an update, a
-  // pending sleep or a pending retry), check that it is asleep: probe it without Wake-on-LAN,
-  // so a sleeping display stays asleep. One that answers is put back to sleep, and noted.
+  // pending sleep or a pending retry) or a scheduled update is due within 20 minutes (in
+  // deep sleep the display wakes itself for it), check that it is asleep: probe it without
+  // Wake-on-LAN, so a sleeping display stays asleep. One that answers gets the photo that
+  // is still waiting to be shown, if any; otherwise it is put back to sleep. Either way it
+  // is noted.
   startSleepWatch() {
     const { mode, checkMin } = this.cfg.sleep;
     if (!checkMin || mode === 'off' || !this.cfg.display.host) return;
@@ -410,7 +437,7 @@ export class FrameApp {
   }
 
   async checkAsleep() {
-    if (this.busy || this.sleepTimer || this.retryTimer) return null;
+    if (this.busy || this.sleepTimer || this.retryTimer || this.minutesToNextRun() < 20) return null;
     // Holding the lock: the display takes one connection at a time.
     const awake = await this.exclusive('Checking that the display is asleep', () => probeDisplay(this.cfg));
     const st = this.state;
@@ -419,20 +446,42 @@ export class FrameApp {
       this.store.save();
       return false;
     }
-    log.warn('Sleep check: the display is awake although it should be asleep; putting it back to sleep.');
     const event = { at: Date.now(), wasAsleep: this.believedAsleep() };
     st.wakeEvents = [event, ...(st.wakeEvents || [])].slice(0, 20);
     this.markAwake();
     this.store.save();
+    const waiting = this.photoWaiting();
+    if (waiting) log.info('Sleep check: the display is awake and a photo is waiting; sending it.');
+    else log.warn('Sleep check: the display is awake although it should be asleep; putting it back to sleep.');
     try {
-      await this.sleepNow();
-      event.putBack = true;
+      if (waiting) {
+        await this.run('Sending the waiting photo', () => this.push(st.current, { reason: 'awake' }));
+        event.sent = true; // it goes back to sleep SLEEP_DELAY_SEC later, as after any update
+      } else {
+        await this.sleepNow();
+        event.putBack = true;
+      }
     } finally {
-      const b = st.battery; // read while putting it back to sleep
+      const b = st.battery; // read just now
       if (b?.at >= event.at) Object.assign(event, { battery: b.batteryPercent ?? null, charging: !!b.pluggedIn });
       this.store.save();
     }
     return true;
+  }
+
+  // A rendered photo that never reached the display (e.g. it slept through the update).
+  photoWaiting() {
+    const c = this.state.current;
+    return !!c && !c.pushed && !c.dryRun && fs.existsSync(this.store.path('current', 'device.png'));
+  }
+
+  minutesToNextRun() {
+    try {
+      const t = this.cron?.nextRun();
+      return t ? (t.getTime() - Date.now()) / 60000 : Infinity;
+    } catch {
+      return Infinity;
+    }
   }
 
   // For one-shot commands: wait for the pending sleep instead of exiting before it.
@@ -467,7 +516,7 @@ export class FrameApp {
           await pushToDisplay(this.cfg, this.server, devicePng, this.pushOptions());
         } catch (err) {
           if (!err.unreachable) this.markAwake();
-          throw this.explainUnreachable(err);
+          throw this.explainUnreachable(err, 'manual');
         }
         this.state.testPattern.sent = true;
         this.addHistory({ ok: true, kind: 'test pattern', ids: [], dates: [] });

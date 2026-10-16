@@ -3,7 +3,8 @@
 // real display does. Power-off (0x11 0x00) puts it to sleep: it then refuses
 // connections until a Wake-on-LAN packet for its MAC arrives (only heard with
 // network standby on) or wake() (someone pressing its button). Like the EM32DX,
-// it refuses (NAKs) 0x25 with a timer payload.
+// it refuses (NAKs) 0x25 with a timer payload. It answers the clock (0xA7) and,
+// unless `hasTimer` is false, refuses timer 1 (0xA4).
 import dgram from 'node:dgram';
 import net from 'node:net';
 import tls from 'node:tls';
@@ -56,6 +57,8 @@ export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage =
       events.push(`cmd:${cmd.toString(16)}${len && cmd !== 0xc7 ? `:${[...payload].join(',')}` : ''}`);
       if (cmd === 0x1b) return reply(sock, id, cmd, [0x73, 0x00, 0x01, 0x00, battery, 0x00, state.pluggedIn ? 0x02 : 0x00]);
       if (cmd === 0x25 && len > 1) return reply(sock, id, cmd, [0x01], false);
+      if (cmd === 0xa7 && !len) return reply(sock, id, cmd, [16, 1, 5, 10, 0x07, 0xea, 0x00]); // 16 Oct 2026 13:05
+      if (cmd === 0xa4 && !len) return reply(sock, id, cmd, [0x01], false);
       if (cmd === 0xb5 && !len) return reply(sock, id, cmd, [state.networkStandby ? 0x01 : 0x00]);
       if (cmd === 0xb5 && len) state.networkStandby = payload[0] === 0x01;
       if (cmd === 0x11 && len && payload[0] === 0x00) {

@@ -7,7 +7,7 @@ It runs as a single Docker container. It was written for a Synology NAS (tested 
 - **Shuffle without repeats:** every photo in the album is shown once before anything repeats. Photos added to the album later join the current round.
 - **Odd shapes get paired:** on a portrait frame, landscape and square photos are shown two at a time, stacked, preferably two taken around the same time. Portrait photos fill the frame on their own, smart-cropped around the most interesting part.
 - **The display does the final dithering:** the NAS crops, tones and sends the photo, and the panel's own algorithm turns it into ink dots. A NAS-side ditherer (gamut mapping plus blue noise) is included as `DITHER=local`, but on the EM32DX the panel's own processing looked clearly better side by side (see [Findings](#findings-nas-vs-panel-dithering)).
-- **Sleeps between updates:** two minutes after each photo, the NAS powers the display off and checks that it went to sleep. Only its Wi-Fi listener stays on, so the next update can wake it with Wake-on-LAN. Every half hour the NAS checks that it is still asleep (see [Sleep and battery](#6-sleep-and-battery)).
+- **Sleeps between updates:** two minutes after each photo, the NAS powers the display off and checks that it went to sleep. By default its Wi-Fi listener stays on, so Wake-on-LAN can wake it any time; for weeks on a charge, deep sleep turns that off too, and the display wakes itself each morning for the next photo (see [Sleep and battery](#6-sleep-and-battery)).
 
 ## 1. What you need
 
@@ -19,7 +19,7 @@ It runs as a single Docker container. It was written for a Synology NAS (tested 
 | **Display PIN** | The 6-digit device security PIN you set when configuring the display in the Samsung E-Paper app. |
 | **NAS IP address** | DSM → Control Panel → Network. |
 
-On the display (via the Samsung E-Paper app): set **Orientation** to match how it hangs (`.env.example` assumes portrait) and turn **Network Standby** on. Network Standby is the Wi-Fi listener that lets Wake-on-LAN wake the display; the NAS also switches it on at every update.
+On the display (via the Samsung E-Paper app): set **Screen Orientation** to match how it hangs (`.env.example` assumes portrait). For deep sleep (`SLEEP_MODE=deep`, best on battery), also set its **Screen protection time** to the time of the daily update (see [Sleep and battery](#6-sleep-and-battery)). The NAS sets Network Standby, the Wi-Fi listener that Wake-on-LAN needs, at every update.
 
 ## 2. Install on a Synology NAS (Container Manager)
 
@@ -39,9 +39,9 @@ Open `http://<NAS-IP>:8321`.
    - The **six swatches** should be the six inks.
    - The two sets of colour bands compare the NAS ditherer (`DITHER=local`) with the display's own processing (**"Smooth"**, the default `DITHER=device`). On an EM32DX the display's own looked better. If the NAS bands look better on your panel, set `DITHER=local`.
 2. Press **Next photo now**.
-3. Check that the NAS can wake the display: over SSH, run `sudo docker exec emdx-photo-frame node src/index.js sleep-test`. It puts the display to sleep, waits until it stops answering, then wakes it with Wake-on-LAN and puts it back to sleep (about a minute when it works).
+3. With the default `SLEEP_MODE=standby`, check that the NAS can wake the display: over SSH, run `sudo docker exec emdx-photo-frame node src/index.js sleep-test`. It puts the display to sleep, waits until it stops answering, then wakes it with Wake-on-LAN and puts it back to sleep (about a minute when it works). With `SLEEP_MODE=deep`, check instead that `SCHEDULE` matches the display's screen protection time, and that **Check display** shows its clock right.
 
-From then on it updates every day at 06:00 (`SCHEDULE`), and two minutes after each update the display goes back to sleep. If the display can't be reached at 06:00, it retries 3× at 20-minute intervals. The web page shows whether the display is asleep (**Display**), what the half-hourly checks found (**Sleep checks**) and the battery at each update (**Recent**).
+From then on it updates every day at 06:00 (`SCHEDULE`), and two minutes after each update the display goes back to sleep. If the display can't be reached at 06:00, it retries 3× at 20-minute intervals (in deep sleep the update waits for the display to wake itself instead). The web page shows whether the display is asleep (**Display**), what the half-hourly checks found (**Sleep checks**) and the battery at each update (**Recent**).
 
 ## 4. Try it on a laptop first (optional)
 
@@ -59,8 +59,8 @@ Then open http://localhost:8321 and press **Next photo now** a few times to prev
 Other commands (`sudo docker exec emdx-photo-frame node src/index.js <cmd>` on the NAS):
 
 - `check-album`: read the album and print what was found.
-- `display-info`: connect to the display and print its name, battery and Network Standby. Changes nothing on the display.
-- `sleep`: put the display to sleep now (Network Standby on, power off) and wait until it stops answering.
+- `display-info`: connect to the display and print its name, battery, Network Standby, clock and timer 1. Changes nothing on the display.
+- `sleep`: put the display to sleep now (Network Standby on, or off with `SLEEP_MODE=deep`; then power off) and wait until it stops answering.
 - `sleep-test [minutes]`: check that Wake-on-LAN wakes the display from sleep, optionally after letting it sleep that many more minutes (see [Sleep and battery](#6-sleep-and-battery)).
 - `once`, `test-pattern`: show the next photo or the test pattern. These start their own web server, so use them only while the service is stopped (e.g. with `docker run --rm`); while it runs, use the buttons on its web page.
 
@@ -71,7 +71,7 @@ Other commands (`sudo docker exec emdx-photo-frame node src/index.js <cmd>` on t
 | `ALBUM_URLS` | — | One or more share links, comma-separated |
 | `PHOTO_DIR` | — | Extra source: a NAS folder mounted at `/photos` (see `docker-compose.yml`) |
 | `PANEL` / `ORIENTATION` / `ROTATE` | EM32DX / landscape / 0 | EM13DX also known; or set `PANEL_WIDTH`/`PANEL_HEIGHT` |
-| `SCHEDULE`, `TZ` | `0 6 * * *`, Europe/Brussels | Cron syntax |
+| `SCHEDULE`, `TZ` | `0 6 * * *`, Europe/Brussels | Cron syntax. With `SLEEP_MODE=deep`, use the display's screen protection time |
 | `ODD_PHOTOS` | pair | `pair`, `crop` (smart-crop to fill) or `fit` (white margin) |
 | `DITHER` | device | The display dithers. `local` dithers on the NAS instead (see [Findings](#findings-nas-vs-panel-dithering)) |
 | `SATURATION`, `CONTRAST` | 1.0, 0.1 | Tone tweaks before sending. With `DITHER=local` the defaults are 1.3, 0.25 |
@@ -79,7 +79,8 @@ Other commands (`sudo docker exec emdx-photo-frame node src/index.js <cmd>` on t
 | `DITHER_METHOD` | bluenoise | `DITHER=local` only. `diffusion` for classic error diffusion (`DITHER_KERNEL`: floyd-steinberg, stucki, jarvis, sierra, atkinson) |
 | `PALETTE` | measured Spectra 6 | `DITHER=local` only. JSON of measured ink colours, if you photograph/measure your own panel |
 | `OUTPUT_COLORS` | device | `DITHER=local` only. `measured` writes the measured RGB values into the PNG instead of pure colours |
-| `SLEEP_MODE` | standby | After each update: `standby` (sleep, woken by Wake-on-LAN) or `off` (see [Sleep and battery](#6-sleep-and-battery)) |
+| `SLEEP_MODE` | standby | After each update: `standby` (sleep, woken by Wake-on-LAN), `deep` (Network Standby off too; the display wakes itself at its screen protection time) or `off` (see [Sleep and battery](#6-sleep-and-battery)) |
+| `WAKE_WINDOW_MIN` | 15 | `deep`: how long the scheduled update waits for the display to wake itself |
 | `SLEEP_DELAY_SEC` | 120 | Time for the panel to redraw before it is sent to sleep |
 | `SLEEP_CHECK_MIN` | 30 | Every this many minutes, check that the display is still asleep and put it back to sleep if not. `0` turns the check off |
 | `WOL_BROADCAST`, `WOL_PORT` | 255.255.255.255, 9 | Where the Wake-on-LAN packet goes. Try your network's broadcast address (e.g. 192.168.1.255) if the display doesn't wake |
@@ -87,13 +88,19 @@ Other commands (`sudo docker exec emdx-photo-frame node src/index.js <cmd>` on t
 
 ## 6. Sleep and battery
 
-E-paper keeps its picture without power, but a display that stays awake on Wi-Fi uses battery. So once the panel has redrawn (`SLEEP_DELAY_SEC`), the NAS powers the display off. Network Standby keeps a Wi-Fi listener running while it sleeps, so the next update can wake it with Wake-on-LAN. The display may also go to sleep by itself before the NAS gets to it (the "sleep time" set in the Samsung E-Paper app), so the NAS switches Network Standby on during every update, not just when it sends the display to sleep. `SLEEP_MODE=off` leaves sleeping and Network Standby to the display's own settings instead.
+E-paper keeps its picture without power, but a display that stays awake on Wi-Fi uses battery. So once the panel has redrawn (`SLEEP_DELAY_SEC`), the NAS powers the display off. How it sleeps depends on `SLEEP_MODE`:
 
-**Making sure it sleeps.** An awake display keeps using its battery, so the NAS doesn't stop at sending the power-off command. It waits until the display stops answering (up to 2.5 minutes). If it still answers, the NAS sends it to sleep once more, and if that fails too, the web page says so in red. Every `SLEEP_CHECK_MIN` minutes (default 30) the NAS also checks that the display is still asleep, and puts it back to sleep if it isn't, for example after someone pressed its power button. The page lists when it was found awake. These checks don't wake a sleeping display: they only try to connect, without sending Wake-on-LAN.
+- **`standby`** (default): Network Standby stays on, so the display's Wi-Fi keeps listening while it sleeps, and the next update or a button on the web page can wake it with Wake-on-LAN. On an EM32DX that costs about 1.5% of the battery an hour, so a charge lasts about three days, and on battery the display stops hearing Wake-on-LAN after many hours (see the findings below). Best when the display runs on USB-C power.
+- **`deep`**: Network Standby off, then power off. The display then uses hardly any battery, but nothing on the network reaches it. It does wake itself once a day at its **screen protection time** (Samsung E-Paper app → the display → Screen protection time), when it refreshes the panel. Set `SCHEDULE` to that same time: the update then looks for the display for up to `WAKE_WINDOW_MIN` minutes (default 15), without Wake-on-LAN, sends the photo and puts it back into deep sleep. During the day the buttons on the web page reach the display only after someone has pressed its power button.
+- **`off`**: leaves sleeping and Network Standby to the display's own settings ("Sleep After" in the app).
 
-Samsung quotes up to 70 days per charge in this sleep mode with one update a day, and up to 80 days in deep sleep, where Network Standby is off too ([product page](https://www.samsung.com/au/business/smart-signage/others/color-e-paper-emdx-a-lh32emdiagbxxy/), pre-release lab tests). Deep sleep isn't offered here, because nothing woke an EM32DX reliably from it.
+The display may also go to sleep by itself before the NAS gets to it ("Sleep After"), so the NAS sets Network Standby during every update (on for `standby`, off for `deep`), not just when it sends the display to sleep.
 
-`sleep-test [minutes]` checks the setup: it puts the display to sleep, waits until it stops answering plus the given minutes, then wakes it with Wake-on-LAN.
+**Making sure it sleeps.** An awake display keeps using its battery, so the NAS doesn't stop at sending the power-off command. It waits until the display stops answering (up to 2.5 minutes). If it still answers, the NAS sends it to sleep once more, and if that fails too, the web page says so in red. Every `SLEEP_CHECK_MIN` minutes (default 30) the NAS also checks that the display is still asleep, for example after someone pressed its power button. If it is awake and a photo is still waiting to be shown (the display slept through its update), the NAS sends the photo; otherwise it puts the display back to sleep. The page lists when it was found awake. These checks don't wake a sleeping display: they only try to connect, without sending Wake-on-LAN. They pause in the 20 minutes before a scheduled update, so that a display that woke itself for the update isn't sent back to sleep.
+
+Samsung quotes up to 70 days per charge in sleep mode and up to 80 days in deep sleep, with one update a day ([product page](https://www.samsung.com/au/business/smart-signage/others/color-e-paper-emdx-a-lh32emdiagbxxy/), pre-release lab tests).
+
+`sleep-test [minutes]` checks the Wake-on-LAN setup for `standby`: it puts the display to sleep with Network Standby on, waits until it stops answering plus the given minutes, then wakes it with Wake-on-LAN.
 
 ### Findings: sleep and wake-up on an EM32DX
 
@@ -103,11 +110,10 @@ Tested in October 2026 on an EM32DX (firmware S-RSEDWWC-1130.7) on 5 GHz Wi-Fi:
 |---|---|
 | Wake-up timer (MDC `0x25`, listed as an on-timer in some notes) | Refused (NAK). On Samsung's other screens `0x25` is brightness. |
 | Deep sleep (Network Standby off), then Wake-on-LAN | Woke it half a minute after it fell asleep, not seven hours later. |
-| Sleep with Network Standby on, then Wake-on-LAN | Woke it within seconds after 5, 15, 30 and 60 minutes asleep, and at 06:00 after a night on battery. |
+| Sleep with Network Standby on, then Wake-on-LAN | Woke it within seconds after 5, 15, 30 and 60 minutes and after 5 hours asleep, and at 06:00 after two nights (one of them on the charger). Twice, after a night and after a full day asleep on battery, it didn't wake, nor in the hour after. |
 
-- **One earlier night it didn't wake** at 06:00 in this sleep mode either, nor later that morning. The battery was down to about 20% then; whether that was the cause isn't known.
-- **Battery:** near empty, the reading dropped about 3 percentage points an hour while the display slept between test wake-ups (19% to 10% over one morning). After a recharge it read 94% at the next morning's update, unplugged. The web page shows the reading at every update (**Recent**), so the drain over a normal week will tell whether Samsung's figures hold.
-- **Bluetooth:** Samsung's E-Paper app monitors the display over Bluetooth. The NAS has none, so Wake-on-LAN is its only way to wake the display.
+- **Battery in standby:** with Network Standby on, the reading dropped about 1.5 percentage points an hour (100% to 92% in the five hours after an update). After the full day at the end of which Wake-on-LAN no longer reached it, it still read 100%. So on battery the display seems to drop into a deeper sleep after many hours, with its Wi-Fi off. Guides for signage software describe the same: on battery the display enters deep sleep after a period of inactivity and is then offline until it is woken from the Samsung app or connected to power ([NowSignage](https://knowledgebase.nowsignage.com/samsung-e-paper-setup-nowsignage-installation-guide)), and Network Standby "may consume additional power" ([OnSign](https://onsigntv.helpjuice.com/en_US/installing-samsung-e-paper)).
+- **Bluetooth:** Samsung's E-Paper app monitors the display over Bluetooth and can wake it. The NAS has no Bluetooth, which is why `deep` relies on the display waking itself.
 
 The sleep commands (MDC `0x11` power, `0xB5` Network Standby) follow the EMDX command notes in [taylorRichie/node-samsung-emdx](https://github.com/taylorRichie/node-samsung-emdx/blob/main/docs/MDC-COMMANDS.md).
 
@@ -119,13 +125,14 @@ The sleep commands (MDC `0x11` power, `0xB5` Network Standby) follow the EMDX co
 4. **Dither.** By default the NAS sends the toned photo as a PNG at the panel's native resolution and the display dithers it. With `DITHER=local` the NAS does it instead:
    - *Gamut:* the image's white and black are mapped to the paper white and ink black. Colours the inks can't make are pulled toward grey until they fit inside the convex hull of the six measured ink colours, which is everything dithering can reproduce.
    - *Dither:* each colour is written as an exact mix of at most five inks: a grey from black and white, plus the hull face around its hue. A 64×64 blue-noise mask then picks one ink per pixel in those proportions. The PNG uses pure colours (#FF0000 etc.); the web preview uses the measured colours.
-5. **Push.** The NAS sends Wake-on-LAN, connects with Samsung MDC (TLS + PIN) and sends command `0xC7` with a URL. The display then downloads a small JSON schedule and the PNG from this container. This trick comes from [node-samsung-emdx](https://github.com/WeeJeWel/node-samsung-emdx), and the MDC client from [@weejewel/samsung-mdc](https://github.com/WeeJeWel/node-samsung-mdc), both by Emile Nijssen.
+5. **Push.** The NAS sends Wake-on-LAN (in deep sleep it waits for the display to wake itself instead), connects with Samsung MDC (TLS + PIN) and sends command `0xC7` with a URL. The display then downloads a small JSON schedule and the PNG from this container. This trick comes from [node-samsung-emdx](https://github.com/WeeJeWel/node-samsung-emdx), and the MDC client from [@weejewel/samsung-mdc](https://github.com/WeeJeWel/node-samsung-mdc), both by Emile Nijssen.
 
 ## 8. Troubleshooting
 
 - **"accepted the command but never downloaded"**: the display can't reach `http://SERVER_HOST:HTTP_PORT`. Check `SERVER_HOST`, the DSM firewall, and that the display and the NAS are on the same network.
 - **"Incorrect PIN"**: check `EMDX_PIN`. After several wrong PINs the display may block MDC for a while.
-- **Is the display reachable, and how is it set?** The web page's **Check display** button wakes it and shows its battery, firmware and Network Standby (`display-info` does the same on the command line).
+- **Is the display reachable, and how is it set?** The web page's **Check display** button wakes it and shows its battery, firmware, Network Standby, clock and timer 1 (Samsung's standard MDC on/off timer, read only). `display-info` does the same on the command line. In deep sleep, press the display's power button first.
+- **"did not wake by itself within … minutes"** (`SLEEP_MODE=deep`): the display's screen protection time and `SCHEDULE` must match, and its clock must be right (**Check display** shows it). Press the display's power button, then **Send again** to show the photo now.
 - **"Could not connect"**: the display is asleep or offline. Set `EMDX_MAC` for Wake-on-LAN, check its battery, run `sleep-test`, try `WOL_BROADCAST` set to your network's broadcast address, or raise `WAKE_WAIT_SEC`. If it fell asleep while Network Standby was off, Wake-on-LAN can't reach it: press its power button and send a photo, which switches Network Standby back on.
 - **"The display did not go to sleep"**: it took the power-off command but kept answering, so it is using battery. The NAS tries again at every sleep check (`SLEEP_CHECK_MIN`). If it keeps failing, the log shows each try; please open an issue with it.
 - **"the display refused MDC command …"**: this firmware doesn't support that command. Please open an issue with the full message.

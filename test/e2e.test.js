@@ -155,6 +155,9 @@ test('a full day: album -> render -> display downloads a palette-only PNG', { sk
     const info = await (await fetch('http://127.0.0.1:18321/api/display-info', { method: 'POST' })).json();
     assert.equal(info.networkStandby, 'on');
     assert.equal(info.battery.batteryPercent, 87);
+    // ...and the clock and timer 1 (read only), or why not.
+    assert.equal(info.clock, '2026-10-16 13:05');
+    assert.match(info.onTimer, /Reading timer 1: the display refused MDC command 0xa4/);
     const checked = await (await fetch('http://127.0.0.1:18321/api/status')).json();
     assert.equal(checked.displayCheck.networkStandby, 'on');
     await until(() => app.state.sleep?.asleep && !emdx.state.awake);
@@ -189,6 +192,40 @@ test('a full day: album -> render -> display downloads a palette-only PNG', { sk
     assert.ok(!emdx.events.slice(seen).includes('wol'));
     const watched = await (await fetch('http://127.0.0.1:18321/api/status')).json();
     assert.deepEqual([watched.check.everyMin, watched.check.last.awake, watched.check.wakeEvents.length], [30, false, 1]);
+
+    // Deep sleep (SLEEP_MODE=deep): network standby off, then power off, so Wake-on-LAN
+    // can't wake it. A scheduled update waits for the display to wake by itself (its screen
+    // protection time) instead, without sending Wake-on-LAN.
+    cfg.sleep.mode = 'deep';
+    cfg.sleep.wakeWindowMin = 0.5;
+    const wols = () => emdx.events.filter((e) => e.startsWith('wol')).length;
+    emdx.wake();
+    await app.sleepNow();
+    assert.deepEqual([emdx.state.awake, emdx.state.networkStandby, app.state.sleep.asleep], [false, false, true]);
+    const wolsBefore = wols();
+    // It wakes itself (its screen protection time) just after the NAS first looked for it.
+    const refused = () => emdx.events.filter((e) => e === 'refused').length;
+    const refusedBefore = refused();
+    const selfWake = until(() => refused() > refusedBefore, 20000).then(() => emdx.wake());
+    assert.ok((await app.next('schedule')).pushed);
+    await selfWake;
+    assert.equal(wols(), wolsBefore);
+    assert.ok(app.state.history[0].waited >= 1, `waited: ${app.state.history[0].waited}`);
+    assert.equal(emdx.state.networkStandby, false); // left off during the update
+    await until(() => app.state.sleep?.asleep && !emdx.state.awake);
+    assert.equal(app.state.sleep.mode, 'deep');
+
+    // A manual update can't reach it, says what to do, and isn't retried...
+    await assert.rejects(app.next('manual'), /It is in deep sleep, where Wake-on-LAN does not reach it: press its power button/);
+    assert.equal(app.retryTimer, null);
+    assert.equal(app.state.current.pushed, false);
+    // ...and once someone has pressed its button, the sleep check sends the waiting photo.
+    emdx.wake();
+    assert.equal(await app.checkAsleep(), true);
+    assert.equal(app.state.current.pushed, true);
+    assert.deepEqual([app.state.wakeEvents[0].sent, app.state.wakeEvents[0].battery], [true, 87]);
+    await until(() => app.state.sleep?.asleep && !emdx.state.awake);
+    assert.equal(emdx.state.networkStandby, false);
   } finally {
     app.cancelSleep();
     await server.close();

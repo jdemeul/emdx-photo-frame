@@ -87,7 +87,11 @@ function sleepHtml(s) {
   const hm = (t) => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   if (!z) return '–';
   if (z.mode === 'off') return 'sleeps by its own settings (SLEEP_MODE=off)';
-  if (z.asleep) return esc((z.sleptAt ? 'asleep since ' + fmt(z.sleptAt) : 'asleep') + (z.self ? ' (went to sleep by itself)' : z.confirmedAfter != null ? ' (confirmed)' : '') + ', the next update wakes it');
+  if (z.asleep) {
+    const how = z.self ? ' (went to sleep by itself)' : z.confirmedAfter != null ? ' (confirmed)' : '';
+    const wake = z.mode === 'deep' ? ', wakes itself at its screen protection time' : ', the next update wakes it';
+    return esc((z.mode === 'deep' ? 'in deep sleep' : 'asleep') + (z.sleptAt ? ' since ' + fmt(z.sleptAt) : '') + how + wake);
+  }
   if (z.error) return '<span class="err">' + esc(z.error) + '</span>';
   if (z.pending && z.sleepAt) return esc('awake, goes to sleep at ' + hm(z.sleepAt));
   return 'awake';
@@ -100,13 +104,14 @@ function watchHtml(c) {
   if (ev.length) {
     h += '<br><span class="err">Found awake:</span> ' + ev.slice(0, 5).map((e) => esc(fmt(e.at)
       + (e.battery != null ? ' (' + e.battery + '%' + (e.charging ? ', charging' : '') + ')' : '')
-      + (e.putBack ? '' : ', not put back to sleep'))).join('; ');
+      + (e.sent ? ', sent the waiting photo' : e.putBack ? '' : ', not put back to sleep'))).join('; ');
   }
   return h;
 }
 function checkText(c) {
   if (!c) return '–';
-  return esc(fmt(c.at) + ' · Network Standby ' + c.networkStandby + ' · ' + c.name + ', firmware ' + c.software);
+  return esc(fmt(c.at) + ' · Network Standby ' + c.networkStandby + ' · ' + c.name + ', firmware ' + c.software
+    + (c.clock ? ' · clock ' + c.clock : '') + (c.onTimer ? ' · timer 1: ' + c.onTimer : ''));
 }
 function render(s) {
   last = s;
@@ -132,7 +137,7 @@ function render(s) {
   $('#info').innerHTML = rows.map(([k, v]) => '<dt>' + k + '</dt><dd>' + v + '</dd>').join('');
   const dup = s.lastError && s.sleep && s.sleep.error === s.lastError.message; // already shown under Display
   $('#error').textContent = s.lastError && !dup ? 'Last problem (' + fmt(s.lastError.at) + '): ' + s.lastError.message : '';
-  $('#history').innerHTML = (s.history || []).slice(0, 8).map((h) => '<dt>' + fmt(h.at) + '</dt><dd>' + (h.ok ? esc(h.kind) + (h.dates && h.dates.length ? ' · ' + h.dates.map(day).join(' + ') : '') + (h.battery != null ? ' · battery ' + h.battery + '%' : '') : '<span class="err">' + esc(h.error) + '</span>') + '</dd>').join('');
+  $('#history').innerHTML = (s.history || []).slice(0, 8).map((h) => '<dt>' + fmt(h.at) + '</dt><dd>' + (h.ok ? esc(h.kind) + (h.dates && h.dates.length ? ' · ' + h.dates.map(day).join(' + ') : '') + (h.battery != null ? ' · battery ' + h.battery + '%' : '') + (h.waited ? ' · waited ' + h.waited + ' s for the display' : '') : '<span class="err">' + esc(h.error) + '</span>') + '</dd>').join('');
   renderView(s);
 }
 async function refresh() {

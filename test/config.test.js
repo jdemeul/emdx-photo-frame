@@ -25,13 +25,14 @@ test('the display does the dithering by default, with gentler tone defaults', ()
   assert.equal(explicit.image.saturation, 1.2);
 });
 
-test('the display sleeps with network standby on by default', () => {
-  const unset = { SLEEP_MODE: null, SLEEP_DELAY_SEC: null };
+test('the display sleeps with network standby on by default; deep and off are the alternatives', () => {
+  const unset = { SLEEP_MODE: null, SLEEP_DELAY_SEC: null, WAKE_WINDOW_MIN: null };
   const def = withEnv({ ...unset, SLEEP_CHECK_MIN: null }, loadConfig).sleep;
-  assert.deepEqual([def.mode, def.delaySec, def.checkMin], ['standby', 120, 30]);
+  assert.deepEqual([def.mode, def.delaySec, def.checkMin, def.wakeWindowMin], ['standby', 120, 30, 15]);
   assert.equal(withEnv({ ...unset, SLEEP_CHECK_MIN: '0' }, loadConfig).sleep.checkMin, 0);
   assert.equal(withEnv({ ...unset, SLEEP_MODE: 'Off' }, loadConfig).sleep.mode, 'off');
-  assert.throws(() => withEnv({ ...unset, SLEEP_MODE: 'deep' }, loadConfig), /SLEEP_MODE must be one of standby, off/);
+  assert.equal(withEnv({ ...unset, SLEEP_MODE: 'deep' }, loadConfig).sleep.mode, 'deep');
+  assert.throws(() => withEnv({ ...unset, SLEEP_MODE: 'nap' }, loadConfig), /SLEEP_MODE must be one of standby, deep, off/);
 });
 
 test('a malformed EMDX_MAC is caught when the config loads', () => {

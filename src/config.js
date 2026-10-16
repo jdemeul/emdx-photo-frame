@@ -159,13 +159,19 @@ export function loadConfig() {
 
     // What the display does once a photo is up.
     //   standby - power off with its Wi-Fi listener (network standby) on, so the next
-    //             update can wake it with Wake-on-LAN
+    //             update can wake it with Wake-on-LAN. The listener costs battery, and on
+    //             battery the EM32DX stops hearing Wake-on-LAN after many hours anyway.
+    //   deep    - network standby off, then power off: hardly any battery use, but nothing
+    //             on the network wakes it. It wakes itself at its "screen protection time"
+    //             (Samsung E-Paper app), and the scheduled update waits for it then.
     //   off     - leave it to the display's own settings (e.g. when it is on mains power)
     sleep: {
-      mode: oneOf('SLEEP_MODE', 'standby', ['standby', 'off']),
+      mode: oneOf('SLEEP_MODE', 'standby', ['standby', 'deep', 'off']),
       delaySec: num('SLEEP_DELAY_SEC', 120), // let the panel finish redrawing first
       // Every this many minutes, check that the display is really asleep (0 = never).
       checkMin: num('SLEEP_CHECK_MIN', 30),
+      // deep: how long a scheduled update waits for the display to wake itself.
+      wakeWindowMin: num('WAKE_WINDOW_MIN', 15),
       confirmSec: 150, // after a sleep command, how long to wait for it to stop answering
       confirmEverySec: 15,
     },

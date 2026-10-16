@@ -4,9 +4,9 @@
 //   node src/index.js serve            run the scheduler + web UI (default; what the container does)
 //   node src/index.js once             show the next photo now, then exit
 //   node src/index.js check-album      read the album(s) and print what was found
-//   node src/index.js display-info     connect to the display and print name/battery/network standby (changes nothing)
+//   node src/index.js display-info     connect to the display and print name/battery/network standby/clock/timer 1 (changes nothing)
 //   node src/index.js test-pattern     send the calibration image to the display
-//   node src/index.js sleep            put the display to sleep now (network standby on, power off)
+//   node src/index.js sleep            put the display to sleep now (network standby as SLEEP_MODE says, power off)
 //   node src/index.js sleep-test [min] put the display to sleep, wait [min] more minutes, check Wake-on-LAN wakes it
 //   node src/index.js render <img...>  render local image files to <DATA_DIR>/render-test (no display needed)
 import fs from 'node:fs';
@@ -54,9 +54,9 @@ async function main() {
   }
 
   // Put the display to sleep, then wait until it stops answering (the same check the
-  // service makes after every update).
-  const sleepAndConfirm = async () => {
-    await putToSleep(cfg).catch(asleepHint);
+  // service makes after every update). Network standby stays on unless SLEEP_MODE=deep.
+  const sleepAndConfirm = async ({ networkStandby = cfg.sleep.mode !== 'deep' } = {}) => {
+    await putToSleep(cfg, { networkStandby }).catch(asleepHint);
     const { confirmSec, confirmEverySec } = cfg.sleep;
     const after = await confirmAsleep(cfg, { timeoutSec: confirmSec, everySec: confirmEverySec });
     if (after === null) throw new Error(`The display still answers ${confirmSec} s after the power-off command: it did not go to sleep.`);
@@ -65,7 +65,7 @@ async function main() {
 
   if (cmd === 'sleep') {
     const after = await sleepAndConfirm();
-    log.info(`Display is asleep (it stopped answering after ${after} s), with network standby on.`);
+    log.info(`Display is asleep (it stopped answering after ${after} s), with network standby ${cfg.sleep.mode === 'deep' ? 'off' : 'on'}.`);
     return;
   }
 
@@ -79,7 +79,7 @@ async function main() {
     if (!cfg.display.mac) throw new Error('Set EMDX_MAC first: Wake-on-LAN is how the NAS wakes the display.');
 
     log.info('Putting the display to sleep (network standby on)…');
-    log.info(`It stopped answering after ${await sleepAndConfirm()} s: asleep.`);
+    log.info(`It stopped answering after ${await sleepAndConfirm({ networkStandby: true })} s: asleep.`);
     if (minutes) {
       log.info(`Letting it sleep for ${minutes} more minute${minutes === 1 ? '' : 's'}…`);
       await wait(minutes * 60000);
@@ -91,7 +91,7 @@ async function main() {
       await wait(5000);
       if (await probeDisplay(cfg)) {
         log.info(`Wake-on-LAN woke it after ${Math.round((Date.now() - start) / 1000)} s.`);
-        log.info(`Back to sleep (it stopped answering after ${await sleepAndConfirm()} s).`);
+        log.info(`Back to sleep (it stopped answering after ${await sleepAndConfirm({ networkStandby: true })} s).`);
         return;
       }
     }
