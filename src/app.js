@@ -37,6 +37,15 @@ export class FrameApp {
     const st = this.state;
     st.excluded ||= {};
     st.history ||= [];
+    // A playlist test cut short by a restart: its clean-up never ran. Keep the display's
+    // original settings so Check display (or the next test) can put them back.
+    const pt = st.playlistTest;
+    if (pt && !pt.done) {
+      pt.done = true;
+      pt.error = 'Interrupted: the service restarted during the test. Check display puts the display\'s settings back, Send again the photo.';
+      if (pt.saved) st.pendingRestore = pt.saved;
+      store.save();
+    }
   }
 
   get state() {
@@ -540,6 +549,25 @@ export class FrameApp {
   displayInfo() {
     return this.exclusive('Checking the display', async () => {
       const info = await readDisplayInfo(this.cfg, { thumbnailUrl: this.server?.thumbnailUrl });
+      const saved = this.state.pendingRestore;
+      if (saved) { // settings an interrupted playlist test changed
+        try {
+          await withDisplay(this.cfg, {}, async (device) => {
+            await setSleepAfter(device, saved.sleepAfter?.length ? saved.sleepAfter : SLEEP_AFTER_10_MIN);
+            if (saved.applySleep != null) {
+              await new Promise((r) => setTimeout(r, 300));
+              await setApplySleep(device, saved.applySleep);
+            }
+          });
+          info.restored = `Sleep After ${formatSleepAfter(saved.sleepAfter?.length ? saved.sleepAfter : SLEEP_AFTER_10_MIN)}`
+            + (saved.applySleep != null ? `, sleep after content update ${saved.applySleep ? 'on' : 'off'}` : '')
+            + ' (put back after the interrupted playlist test)';
+          log.info(`Check display: ${info.restored}`);
+          delete this.state.pendingRestore;
+        } catch (err) {
+          info.restored = `could not put back the settings from before the interrupted playlist test: ${err.message}`;
+        }
+      }
       this.markAwake();
       this.scheduleSleep();
       if (info.battery?.batteryPercent != null) this.state.battery = { ...info.battery, at: Date.now() };
@@ -577,6 +605,18 @@ export class FrameApp {
     if (!waiters.length && st.playlistTest && !st.playlistTest.done) {
       this.recordTestThumbnail(th, { asked: false }).catch((err) => log.warn(`Playlist test: ${err.message}`));
     }
+  }
+
+  // A thumbnail POST we couldn't read: keep the body (thumbnails/failed-<time>.bin) so the
+  // format can be looked at, and note it on the status page.
+  onThumbnailFailure(f) {
+    const dir = this.store.path('thumbnails');
+    fs.mkdirSync(dir, { recursive: true });
+    const file = `failed-${stamp(new Date(f.at)).replace(/\D/g, '').slice(8, 14)}.bin`;
+    if (f.body?.length) fs.writeFileSync(`${dir}/${file}`, f.body);
+    const st = this.state;
+    st.thumbnailFailures = [{ at: f.at, error: f.error, contentType: f.contentType, bytes: f.body?.length ?? 0, file }, ...(st.thumbnailFailures || [])].slice(0, 5);
+    this.store.save();
   }
 
   // Download progress the display reports (Samsung's app has an endpoint for it).
@@ -637,13 +677,16 @@ export class FrameApp {
       const tryTo = async (fn, what) => { try { await fn(); } catch (err) { note(`could not ${what}: ${err.message}`, 'warn'); } };
       const pause = () => new Promise((r) => setTimeout(r, 300)); // the display drops commands sent too fast
 
-      // 1. Note the display's settings, then keep it awake for the test.
+      // 1. Note the display's settings, then keep it awake for the test. After an interrupted
+      // test, the settings it noted are the real ones (the display still has the test's).
       const saved = {};
+      const earlier = st.pendingRestore;
       try {
         await withDisplay(cfg, {}, async (device) => {
           saved.battery = await readOr(() => device.getBatteryState()); await pause();
-          saved.sleepAfter = await readOr(() => getSleepAfter(device)); await pause();
-          saved.applySleep = await readOr(() => getApplySleep(device)); await pause();
+          saved.sleepAfter = earlier?.sleepAfter ?? await readOr(() => getSleepAfter(device)); await pause();
+          saved.applySleep = earlier ? earlier.applySleep : await readOr(() => getApplySleep(device)); await pause();
+          if (earlier) note('using the settings noted before the interrupted test.');
           saved.networkStandby = await readOr(() => getNetworkStandby(device)); await pause();
           saved.features = await readOr(() => getFeatures(device)); await pause();
           const b = saved.battery;
@@ -733,6 +776,7 @@ export class FrameApp {
           note('no photo to put back: the frame keeps cycling the test cards until the next update.', 'warn');
           this.scheduleSleep();
         }
+        delete st.pendingRestore;
         t.done = true;
         t.endedAt = Date.now();
         this.testWake = null;
@@ -801,6 +845,8 @@ export class FrameApp {
         ? { everyMin: this.cfg.sleep.checkMin, last: st.lastCheck || null, wakeEvents: (st.wakeEvents || []).slice(0, 10) }
         : null,
       thumbnail: st.thumbnail || null,
+      thumbnailFailures: st.thumbnailFailures || [],
+      displayTraffic: this.server?.recentTraffic?.().slice(0, 20) ?? [],
       playlistTest: st.playlistTest ? this.testSummary(st.playlistTest) : null,
     };
   }
@@ -808,7 +854,8 @@ export class FrameApp {
   testSummary(t) {
     return {
       startedAt: t.startedAt, t0: t.t0 ?? null, endsAt: t.endsAt ?? null, endedAt: t.endedAt ?? null, done: t.done,
-      minutes: t.minutes, unitMs: t.unitMs, error: t.error ?? null, saved: t.saved ?? null, reports: (t.reports || []).length,
+      minutes: t.minutes, unitMs: t.unitMs, error: t.error ?? null, saved: t.saved ?? null,
+      reports: (t.reports || []).slice(-5).map(({ at, path, text }) => ({ at, path, text: text.slice(0, 300) })),
       observations: t.observations.slice(-60).map(({ at, card, error, file, asked }) => ({ at, card, error, file, asked })),
       notes: t.notes.slice(-12),
       fields: t.fields ?? null,

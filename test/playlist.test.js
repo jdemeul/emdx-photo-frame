@@ -80,9 +80,9 @@ after(async () => { for (const f of cleanups) await f(); });
 
 // A run against the fake display, with "minutes" of one second.
 let runs = 0;
-async function runTest({ model = 'push', thumbnails = true } = {}) {
+async function runTest({ model = 'push', thumbnails = true, thumbnailPath = null } = {}) {
   const { startFakeEmdx } = await import('./helpers/fakeEmdx.js');
-  const emdx = await startFakeEmdx({ pin: '515151', thumbnails });
+  const emdx = await startFakeEmdx({ pin: '515151', thumbnails, thumbnailPath });
   emdx.state.playlistModel = model;
   emdx.state.applySleep = true; // as the user may have set it in the app
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'frame-playlist-'));
@@ -140,8 +140,24 @@ test('playlist test against the fake display: push-timed playlist, settings and 
   assert.match(status.playlistTest.result.verdict, /moved on by itself, counted from when it received the playlist/);
   const shot = await fetch(`http://127.0.0.1:${app.cfg.server.port}/img/thumbnails/${status.thumbnail.file}`);
   assert.equal(shot.status, 200);
+  // The display's requests are listed, with how they were answered.
+  const posts = status.displayTraffic.filter((r) => r.method === 'POST' && r.path.endsWith('/device-thumbnail'));
+  assert.ok(posts.length > 0 && posts.every((r) => r.status === 200 && /^thumbnail/.test(r.result)), JSON.stringify(posts[0]));
   // Back to sleep afterwards, as after any update.
   await until(() => app.state.sleep?.asleep && !emdx.state.awake);
+});
+
+test('playlist test: thumbnails posted to the Samsung app\'s path also count; an unreadable one is kept', { skip: !hasOpenssl && 'openssl not available' }, async () => {
+  const { app, t, dataDir } = await runTest({ thumbnailPath: '/device-thumbnail' });
+  assert.equal(t.result.model, 'push', t.result.verdict);
+  // A thumbnail POST that isn't valid multipart: answered with 200, body kept, noted.
+  const r = await fetch(`http://127.0.0.1:${app.cfg.server.port}/device-thumbnail`, {
+    method: 'POST', headers: { 'content-type': 'multipart/form-data; boundary=nope' }, body: 'garbage',
+  });
+  assert.equal(r.status, 200);
+  const status = await (await fetch(`http://127.0.0.1:${app.cfg.server.port}/api/status`)).json();
+  assert.match(status.thumbnailFailures[0].error, /no parts/);
+  assert.equal(fs.readFileSync(`${dataDir}/thumbnails/${status.thumbnailFailures[0].file}`, 'utf8'), 'garbage');
 });
 
 test('playlist test: a display that never moves on, and one without thumbnails', { skip: !hasOpenssl && 'openssl not available' }, async () => {
@@ -151,6 +167,40 @@ test('playlist test: a display that never moves on, and one without thumbnails',
   assert.match(blind.t.result.verdict, /No thumbnails came back/);
   await until(() => blind.emdx.received.length === 2);
   assert.equal(blind.emdx.received.at(-1).images.length, 1); // the photo still went back
+});
+
+test('a playlist test cut short by a restart: Check display puts the display\'s settings back', { skip: !hasOpenssl && 'openssl not available' }, async () => {
+  const { startFakeEmdx } = await import('./helpers/fakeEmdx.js');
+  const emdx = await startFakeEmdx({ pin: '525252' });
+  Object.assign(emdx.state, { sleepAfter: [0x00], applySleep: false }); // as the test left them
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'frame-interrupted-'));
+  fs.mkdirSync(`${dataDir}/current`, { recursive: true });
+  fs.writeFileSync(`${dataDir}/state.json`, JSON.stringify({
+    version: 1, bag: [], shownThisCycle: [], cycle: 0, excluded: {}, history: [],
+    playlistTest: { startedAt: Date.now() - 600000, minutes: [10, 20, 20, 20], observations: [], notes: [], done: false, saved: { sleepAfter: [0x07], applySleep: true } },
+  }));
+  Object.assign(process.env, {
+    DATA_DIR: dataDir, EMDX_HOST: '127.0.0.1', EMDX_PORT: String(emdx.port), EMDX_PIN: '525252',
+    SERVER_HOST: '127.0.0.1', HTTP_PORT: String(18400 + runs++), CONNECT_ATTEMPTS: '2', EMDX_MAC: emdx.mac,
+    WOL_BROADCAST: '127.0.0.1', WOL_PORT: String(emdx.wolPort), WAKE_WAIT_SEC: '0.1', SLEEP_MODE: 'off',
+  });
+  const { loadConfig, DEVICE_PALETTE } = await import('../src/config.js');
+  const { Store } = await import('../src/state.js');
+  const { buildPaletteModel } = await import('../src/color.js');
+  const { FrameApp } = await import('../src/app.js');
+  const { createServer } = await import('../src/server.js');
+  const cfg = loadConfig();
+  const app = new FrameApp(cfg, new Store(dataDir), buildPaletteModel(cfg.image.measuredPalette, DEVICE_PALETTE));
+  const server = createServer(cfg, app);
+  app.server = server;
+  await server.listen();
+  cleanups.push(async () => { await server.close(); await emdx.close(); });
+  assert.match(app.state.playlistTest.error, /Interrupted/);
+  assert.deepEqual(app.state.pendingRestore, { sleepAfter: [0x07], applySleep: true });
+  const info = await app.displayInfo();
+  assert.match(info.restored, /Sleep After 10 min, sleep after content update on/);
+  assert.deepEqual([emdx.state.sleepAfter, emdx.state.applySleep], [[0x07], true]);
+  assert.equal(app.state.pendingRestore, undefined);
 });
 
 async function until(fn, ms = 10000) {

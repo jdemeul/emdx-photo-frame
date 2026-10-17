@@ -32,7 +32,9 @@ function reply(sock, displayId, cmd, payload = [], ack = true) {
   sock.write(Buffer.from([0xaa, ...body, checksum]));
 }
 
-export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage = true, mac = '02:00:00:00:00:01', thumbnails = true } = {}) {
+// `thumbnailPath`: post thumbnails to this path on the given host instead of the URL's own
+// path (e.g. '/device-thumbnail', the Samsung app's).
+export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage = true, mac = '02:00:00:00:00:01', thumbnails = true, thumbnailPath = null } = {}) {
   const { key, cert } = makeCert();
   // Events look like 'auth', 'cmd:1b', 'cmd:b5:1' (hex command, decimal payload), 'wol'.
   const events = [];
@@ -66,6 +68,7 @@ export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage =
     form.append('schedule_downloaded_timestamp', String(now?.startedAt || 0));
     form.append('thumbnail_timestamp', String(Date.now()));
     if (now) form.append('file', new Blob([now.images[now.index]], { type: 'image/png' }), 'thumbnail.png');
+    if (thumbnailPath) url = new URL(thumbnailPath, url).href;
     try {
       await fetch(url, { method: 'POST', body: form });
       state.thumbnailsPosted++;

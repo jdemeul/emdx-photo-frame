@@ -4,6 +4,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import { log, stamp } from './log.js';
 import { UI_HTML } from './ui.js';
+import { parseMultipart } from './multipart.js';
 
 const MAX_PUSHES = 6;
 const EPD_CONTENT_DIR = '/home/owner/content/Downloads/vxtplayer/epaper/mobile/contents';
@@ -11,6 +12,8 @@ const MAX_POST_BYTES = 10 * 1024 * 1024; // what the display may POST to us (thu
 
 export function createServer(cfg, app) {
   const pushes = new Map();
+  // The last requests from the display (and to the endpoints it uses), for the status page.
+  const traffic = [];
   const baseUrl = `http://${cfg.server.publicHost}:${cfg.server.port}`;
   const thumbnailUrl = `${baseUrl}/emdx/device-thumbnail`;
 
@@ -110,30 +113,40 @@ export function createServer(cfg, app) {
 
   // The display POSTs a thumbnail of its screen (multipart: device_id, content_id,
   // content_name, content_type, content_player_type, schedule_downloaded_timestamp,
-  // thumbnail_timestamp and an image file) after MDC 0xC7/0x54 with this URL.
-  async function receiveThumbnail(req, res) {
+  // thumbnail_timestamp and an image file) after MDC 0xC7/0x54 with this URL. A body we
+  // can't read is kept for a look (thumbnails/failed-*.bin), and still answered with 200.
+  async function receiveThumbnail(req, res, note) {
+    let body = null;
     try {
-      const body = await readBody(req);
-      const form = await new Response(body, { headers: { 'content-type': req.headers['content-type'] || '' } }).formData();
+      body = await readBody(req);
+      note.bytes = body.length;
       const fields = {};
       let image = null;
-      for (const [k, v] of form) {
-        if (typeof v === 'string') fields[k] = v.slice(0, 200);
-        else if (!image) image = { name: v.name, type: v.type, buf: Buffer.from(await v.arrayBuffer()) };
+      for (const part of parseMultipart(body, req.headers['content-type'])) {
+        if (part.filename != null || /^image\//i.test(part.type || '')) {
+          if (!image) image = { name: part.filename || part.name || '', type: part.type || '', buf: part.content };
+        } else if (part.name) {
+          fields[part.name] = part.content.toString('utf8').slice(0, 200);
+        }
       }
+      note.result = image ? `thumbnail ${(image.buf.length / 1024).toFixed(0)} kB` : 'no image in it';
       log.info(`Display sent a thumbnail (${image ? `${(image.buf.length / 1024).toFixed(0)} kB` : 'no image'}; ${Object.entries(fields).map(([k, v]) => `${k}=${v}`).join(', ')})`);
       res.writeHead(200, { 'Content-Type': 'text/plain' }).end('OK');
       app.onThumbnail?.({ at: Date.now(), from: req.socket.remoteAddress, fields, image });
     } catch (err) {
-      log.warn(`Could not read a thumbnail from the display: ${err.message}`);
-      res.writeHead(err.status || 400).end();
+      note.result = `unreadable: ${err.message}`;
+      log.warn(`Could not read a thumbnail from the display (${req.headers['content-type'] || 'no content type'}, ${body?.length ?? '?'} bytes): ${err.message}`);
+      if (err.status) { res.writeHead(err.status).end(); return; }
+      res.writeHead(200, { 'Content-Type': 'text/plain' }).end('OK');
+      app.onThumbnailFailure?.({ at: Date.now(), error: err.message, contentType: req.headers['content-type'] || null, body });
     }
   }
 
   // Samsung's app also takes download progress reports from the display; log any we get.
-  async function receiveProgress(req, res) {
+  async function receiveProgress(req, res, note) {
     try {
       const text = (await readBody(req)).toString('utf8').slice(0, 2000);
+      note.result = text.slice(0, 160);
       log.info(`Display reported progress (${req.url}): ${text.replace(/\s+/g, ' ')}`);
       res.writeHead(200, { 'Content-Type': 'application/json' }).end(text.startsWith('{') ? text : '{}');
       app.onDisplayReport?.({ at: Date.now(), path: req.url, text });
@@ -171,6 +184,18 @@ export function createServer(cfg, app) {
     const url = new URL(req.url, 'http://x');
     const p = url.pathname;
 
+    // Note what the display asks for, and anything sent to the endpoints it uses.
+    const fromDisplay = (req.socket.remoteAddress || '').replace(/^::ffff:/, '') === cfg.display.host;
+    const displayPath = p.startsWith('/emdx/') || p.endsWith('/device-thumbnail') || p.endsWith('/content-transfer-progress');
+    const note = { at: Date.now(), method: req.method, path: req.url.slice(0, 160), from: fromDisplay ? 'display' : (req.socket.remoteAddress || '').replace(/^::ffff:/, '') };
+    if (fromDisplay || (displayPath && req.method === 'POST')) {
+      if (req.headers['content-type']) note.type = req.headers['content-type'].slice(0, 100);
+      if (req.headers['user-agent']) note.agent = req.headers['user-agent'].slice(0, 80);
+      traffic.unshift(note);
+      traffic.length = Math.min(traffic.length, 40);
+      res.on('finish', () => { note.status = res.statusCode; });
+    }
+
     // ---- endpoints the display uses (no auth: the display can't do it) ----
     const m = /^\/emdx\/([0-9A-F-]{36})\/([^/]+)$/.exec(p);
     if (m && (req.method === 'GET' || req.method === 'HEAD')) {
@@ -201,13 +226,13 @@ export function createServer(cfg, app) {
       res.writeHead(404).end();
       return;
     }
-    if (p === '/emdx/device-thumbnail' && req.method === 'POST') return receiveThumbnail(req, res);
-    if (p.endsWith('/content-transfer-progress') && req.method === 'POST') return receiveProgress(req, res);
+    // Thumbnails: wherever the display POSTs them (the app's path is /device-thumbnail).
+    if (p.endsWith('/device-thumbnail') && req.method === 'POST') return receiveThumbnail(req, res, note);
+    if (p.endsWith('/content-transfer-progress') && req.method === 'POST') return receiveProgress(req, res, note);
 
     if (p === '/healthz') { res.writeHead(200).end('ok'); return; }
 
     // Anything else the display asks for: note it (it may tell us more about the protocol).
-    const fromDisplay = (req.socket.remoteAddress || '').replace(/^::ffff:/, '') === cfg.display.host;
     if (fromDisplay && !req.headers.authorization) log.info(`Display requested ${req.method} ${req.url}`);
 
     // ---- web UI ----
@@ -266,6 +291,7 @@ export function createServer(cfg, app) {
     thumbnailUrl,
     registerContent,
     registerPush,
+    recentTraffic: () => traffic.map((t) => ({ ...t })),
     listen() {
       return new Promise((resolve, reject) => {
         server.once('error', reject);

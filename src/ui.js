@@ -114,7 +114,7 @@ function checkText(c) {
   return esc(fmt(c.at) + ' · Network Standby ' + c.networkStandby + ' · ' + c.name + ', firmware ' + c.software
     + (c.clock ? ' · clock ' + c.clock : '') + (c.onTimer ? ' · timer 1: ' + c.onTimer : '')
     + (c.sleepAfter ? ' · Sleep After ' + c.sleepAfter : '') + (c.applySleep ? ' · sleep after content update ' + c.applySleep : '')
-    + (c.lowPowerWifi ? ' · low-power Wi-Fi module ' + c.lowPowerWifi : ''));
+    + (c.lowPowerWifi ? ' · low-power Wi-Fi module ' + c.lowPowerWifi : '') + (c.restored ? ' · ' + c.restored : ''));
 }
 function testHtml(t) {
   if (!t) return '–';
