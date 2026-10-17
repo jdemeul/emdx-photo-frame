@@ -8,6 +8,7 @@
 //   node src/index.js test-pattern     send the calibration image to the display
 //   node src/index.js sleep            put the display to sleep now (network standby as SLEEP_MODE says, power off)
 //   node src/index.js sleep-test [min] put the display to sleep, wait [min] more minutes, check Wake-on-LAN wakes it
+//   node src/index.js playlist-test [m,m,..] send numbered cards as a playlist and watch how the display plays them
 //   node src/index.js render <img...>  render local image files to <DATA_DIR>/render-test (no display needed)
 import fs from 'node:fs';
 import path from 'node:path';
@@ -138,10 +139,18 @@ async function main() {
   if (!cfg.display.host) log.warn('EMDX_HOST is not set: dry run, photos will be rendered but not sent.');
   if (!cfg.albumUrls.length && !cfg.photoDir) log.warn('Neither ALBUM_URLS nor PHOTO_DIR is set: there is nothing to show yet.');
 
-  if (cmd === 'once' || cmd === 'test-pattern') {
+  if (cmd === 'once' || cmd === 'test-pattern' || cmd === 'playlist-test') {
     try {
       if (cmd === 'once') await app.next('manual');
-      else await app.testPattern();
+      else if (cmd === 'test-pattern') await app.testPattern();
+      else {
+        const minutes = args[0] ? args[0].split(',').map(Number) : null;
+        if (minutes && (minutes.length < 2 || minutes.length > 4 || minutes.some((m) => !(m > 0)))) {
+          throw new Error('Usage: playlist-test [minutes per card, 2 to 4 cards], e.g. playlist-test 10,20,20,20');
+        }
+        const t = await app.playlistTest(minutes ? { minutes } : {});
+        console.log(t.result?.verdict || 'No result.');
+      }
       await app.flushSleep();
     } finally {
       await server.close();

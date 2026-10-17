@@ -53,6 +53,7 @@ export const UI_HTML = `<!doctype html>
       <button data-act="test-pattern">Show test pattern</button>
       <button data-act="refresh-album">Re-read album</button>
       <button data-act="display-info" title="Wakes the display and reads its battery and Network Standby">Check display</button>
+      <button data-act="playlist-test" title="Sends numbered cards as a playlist and watches how the display plays them (about 1.5 h)">Playlist test</button>
     </div>
     <dl id="info"></dl>
     <div id="error" class="err"></div>
@@ -111,7 +112,23 @@ function watchHtml(c) {
 function checkText(c) {
   if (!c) return '–';
   return esc(fmt(c.at) + ' · Network Standby ' + c.networkStandby + ' · ' + c.name + ', firmware ' + c.software
-    + (c.clock ? ' · clock ' + c.clock : '') + (c.onTimer ? ' · timer 1: ' + c.onTimer : ''));
+    + (c.clock ? ' · clock ' + c.clock : '') + (c.onTimer ? ' · timer 1: ' + c.onTimer : '')
+    + (c.sleepAfter ? ' · Sleep After ' + c.sleepAfter : '') + (c.applySleep ? ' · sleep after content update ' + c.applySleep : '')
+    + (c.lowPowerWifi ? ' · low-power Wi-Fi module ' + c.lowPowerWifi : ''));
+}
+function testHtml(t) {
+  if (!t) return '–';
+  const hm = (x) => new Date(x).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const seen = (t.observations || []).slice(-6).map((o) => esc(hm(o.at) + ' ' + (o.card ? 'card ' + o.card : o.error ? '?' : 'no card'))
+    + (o.file ? ' (<a href="/img/playlist-test/' + encodeURIComponent(o.file) + '" target="_blank">view</a>)' : '')).join(', ');
+  if (!t.done) {
+    return esc(t.t0 ? 'running: cards on the display since ' + hm(t.t0) + ', watching until ' + hm(t.endsAt) : 'starting…')
+      + (seen ? '<br>' + seen : '') + ' <button id="stoptest" type="button">Stop test</button>';
+  }
+  if (t.error) return '<span class="err">' + esc(fmt(t.startedAt) + ': ' + t.error) + '</span>';
+  const sw = t.result && t.result.transitions && t.result.transitions.length
+    ? '<br>Switches: ' + t.result.transitions.map((x) => esc(x.from + '→' + x.to + ' between ' + hm(x.after) + ' and ' + hm(x.by))).join('; ') : '';
+  return esc(fmt(t.startedAt) + ': ' + (t.result ? t.result.verdict : 'no result')) + sw + (seen ? '<br><span class="muted">Last thumbnails: ' + seen + '</span>' : '');
 }
 function render(s) {
   last = s;
@@ -134,7 +151,11 @@ function render(s) {
     ['This round', s.cycle ? esc(s.cycle.shown + ' of ' + s.cycle.total + ' photos shown (round ' + s.cycle.n + ')') : '–'],
     ['Album', s.library ? esc(s.library.titles.join(', ') + ' · ' + s.library.count + ' photos · read ' ) + fmt(s.library.fetchedAt) : '–'],
   ];
+  if (s.playlistTest) rows.push(['Playlist test', testHtml(s.playlistTest)]);
+  if (s.thumbnail && s.thumbnail.file) rows.push(['Screen', '<a href="/img/thumbnails/' + s.thumbnail.file + '?' + s.thumbnail.at + '" target="_blank">thumbnail the display sent ' + esc(fmt(s.thumbnail.at)) + '</a>']);
   $('#info').innerHTML = rows.map(([k, v]) => '<dt>' + k + '</dt><dd>' + v + '</dd>').join('');
+  const stop = $('#stoptest');
+  if (stop) stop.onclick = async () => { stop.disabled = true; await fetch('/api/stop-test', { method: 'POST' }); setTimeout(refresh1, 600); };
   const dup = s.lastError && s.sleep && s.sleep.error === s.lastError.message; // already shown under Display
   $('#error').textContent = s.lastError && !dup ? 'Last problem (' + fmt(s.lastError.at) + '): ' + s.lastError.message : '';
   $('#history').innerHTML = (s.history || []).slice(0, 8).map((h) => '<dt>' + fmt(h.at) + '</dt><dd>' + (h.ok ? esc(h.kind) + (h.dates && h.dates.length ? ' · ' + h.dates.map(day).join(' + ') : '') + (h.battery != null ? ' · battery ' + h.battery + '%' : '') + (h.waited ? ' · waited ' + h.waited + ' s for the display' : '') : '<span class="err">' + esc(h.error) + '</span>') + '</dd>').join('');
@@ -147,7 +168,11 @@ async function refresh() {
 document.querySelectorAll('.tabs button').forEach((b) => b.onclick = () => {
   view = b.dataset.view; document.querySelectorAll('.tabs button').forEach((x) => x.classList.toggle('on', x === b)); if (last) renderView(last);
 });
+async function refresh1() { const r = await fetch('/api/status'); render(await r.json()); }
 document.querySelectorAll('.actions button').forEach((b) => b.onclick = async () => {
+  if (b.dataset.act === 'playlist-test' && !confirm('Playlist test: the display shows four numbered cards as a playlist for about 1.5 hours, '
+    + 'while the NAS asks it every 2 minutes which one is up. Best with the display on USB-C power. '
+    + 'Your photo comes back afterwards. Start?')) return;
   b.disabled = true;
   const r = await fetch('/api/' + b.dataset.act, { method:'POST' });
   if (!r.ok) { const j = await r.json().catch(() => ({})); alert(j.error || 'Failed'); }

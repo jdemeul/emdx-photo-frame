@@ -12,6 +12,12 @@
 // protection time" (set in the Samsung E-Paper app). The EM32DX refuses 0x25, which those
 // notes list as an on-timer; "Check display" also reads Samsung's standard MDC clock
 // (0xA7) and timer 1 (0xA4), to see whether those are a way to set a wake-up time.
+//
+// From Samsung's own E-Paper app (Android 1.3.3, decompiled): 0xC7 with sub-command 0x53
+// and type 0x01 is "apply sleep mode after content update", 0xC7/0x54 + a URL makes the
+// display POST a thumbnail of its screen to that URL, 0xC6/0x81 is "Sleep After" and 0xCB
+// lists optional features. The same app sends playlists as one schedule entry with several
+// images, each with its own duration in milliseconds.
 import dgram from 'node:dgram';
 import { Device } from '@weejewel/samsung-mdc';
 import { log } from './log.js';
@@ -22,6 +28,13 @@ const CMD_POWER = 0x11;
 const CMD_NETWORK_STANDBY = 0xb5;
 const CMD_TIMER1 = 0xa4;
 const CMD_CLOCK = 0xa7;
+const CMD_CONTENT = 0xc7; // sub 0x53: content download (type 0x80) / apply sleep after update (type 0x01); 0x54: thumbnail
+const CMD_SLEEP_AFTER = 0xc6; // sub 0x81
+const CMD_FEATURES = 0xcb;
+
+// "Sleep After" codes, as the Samsung app sets them (0xF0 = custom, followed by 2 bytes).
+const SLEEP_AFTER_TEXT = { 0x00: 'off', 0x06: '5 min', 0x07: '10 min', 0x08: '20 min', 0x09: '30 min', 0x0a: '60 min' };
+export const SLEEP_AFTER_10_MIN = [0x07];
 
 const hex = (bytes) => Array.from(bytes || []).map((x) => x.toString(16).padStart(2, '0')).join(' ');
 
@@ -154,9 +167,17 @@ async function setNetworkStandby(device, on) {
 // sends it to sleep, and then sleeps the way it is set. `connect`: options for finding
 // the display (see connect()). Returns { battery, waitedSec }; throws when the display
 // never fetched the image.
-export async function pushToDisplay(cfg, server, png, { networkStandby = null, connect: connectOpts = {} } = {}) {
+export function pushToDisplay(cfg, server, png, opts = {}) {
+  return pushContent(cfg, server, { items: [{ buf: png, ext: 'png' }] }, opts);
+}
+
+// Push content: one image, or a playlist ({ items: [{ buf, durationMs }], contentType:
+// 'PlaylistContent' }), which the display downloads in full and then plays by itself.
+// Waits until the display has fetched every image; options as for pushToDisplay().
+export async function pushContent(cfg, server, content, { networkStandby = null, connect: connectOpts = {} } = {}) {
   const d = cfg.display;
-  const push = server.registerPush(png, 'png');
+  const push = server.registerContent(content);
+  const what = push.count === 1 ? 'the image' : `all ${push.count} images`;
   let battery = null;
   let waitedSec = null;
   try {
@@ -183,12 +204,16 @@ export async function pushToDisplay(cfg, server, png, { networkStandby = null, c
       } finally {
         await close(device);
       }
-      const ok = await push.waitForImage(d.fetchTimeoutSec * 1000);
-      if (ok) {
-        log.info('The display downloaded the image; it will refresh in a moment.');
+      // Waits until every image is fetched, or until no new one came for FETCH_TIMEOUT_SEC.
+      const got = await push.waitForImages(d.fetchTimeoutSec * 1000);
+      if (got === push.count) {
+        log.info(`The display downloaded ${what}; it will refresh in a moment.`);
         return { battery, waitedSec };
       }
-      log.warn(`The display did not fetch the image within ${d.fetchTimeoutSec}s (attempt ${attempt}/${d.pushAttempts}).`);
+      if (got > 0) {
+        throw new Error(`The display downloaded ${got} of ${push.count} images, then stopped (nothing for ${d.fetchTimeoutSec}s).`);
+      }
+      log.warn(`The display did not fetch ${what} within ${d.fetchTimeoutSec}s (attempt ${attempt}/${d.pushAttempts}).`);
     }
   } finally {
     push.done();
@@ -198,6 +223,65 @@ export async function pushToDisplay(cfg, server, png, { networkStandby = null, c
       'Check that it can reach this NAS on that address (SERVER_HOST, HTTP_PORT, NAS firewall).',
   );
 }
+
+// Connect (Wake-on-LAN first when a MAC is known; options as for connect()), run fn(device),
+// disconnect.
+export async function withDisplay(cfg, opts, fn) {
+  const device = await connect(cfg, opts);
+  try {
+    return await fn(device);
+  } finally {
+    await close(device);
+  }
+}
+
+// Answers to sub-commands start with the sub-command itself; drop it.
+const stripSub = (sub, r) => [...(r?.[0] === sub ? r.subarray(1) : r || [])];
+
+// "Sleep After" (0xC6/0x81), the display's own inactivity timer: [code] or [0xF0, hi, lo].
+export async function getSleepAfter(device) {
+  return stripSub(0x81, await cmd(device, CMD_SLEEP_AFTER, [0x81], 'Reading Sleep After'));
+}
+
+export async function setSleepAfter(device, bytes) {
+  await cmd(device, CMD_SLEEP_AFTER, [0x81, ...bytes], 'Setting Sleep After');
+}
+
+export function formatSleepAfter(bytes) {
+  if (!bytes?.length) return 'unknown';
+  if (bytes[0] === 0xf0 && bytes.length >= 3) return `custom (${(bytes[1] << 8) | bytes[2]})`;
+  return SLEEP_AFTER_TEXT[bytes[0]] ?? `code ${bytes[0]}`;
+}
+
+// "Apply sleep mode after content update" (0xC7/0x53, type 0x01): sleep as soon as an update
+// has been shown. Returns true/false, or null for an answer we don't understand.
+export async function getApplySleep(device) {
+  const d = stripSub(0x53, await cmd(device, CMD_CONTENT, [0x53], 'Reading "apply sleep mode after content update"'));
+  return d.length >= 2 && d[0] === 0x01 ? d[1] === 0x01 : null;
+}
+
+export async function setApplySleep(device, on) {
+  await cmd(device, CMD_CONTENT, [0x53, 0x01, on ? 0x01 : 0x00], `Turning "apply sleep mode after content update" ${on ? 'on' : 'off'}`);
+}
+
+// Ask the display to POST a thumbnail of what it shows to `url` (0xC7/0x54 + URL).
+export async function requestThumbnail(device, url) {
+  if (url.length > 250) throw new Error('Thumbnail URL is too long for MDC');
+  await cmd(device, CMD_CONTENT, [0x54, ...Buffer.from(url)], 'Asking for a thumbnail');
+}
+
+// Optional features (0xCB): bit 0 of the second byte = a low-power (2.4 GHz) Wi-Fi module
+// that Samsung's app uses for remote wake-up.
+export async function getFeatures(device) {
+  const r = await cmd(device, CMD_FEATURES, [], 'Reading features');
+  return { lowPowerWifi: r.length > 1 ? (r[1] & 1) === 1 : null, raw: hex(r) };
+}
+
+export async function getNetworkStandby(device) {
+  return (await cmd(device, CMD_NETWORK_STANDBY, [], 'Reading network standby'))[0] === 0x01;
+}
+
+export { setNetworkStandby };
 
 // Put the display to sleep, then power it off. With `networkStandby` (standby), network
 // standby is switched on first so that Wake-on-LAN can wake it; if that fails, the
@@ -286,10 +370,12 @@ export function formatTimer(b) {
   return `${on}, ${off} ${raw}`;
 }
 
-export async function readDisplayInfo(cfg) {
+// `thumbnailUrl`: also ask the display to POST a thumbnail of its screen there.
+export async function readDisplayInfo(cfg, { thumbnailUrl = null } = {}) {
   const device = await connect(cfg);
   try {
     const info = {};
+    const onOff = (v) => (v == null ? 'unknown' : v ? 'on' : 'off');
     for (const [key, fn] of [
       ['name', () => device.getDeviceName()],
       ['serial', () => device.getSerialNumber()],
@@ -299,6 +385,11 @@ export async function readDisplayInfo(cfg) {
       // Read only: a possible way to set a wake-up time (see the notes at the top).
       ['clock', async () => formatClock(await cmd(device, CMD_CLOCK, [], 'Reading the clock'))],
       ['onTimer', async () => formatTimer(await cmd(device, CMD_TIMER1, [], 'Reading timer 1'))],
+      // Settings from the Samsung app (see the notes at the top).
+      ['sleepAfter', async () => formatSleepAfter(await getSleepAfter(device))],
+      ['applySleep', async () => onOff(await getApplySleep(device))],
+      ['lowPowerWifi', async () => { const f = await getFeatures(device); return f.lowPowerWifi == null ? `unknown [${f.raw}]` : f.lowPowerWifi ? 'yes' : 'no'; }],
+      ...(thumbnailUrl ? [['thumbnail', async () => { await requestThumbnail(device, thumbnailUrl); return 'asked'; }]] : []),
     ]) {
       try {
         info[key] = await withTimeout(fn(), 6000, key);

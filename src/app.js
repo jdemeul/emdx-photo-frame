@@ -1,13 +1,19 @@
 // Orchestration: read the album, pick, download, render, push, remember.
 import fs from 'node:fs';
 import sharp from 'sharp';
-import { log } from './log.js';
+import { log, stamp } from './log.js';
 import { fetchAlbum, fetchItemInfo, sizedUrl, downloadImage } from './sources/googleAlbum.js';
 import { scanFolder } from './sources/folder.js';
 import { syncBag, planNext, markShown } from './selector.js';
 import { composeCanvas, renderCanvas, planCells } from './render.js';
-import { pushToDisplay, putToSleep, readDisplayInfo, confirmAsleep, probeDisplay } from './display.js';
+import {
+  pushToDisplay, pushContent, putToSleep, readDisplayInfo, confirmAsleep, probeDisplay, withDisplay,
+  getSleepAfter, setSleepAfter, formatSleepAfter, getApplySleep, setApplySleep, getNetworkStandby,
+  setNetworkStandby, getFeatures, requestThumbnail, SLEEP_AFTER_10_MIN,
+} from './display.js';
 import { renderTestPattern } from './testPattern.js';
+import { renderTestCards, classifyThumbnail } from './testCards.js';
+import { analyzePlaylistTest } from './playlistTest.js';
 
 const DAY = 24 * 3600 * 1000;
 // Runs that retry when the display can't be reached (manual ones report back instead).
@@ -25,6 +31,9 @@ export class FrameApp {
     this.retryTimer = null;
     this.sleepTimer = null;
     this.watchTimer = null;
+    this.thumbWaiters = new Set(); // callers waiting for the display's next thumbnail
+    this.testStop = false;
+    this.testWake = null;
     const st = this.state;
     st.excluded ||= {};
     st.history ||= [];
@@ -530,7 +539,7 @@ export class FrameApp {
   // it (Wake-on-LAN), so it is sent back to sleep SLEEP_DELAY_SEC later.
   displayInfo() {
     return this.exclusive('Checking the display', async () => {
-      const info = await readDisplayInfo(this.cfg);
+      const info = await readDisplayInfo(this.cfg, { thumbnailUrl: this.server?.thumbnailUrl });
       this.markAwake();
       this.scheduleSleep();
       if (info.battery?.batteryPercent != null) this.state.battery = { ...info.battery, at: Date.now() };
@@ -544,6 +553,224 @@ export class FrameApp {
   async sleepRightAway() {
     this.cancelSleep();
     await this.sleepNow();
+  }
+
+  // ---------- what the display reports ----------
+  // A thumbnail of the display's screen, which it POSTs after MDC 0xC7/0x54. Kept as
+  // thumbnails/latest.*; whoever asked for it gets it, and during a playlist test one that
+  // arrives unasked is noted too (it would mean the display reports switches by itself).
+  onThumbnail(th) {
+    const st = this.state;
+    if (th.image?.buf?.length) {
+      const ext = /png/i.test(th.image.type || '') || /\.png$/i.test(th.image.name || '') ? 'png' : 'jpg';
+      const dir = this.store.path('thumbnails');
+      fs.mkdirSync(dir, { recursive: true });
+      th.file = `latest.${ext}`;
+      fs.writeFileSync(`${dir}/${th.file}`, th.image.buf);
+      fs.rmSync(`${dir}/latest.${ext === 'png' ? 'jpg' : 'png'}`, { force: true });
+    }
+    st.thumbnail = { at: th.at, fields: th.fields, file: th.file || null };
+    this.store.save();
+    const waiters = [...this.thumbWaiters];
+    this.thumbWaiters.clear();
+    for (const w of waiters) w(th);
+    if (!waiters.length && st.playlistTest && !st.playlistTest.done) {
+      this.recordTestThumbnail(th, { asked: false }).catch((err) => log.warn(`Playlist test: ${err.message}`));
+    }
+  }
+
+  // Download progress the display reports (Samsung's app has an endpoint for it).
+  onDisplayReport(report) {
+    const t = this.state.playlistTest;
+    if (t && !t.done) {
+      t.reports = [...(t.reports || []), { at: report.at, path: report.path, text: report.text.slice(0, 500) }].slice(-20);
+      this.store.save();
+    }
+  }
+
+  // Ask the display for a thumbnail of its screen and wait for it; null if none came.
+  async askThumbnail(timeoutSec = 45) {
+    let deliver;
+    const got = new Promise((resolve) => { deliver = resolve; });
+    this.thumbWaiters.add(deliver);
+    const timer = setTimeout(() => { this.thumbWaiters.delete(deliver); deliver(null); }, timeoutSec * 1000);
+    try {
+      await withDisplay(this.cfg, { quiet: true }, (device) => requestThumbnail(device, this.server.thumbnailUrl));
+      return await got;
+    } finally {
+      clearTimeout(timer);
+      this.thumbWaiters.delete(deliver);
+    }
+  }
+
+  // ---------- playlist test ----------
+  // Does the display play a playlist by itself, and how does it time it? This pushes
+  // numbered cards as a playlist, the way Samsung's E-Paper app sends one (each card with
+  // its own duration), then asks the display every `pollSec` for a thumbnail of its screen
+  // and notes which card is showing. The display is kept awake meanwhile (Sleep After off,
+  // no sleep after the update, network standby on), so run it with the display on USB-C
+  // power. Afterwards its settings and the photo are put back. `unitMs`: length of a "minute"
+  // (tests use shorter ones).
+  playlistTest({ minutes = [10, 20, 20, 20], pollSec = 120, extraMin = 25, unitMs = 60000, thumbTimeoutSec = 45 } = {}) {
+    return this.run('Playlist test', async () => {
+      const cfg = this.cfg;
+      if (!cfg.display.host) throw new Error('Set EMDX_HOST first: the test needs the display.');
+      const st = this.state;
+      const dir = this.store.path('playlist-test');
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.mkdirSync(dir, { recursive: true });
+      this.testStop = false;
+      const durations = minutes.map((m) => Math.round(m * unitMs));
+      const total = durations.reduce((a, b) => a + b, 0) + extraMin * unitMs;
+      const t = { startedAt: Date.now(), minutes, unitMs, durations, observations: [], reports: [], notes: [], done: false };
+      st.playlistTest = t;
+      const note = (msg, level = 'info') => {
+        log[level](`Playlist test: ${msg}`);
+        t.notes.push({ at: Date.now(), msg });
+        this.store.save();
+      };
+      const wait = (ms) => new Promise((resolve) => {
+        const timer = setTimeout(resolve, ms);
+        this.testWake = () => { clearTimeout(timer); resolve(); };
+      });
+      const readOr = async (fn) => { try { return await fn(); } catch (err) { log.debug(err.message); return null; } };
+      const tryTo = async (fn, what) => { try { await fn(); } catch (err) { note(`could not ${what}: ${err.message}`, 'warn'); } };
+      const pause = () => new Promise((r) => setTimeout(r, 300)); // the display drops commands sent too fast
+
+      // 1. Note the display's settings, then keep it awake for the test.
+      const saved = {};
+      try {
+        await withDisplay(cfg, {}, async (device) => {
+          saved.battery = await readOr(() => device.getBatteryState()); await pause();
+          saved.sleepAfter = await readOr(() => getSleepAfter(device)); await pause();
+          saved.applySleep = await readOr(() => getApplySleep(device)); await pause();
+          saved.networkStandby = await readOr(() => getNetworkStandby(device)); await pause();
+          saved.features = await readOr(() => getFeatures(device)); await pause();
+          const b = saved.battery;
+          note(`display before the test: Sleep After ${saved.sleepAfter ? formatSleepAfter(saved.sleepAfter) : 'unknown'}, `
+            + `sleep after content update ${saved.applySleep == null ? 'unknown' : saved.applySleep ? 'on' : 'off'}, `
+            + `network standby ${saved.networkStandby == null ? 'unknown' : saved.networkStandby ? 'on' : 'off'}, `
+            + `low-power Wi-Fi module ${saved.features?.lowPowerWifi == null ? 'unknown' : saved.features.lowPowerWifi ? 'yes' : 'no'}`
+            + (b ? `, battery ${b.batteryPercent}%${b.pluggedIn ? ' (charging)' : ''}` : '') + '.');
+          if (b && !b.pluggedIn) note(`the display is not charging; staying awake for the test (about ${Math.round(total / 60000)} min) costs some battery.`, 'warn');
+          await tryTo(() => setSleepAfter(device, [0x00]), 'switch Sleep After off'); await pause();
+          await tryTo(() => setApplySleep(device, false), 'switch off "apply sleep mode after content update"'); await pause();
+          await tryTo(() => setNetworkStandby(device, true), 'switch network standby on');
+        });
+      } catch (err) {
+        t.done = true;
+        t.error = err.message;
+        this.store.save();
+        throw this.explainUnreachable(err, 'manual');
+      }
+      t.saved = { sleepAfter: saved.sleepAfter, applySleep: saved.applySleep, networkStandby: saved.networkStandby, features: saved.features };
+      this.markAwake();
+
+      try {
+        // 2. The cards, sent as a playlist.
+        this.setBusy('Playlist test: sending the cards');
+        const cards = await renderTestCards(cfg, { minutes, sentAt: new Date() });
+        for (const c of cards) fs.writeFileSync(`${dir}/card-${c.card}.png`, c.png);
+        const { battery } = await pushContent(cfg, this.server, {
+          items: cards.map((c, i) => ({ buf: c.png, durationMs: durations[i] })),
+          contentType: 'PlaylistContent',
+          name: 'Playlist test',
+        }, { networkStandby: true });
+        if (battery) st.battery = { ...battery, at: Date.now() };
+        t.t0 = Date.now();
+        t.endsAt = t.t0 + total;
+        note(`the display downloaded the ${cards.length} cards; card durations ${minutes.join('/')}`
+          + `${unitMs === 60000 ? ' min' : ` × ${unitMs} ms`}. Watching until ${stamp(new Date(t.endsAt)).slice(11, 16)}.`);
+
+        // 3. Watch: a thumbnail every pollSec.
+        this.setBusy(`Playlist test: watching until ${stamp(new Date(t.endsAt)).slice(11, 16)}`);
+        await wait(Math.min(20000, pollSec * 1000)); // let it draw card 1 first
+        while (!this.testStop && Date.now() < t.endsAt) {
+          const asked = Date.now();
+          try {
+            const th = await this.askThumbnail(thumbTimeoutSec);
+            if (th) await this.recordTestThumbnail(th, { asked: true });
+            else {
+              t.observations.push({ at: asked, card: null, error: `no thumbnail within ${thumbTimeoutSec} s` });
+              note(`no thumbnail came back within ${thumbTimeoutSec} s.`, 'warn');
+            }
+          } catch (err) {
+            t.observations.push({ at: asked, card: null, error: err.message });
+            note(`could not ask for a thumbnail: ${err.message}`, 'warn');
+          }
+          this.store.save();
+          const until = Math.min(asked + pollSec * 1000, t.endsAt);
+          if (!this.testStop && Date.now() < until) await wait(until - Date.now());
+        }
+        if (this.testStop) note('stopped early, as asked.');
+        t.result = analyzePlaylistTest({
+          t0: t.t0, durations, observations: t.observations, tz: cfg.timezone,
+          toleranceMs: Math.min(100000, Math.min(...durations) / 4),
+        });
+        note(t.result.verdict);
+        this.addHistory({ ok: true, kind: 'playlist test', ids: [], dates: [] });
+      } catch (err) {
+        t.error = err.message;
+        note(`failed: ${err.message}`, 'warn');
+        throw err;
+      } finally {
+        // 4. Put things back: the display's settings, then the photo (which ends the playlist).
+        this.setBusy('Playlist test: putting things back');
+        await tryTo(() => withDisplay(cfg, {}, async (device) => {
+          await setSleepAfter(device, saved.sleepAfter?.length ? saved.sleepAfter : SLEEP_AFTER_10_MIN);
+          await pause();
+          if (saved.applySleep != null) await setApplySleep(device, saved.applySleep);
+        }), 'put the display\'s Sleep After and "apply sleep mode after content update" back');
+        const c = st.current;
+        if (c && !c.dryRun && fs.existsSync(this.store.path('current', 'device.png'))) {
+          try {
+            await this.push(c, { reason: 'resend' }); // also sets network standby as SLEEP_MODE wants and schedules sleep
+            note('the photo is back on the frame.');
+          } catch (err) {
+            note(`could not put the photo back (${err.message}); press "Send again".`, 'warn');
+          }
+        } else {
+          note('no photo to put back: the frame keeps cycling the test cards until the next update.', 'warn');
+          this.scheduleSleep();
+        }
+        t.done = true;
+        t.endedAt = Date.now();
+        this.testWake = null;
+        this.store.save();
+      }
+      return t;
+    });
+  }
+
+  // Classify a thumbnail for the running playlist test and keep it as an observation.
+  async recordTestThumbnail(th, { asked }) {
+    const t = this.state.playlistTest;
+    if (!t || t.done) return null;
+    if (!th.image?.buf?.length) {
+      t.observations.push({ at: th.at, card: null, asked, error: 'thumbnail without an image' });
+      this.store.save();
+      return null;
+    }
+    const cls = await classifyThumbnail(th.image.buf, t.minutes.length);
+    const ext = th.file?.endsWith('png') ? 'png' : 'jpg';
+    const file = `thumb-${stamp(new Date(th.at)).replace(/\D/g, '').slice(8, 14)}-${cls.card ? `card${cls.card}` : 'unknown'}${asked ? '' : '-unasked'}.${ext}`;
+    fs.writeFileSync(this.store.path('playlist-test', file), th.image.buf);
+    const obs = { at: th.at, card: cls.card, share: cls.share, rgb: cls.rgb, file, asked };
+    t.observations.push(obs);
+    t.fields ||= th.fields; // what the display says about itself, once
+    this.store.save();
+    log.info(`Playlist test: ${asked ? '' : 'unasked '}thumbnail shows ${cls.card ? `card ${cls.card}` : 'no test card'}`
+      + ` (${Math.round(cls.share * 100)}% of the middle; average colour rgb(${cls.rgb.join(',')}))`);
+    return obs;
+  }
+
+  // "Stop test": ends a running playlist test early (it still puts things back).
+  stopTest() {
+    const t = this.state.playlistTest;
+    if (!t || t.done || !this.busy) return false;
+    this.testStop = true;
+    this.testWake?.();
+    return true;
   }
 
   addHistory(entry) {
@@ -573,6 +800,19 @@ export class FrameApp {
       check: this.cfg.display.host && this.cfg.sleep.mode !== 'off' && this.cfg.sleep.checkMin
         ? { everyMin: this.cfg.sleep.checkMin, last: st.lastCheck || null, wakeEvents: (st.wakeEvents || []).slice(0, 10) }
         : null,
+      thumbnail: st.thumbnail || null,
+      playlistTest: st.playlistTest ? this.testSummary(st.playlistTest) : null,
+    };
+  }
+
+  testSummary(t) {
+    return {
+      startedAt: t.startedAt, t0: t.t0 ?? null, endsAt: t.endsAt ?? null, endedAt: t.endedAt ?? null, done: t.done,
+      minutes: t.minutes, unitMs: t.unitMs, error: t.error ?? null, saved: t.saved ?? null, reports: (t.reports || []).length,
+      observations: t.observations.slice(-60).map(({ at, card, error, file, asked }) => ({ at, card, error, file, asked })),
+      notes: t.notes.slice(-12),
+      fields: t.fields ?? null,
+      result: t.result ? { verdict: t.result.verdict, model: t.result.model, transitions: t.result.transitions, scores: t.result.scores } : null,
     };
   }
 

@@ -158,6 +158,10 @@ test('a full day: album -> render -> display downloads a palette-only PNG', { sk
     // ...and the clock and timer 1 (read only), or why not.
     assert.equal(info.clock, '2026-10-16 13:05');
     assert.match(info.onTimer, /Reading timer 1: the display refused MDC command 0xa4/);
+    // ...the Samsung app's settings, and a thumbnail of its screen, which it POSTs back.
+    assert.deepEqual([info.sleepAfter, info.applySleep, info.lowPowerWifi, info.thumbnail], ['10 min', 'off', 'no', 'asked']);
+    await until(() => app.state.thumbnail?.file);
+    assert.equal(app.state.thumbnail.fields.content_player_type, 'MobileCMS');
     const checked = await (await fetch('http://127.0.0.1:18321/api/status')).json();
     assert.equal(checked.displayCheck.networkStandby, 'on');
     await until(() => app.state.sleep?.asleep && !emdx.state.awake);

@@ -62,6 +62,7 @@ Other commands (`sudo docker exec emdx-photo-frame node src/index.js <cmd>` on t
 - `display-info`: connect to the display and print its name, battery, Network Standby, clock and timer 1. Changes nothing on the display.
 - `sleep`: put the display to sleep now (Network Standby on, or off with `SLEEP_MODE=deep`; then power off) and wait until it stops answering.
 - `sleep-test [minutes]`: check that Wake-on-LAN wakes the display from sleep, optionally after letting it sleep that many more minutes (see [Sleep and battery](#6-sleep-and-battery)).
+- `playlist-test [minutes,…]`: the [playlist test](#can-the-display-switch-photos-by-itself-playlist-test), e.g. `playlist-test 10,20,20,20` (2 to 4 cards). Like `once`, only while the service is stopped; otherwise use the button.
 - `once`, `test-pattern`: show the next photo or the test pattern. These start their own web server, so use them only while the service is stopped (e.g. with `docker run --rm`); while it runs, use the buttons on its web page.
 
 ## 5. Settings (`.env`)
@@ -116,6 +117,22 @@ Tested in October 2026 on an EM32DX (firmware S-RSEDWWC-1130.7) on 5 GHz Wi-Fi:
 - **Bluetooth:** Samsung's E-Paper app monitors the display over Bluetooth and can wake it. The NAS has no Bluetooth, which is why `deep` relies on the display waking itself.
 
 The sleep commands (MDC `0x11` power, `0xB5` Network Standby) follow the EMDX command notes in [taylorRichie/node-samsung-emdx](https://github.com/taylorRichie/node-samsung-emdx/blob/main/docs/MDC-COMMANDS.md).
+
+### Can the display switch photos by itself? (playlist test)
+
+Samsung's E-Paper app can send a playlist: one download with several images, each with its own display time, which the display then plays without the phone. If the display keeps doing that in deep sleep, the NAS could send weeks of photos at once and leave the display in deep sleep in between. The playlist format comes from Samsung's Android app (decompiled): the same JSON schedule this service already sends, with several images in it, each with a `duration` in milliseconds (the app's "24 h" interval is 86400000). How the display counts those durations isn't in the app, so this test measures it.
+
+**Run it** during the day, with the display on USB-C power: wake the display (press its power button if it is in deep sleep), open the web page and press **Playlist test**. It takes about an hour and a half:
+
+1. The NAS notes the display's Sleep After, "apply sleep mode after content update" and Network Standby settings, then keeps it awake for the test.
+2. It sends four numbered cards (red, yellow, green, blue) as one playlist, to show for 10, 20, 20 and 20 minutes.
+3. Every 2 minutes it asks the display for a thumbnail of its screen (MDC `0xC7`/`0x54`, as Samsung's app does) and notes which card is up. The thumbnails stay in the data volume (`playlist-test/`); the page links the latest ones.
+4. It then works out how the display timed the playlist: counted from when it received it, from midnight, or from 1970 without restarting, and with each card's own duration or the first card's for all. The verdict appears under **Playlist test**.
+5. Finally it puts the display's settings back and sends your photo again, which ends the playlist. **Stop test** ends it early, with the same clean-up.
+
+If no thumbnails come back (the firmware may not support them), the verdict says so; then watch the panel instead. Card 1 comes first. Counted from the push, card 2 follows 10 minutes later, card 3 after 30, card 4 after 50 and card 1 again after 70.
+
+**Check display** now also shows Sleep After, "sleep after content update" and whether the display has a low-power Wi-Fi module, and asks the display for a thumbnail of its screen, linked under **Screen**.
 
 ## 7. How it works
 
