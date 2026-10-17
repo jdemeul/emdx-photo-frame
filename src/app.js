@@ -219,6 +219,7 @@ export class FrameApp {
     fs.writeFileSync(`${dir}/device.png`, out.devicePng);
     fs.writeFileSync(`${dir}/preview.png`, out.previewPng);
     fs.writeFileSync(`${dir}/preview.jpg`, out.previewJpg);
+    fs.writeFileSync(`${dir}/thumb.jpg`, await sharp(out.previewJpg).resize(240).jpeg({ quality: 80 }).toBuffer()); // for lists of photos
     fs.rmSync(`${dir}/source-2.jpg`, { force: true });
     for (let i = 0; i < inputs.length; i++) {
       const thumb = await sharp(inputs[i], { failOn: 'none' }).rotate().resize(900, 900, { fit: 'inside' }).jpeg({ quality: 82 }).toBuffer();

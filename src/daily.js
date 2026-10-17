@@ -18,13 +18,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import sharp from 'sharp';
 import { log } from './log.js';
 import { markShown } from './selector.js';
 import { pushContent, probeDisplay } from './display.js';
 import { changeClock, slotKey, dayLabel, buildBatch, positionAt } from './playlist.js';
 import { matchThumbnail } from './thumbMatch.js';
 
-const FILES = ['device.png', 'preview.png', 'preview.jpg', 'source-1.jpg', 'source-2.jpg'];
+const FILES = ['device.png', 'preview.png', 'preview.jpg', 'thumb.jpg', 'source-1.jpg', 'source-2.jpg'];
 const pause = (ms) => new Promise((r) => setTimeout(r, ms));
 const DAY = 24 * 3600 * 1000;
 
@@ -82,7 +83,7 @@ export class DailyPlaylist {
     let error = null;
     for (const at of missing) {
       try {
-        const slot = (at === curAt && this.adoptCurrent(at))
+        const slot = (at === curAt && await this.adoptCurrent(at))
           || await this.renderSlot(at, { fresh: fresh && made === 0, note: missing.length > 1 ? ` (${made + 1} of ${missing.length})` : '' });
         have.set(at, slot);
         made++;
@@ -109,7 +110,7 @@ export class DailyPlaylist {
 
   // The photo on the frame (rendered earlier, e.g. before switching to playlist mode) becomes
   // the photo for now, so the first playlist doesn't change it.
-  adoptCurrent(at) {
+  async adoptCurrent(at) {
     const c = this.app.state.current;
     const src = this.app.store.path('current');
     if (!c || c.dryRun || !fs.existsSync(path.join(src, 'device.png'))) return null;
@@ -117,6 +118,9 @@ export class DailyPlaylist {
     const dir = this.app.store.path('playlist', slot.dir);
     fs.mkdirSync(dir, { recursive: true });
     for (const f of FILES) if (fs.existsSync(path.join(src, f))) fs.copyFileSync(path.join(src, f), path.join(dir, f));
+    if (!fs.existsSync(path.join(dir, 'thumb.jpg')) && fs.existsSync(path.join(dir, 'preview.jpg'))) {
+      try { await sharp(path.join(dir, 'preview.jpg')).resize(240).jpeg({ quality: 80 }).toFile(path.join(dir, 'thumb.jpg')); } catch { /* the page uses the preview then */ }
+    }
     markShown(this.app.state, c.ids || []); // (a photo still waiting to be shown wasn't marked yet)
     return slot;
   }
@@ -154,9 +158,18 @@ export class DailyPlaylist {
     if (!p.batch) return 'the display has no playlist yet';
     if (p.batch.schedule !== this.cfg.schedule) return 'SCHEDULE changed';
     if (p.batch.days !== this.cfg.update.days) return 'PLAYLIST_DAYS changed';
+    // At most one a change, and only once the display is running short.
     const curAt = this.clock.prev(now);
-    if (curAt != null && curAt > p.batch.items[0].at) return 'the display has moved on since the last playlist';
+    const left = this.daysLeft(now);
+    if (curAt != null && curAt > p.batch.items[0].at && left < this.cfg.update.topUpDays) {
+      return left ? `only ${left} day${left === 1 ? '' : 's'} of photos left on the display` : 'the playlist on the display has run out';
+    }
     return null;
+  }
+
+  // How many changes the playlist on the display still covers (it repeats after that).
+  daysLeft(now = Date.now()) {
+    return (this.st.batch?.items || []).filter((it) => it.at > now).length;
   }
 
   // Send the playlist: the photo for now until the next change, then one photo per change for
@@ -374,7 +387,10 @@ export class DailyPlaylist {
     const entry = { at, how, expected: expected?.key ?? null, seen: null };
     if (th?.image?.buf?.length && b) {
       const cands = new Map();
-      for (const s of [...b.items, ...this.st.slots]) cands.set(s.dir, { key: s.key, file: this.file(s, 'preview.jpg') });
+      for (const s of [...b.items, ...this.st.slots]) {
+        const small = this.file(s, 'thumb.jpg');
+        cands.set(s.dir, { key: s.key, file: fs.existsSync(small) ? small : this.file(s, 'preview.jpg') });
+      }
       const m = await matchThumbnail(th.image.buf, [...cands.values()]);
       if (m) Object.assign(entry, { seen: m.key, score: m.score, sure: m.sure, file: th.file ?? null });
       entry.ok = !!m && (m.key === entry.expected || m.key === lagging?.key);
@@ -459,7 +475,8 @@ export class DailyPlaylist {
       replaced: this.st.replaced || null,
       changes: this.st.changes.slice(0, 5),
       seen: this.st.seen.slice(0, 5),
-      daysLeft: b ? Math.max(0, Math.round((b.endsAt - now) / DAY)) : null,
+      daysLeft: b ? this.daysLeft(now) : null,
+      topUpDays: this.cfg.update.topUpDays,
     };
   }
 }

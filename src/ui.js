@@ -30,7 +30,7 @@ export const UI_HTML = `<!doctype html>
   .muted { color:var(--muted); font-size:13px; }
   #sources { display:grid; gap:8px; grid-template-columns:1fr 1fr; }
   #sources img { width:100%; border-radius:4px; }
-  .slots { display:grid; gap:10px; grid-template-columns:repeat(auto-fill, minmax(92px, 1fr)); }
+  .slots { display:grid; gap:10px; grid-template-columns:repeat(auto-fill, minmax(76px, 1fr)); }
   .slots figure { margin:0; }
   .slots img { width:100%; display:block; border-radius:4px; background:#ccc; }
   .slots figure.now img { outline:3px solid var(--accent); outline-offset:2px; }
@@ -90,7 +90,7 @@ function renderView(s) {
     else if (!pl.slots.length) html = '<p class="muted">Preparing the photos…</p>';
     else {
       html = '<div class="slots">' + pl.slots.map((x) => '<figure class="' + (x.now ? 'now' : '') + '"><a href="/img/playlist/' + x.dir + '/preview.png" target="_blank">'
-        + '<img loading="lazy" src="/img/playlist/' + x.dir + '/preview.jpg" alt=""></a><figcaption>' + esc(x.label) + (x.now ? ' · now' : '')
+        + '<img loading="lazy" src="/img/playlist/' + x.dir + '/thumb.jpg" data-fallback="/img/playlist/' + x.dir + '/preview.jpg" onerror="this.onerror=null;this.src=this.dataset.fallback" alt=""></a><figcaption>' + esc(x.label) + (x.now ? ' · now' : '')
         + (x.sent ? '' : ' · not sent yet') + '</figcaption></figure>').join('') + '</div>';
       note = 'One photo per change, from the one for now. The display changes to the next one by itself; the outlined one should be on the frame now. Click for full size.';
     }
@@ -135,7 +135,7 @@ function checkText(c) {
 }
 function playlistHtml(pl) {
   let h = pl.batch
-    ? esc(pl.batch.photos + ' photos sent ' + fmt(pl.batch.sentAt) + ', until ' + fmt(pl.batch.endsAt))
+    ? esc(pl.batch.photos + ' photos sent ' + fmt(pl.batch.sentAt) + ', until ' + fmt(pl.batch.endsAt) + ' (' + pl.daysLeft + ' to come; a fresh one when fewer than ' + pl.topUpDays + ' are left)')
       + (pl.batch.ranOut ? ' · <span class="err">used up: the display repeats it until it gets a fresh one</span>' : '')
     : '<span class="err">not on the display yet</span>';
   if (pl.due) h += '<br><span class="muted">' + esc('Fresh playlist due (' + pl.due + '). The NAS sends it when it finds the display awake'

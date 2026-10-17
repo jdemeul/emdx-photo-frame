@@ -75,7 +75,8 @@ Other commands (`sudo docker exec emdx-photo-frame node src/index.js <cmd>` on t
 | `PANEL` / `ORIENTATION` / `ROTATE` | EM32DX / landscape / 0 | EM13DX also known; or set `PANEL_WIDTH`/`PANEL_HEIGHT` |
 | `SCHEDULE`, `TZ` | `0 6 * * *`, Europe/Brussels | Cron syntax. When the photo changes. With `SLEEP_MODE=deep` in push mode, use the display's screen protection time |
 | `UPDATE_MODE` | push | `push`: the NAS sends a photo at every `SCHEDULE` time. `playlist`: the NAS sends the coming days at once and the display changes the photo itself (see [One photo a day from a playlist](#one-photo-a-day-from-a-playlist-update_modeplaylist)) |
-| `PLAYLIST_DAYS` | 7 | Playlist mode: how many days ahead each playlist covers (1–60) |
+| `PLAYLIST_DAYS` | 7 | Playlist mode: how many days ahead each playlist covers (1–60). See [how long a playlist](#how-long-a-playlist) |
+| `PLAYLIST_TOPUP_DAYS` | 7 | Playlist mode: a fresh playlist goes out (when the NAS finds the display awake) only once fewer than this many days are left on it |
 | `ODD_PHOTOS` | pair | `pair`, `crop` (smart-crop to fill) or `fit` (white margin) |
 | `DITHER` | device | The display dithers. `local` dithers on the NAS instead (see [Findings](#findings-nas-vs-panel-dithering)) |
 | `SATURATION`, `CONTRAST` | 1.0, 0.1 | Tone tweaks before sending. With `DITHER=local` the defaults are 1.3, 0.25 |
@@ -126,11 +127,17 @@ The sleep commands (MDC `0x11` power, `0xB5` Network Standby) follow the EMDX co
 Deep sleep saves the battery, but then the NAS can't reach the display to send the next photo. Playlist mode turns this around: the display changes the photo itself. Samsung's E-Paper app works the same way with its playlists, and the [playlist test](#can-the-display-switch-photos-by-itself-playlist-test) showed how the display times them: it starts with the first photo, and shows each photo for its own duration, counted from when it got the playlist.
 
 - **What the NAS sends:** one playlist with the photo for now, shown until the next `SCHEDULE` time, then one photo per change for `PLAYLIST_DAYS` days (default 7). The durations follow the real change times, so a photo shows for 23 or 25 hours across a daylight-saving switch. If no fresh playlist arrives in time, the display starts over at the first photo; an extra item at the end keeps the changes on time then too.
-- **When:** the NAS renders the photos ahead and keeps a week ready. It sends a fresh playlist when it finds the display awake and the display has moved on since the last playlist (or something changed, like **New photo for today**). It looks every `SLEEP_CHECK_MIN` minutes (default 5 in this mode), without Wake-on-LAN, so pressing the display's power button is enough: within a few minutes it gets a fresh week (**Check display** right after the button press does it at once). Each fresh playlist starts with the photo it already shows, so the frame keeps its photo until the next change.
+- **When:** the NAS renders the photos ahead and keeps `PLAYLIST_DAYS` ready. It sends a fresh playlist when it finds the display awake and fewer than `PLAYLIST_TOPUP_DAYS` (7) days are left on it (with the default 7-day playlist: whenever a day has passed), or when something changed, like **New photo for today**. It looks every `SLEEP_CHECK_MIN` minutes (default 5 in this mode), without Wake-on-LAN, so pressing the display's power button is enough: within a few minutes it gets a fresh week (**Check display** right after the button press does it at once). Each fresh playlist starts with the photo it already shows, so the frame keeps its photo until the next change.
 - **Sleep:** with `SLEEP_MODE=deep` the NAS switches Network Standby off and powers the display off after each playlist, as after any update. Pick a `SCHEDULE` time that differs from the display's screen protection time, so you can tell the two apart.
 - **After each change** the NAS looks for the display for `WAKE_WINDOW_MIN` minutes. If it comes online by itself after a change, it gets a fresh playlist then. In deep sleep it most likely changes the photo offline.
 - **On the page:** the **Playlist** tab shows the photos for the coming days. The outlined one should be on the frame now. **On the frame** follows the playlist, and **Seen on the display** shows what the display's own thumbnail showed whenever the NAS could ask for one (if the firmware sends thumbnails). **New photo for today** replaces the photo for now; **Send playlist** sends the playlist now (press the display's power button first).
 - A test pattern replaces the playlist until the next fresh one. After a playlist test, the NAS sends the playlist again.
+
+#### How long a playlist?
+
+`PLAYLIST_DAYS` sets it, up to 60. Every photo goes to the display as a full-colour PNG at panel size, typically 2–4 MB (2 MB for a smooth photo, 3.4 MB for a detailed test image; the log shows each one as the display downloads it). So 30 days come to roughly 60–130 MB per playlist. The display has 8 GB of storage, so that is no limit. What costs battery is the download: the display's Wi-Fi is on for as long as it takes. Changing the photo from its own storage needs no Wi-Fi.
+
+A longer playlist therefore saves battery, provided the NAS doesn't send it again at every chance. That is what `PLAYLIST_TOPUP_DAYS` is for: with `PLAYLIST_DAYS=30` and the default 7, the NAS sends a fresh playlist only in the last week, so once every three weeks or so, the next time it finds the display awake (press its power button now and then). If it never does, the playlist starts over, on time. **Recent** on the page lists the battery at each playlist, so you can see what a download costs. On the NAS each planned photo takes about 5–10 MB in the data volume.
 
 #### The first night
 

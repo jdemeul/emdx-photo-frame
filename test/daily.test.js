@@ -74,6 +74,27 @@ test('spring forward: 02:30 does not exist on 28 Mar 2027, so that change comes 
   assert.deepEqual([slotKey(x, TZ), slotKey(y, TZ)], ['2026-10-17 17:00:12', '2026-10-17 17:00:24']);
 });
 
+test('a long playlist gets a fresh one only once it runs short (PLAYLIST_TOPUP_DAYS)', async () => {
+  const { DailyPlaylist } = await import('../src/daily.js');
+  const app = {
+    cfg: { schedule: '55 5 * * *', timezone: TZ, update: { days: 30, topUpDays: 7 } },
+    state: {},
+    store: { save() {}, path: (...p) => path.join(os.tmpdir(), 'no-such-dir', ...p) },
+  };
+  const daily = new DailyPlaylist(app);
+  const now = at('2026-10-17T15:00:00Z');
+  const b = buildBatch({ now, slots: plan(daily.clock, now, 30), clock: daily.clock });
+  app.state.playlist.batch = { ...b, schedule: '55 5 * * *', days: 30 };
+  assert.equal(daily.daysLeft(now + 60000), 30);
+  assert.equal(daily.due(now + 60000), null);
+  assert.equal(daily.due(at('2026-10-18T05:00:00Z')), null); // 29 to come
+  assert.equal(daily.due(at('2026-11-09T06:00:00Z')), null); // 7 to come
+  assert.equal(daily.due(at('2026-11-10T06:00:00Z')), 'only 6 days of photos left on the display');
+  assert.equal(daily.due(b.endsAt + H), 'the playlist on the display has run out');
+  app.state.playlist.pending = 'a new photo for now';
+  assert.equal(daily.due(now + 60000), 'a new photo for now');
+});
+
 // Distinct test photos: a few shapes in different places and colours.
 function photoSvg(i, w = 300, h = 500) {
   const hue = (i * 67) % 360;
@@ -209,7 +230,7 @@ test('playlist mode: plan, send when found awake, the display moves on by itself
     assert.equal(pl().changes[0].online, null);
     assert.equal(pl().slots.length, 4);
     assert.ok(fs.existsSync(path.join(dataDir, 'playlist', b1.items[0].dir)), 'files of the playlist on the display are kept');
-    assert.equal(app.daily.due(), 'the display has moved on since the last playlist');
+    assert.equal(app.daily.due(), 'only 2 days of photos left on the display'); // fewer than PLAYLIST_TOPUP_DAYS (here 3)
 
     // Someone presses its button: the NAS asks what it shows (the right photo), then tops it up,
     // starting with the photo it shows now.
@@ -252,6 +273,9 @@ test('playlist mode: plan, send when found awake, the display moves on by itself
     assert.equal(status.playlist.batch.count, pl().batch.count);
     const img = await fetch(`http://127.0.0.1:18461/img/playlist/${fresh.dir}/preview.jpg`);
     assert.equal(img.status, 200);
+    const small = await fetch(`http://127.0.0.1:18461/img/playlist/${fresh.dir}/thumb.jpg`);
+    assert.equal(small.status, 200);
+    assert.ok((await small.arrayBuffer()).byteLength < 60000);
     assert.match(await (await fetch('http://127.0.0.1:18461/')).text(), /data-view="playlist"/);
 
     // A test pattern replaces the playlist: a fresh one is due.

@@ -137,6 +137,12 @@ export function loadConfig() {
   if (!Number.isInteger(playlistDays) || playlistDays < 1 || playlistDays > 60) {
     throw new Error(`PLAYLIST_DAYS must be a whole number from 1 to 60 (got "${playlistDays}")`);
   }
+  // A fresh playlist goes out (when the display is found awake) once fewer days than this are
+  // left on it: long playlists then mean a few big downloads instead of one at every chance.
+  const topUpDays = num('PLAYLIST_TOPUP_DAYS', 7);
+  if (!Number.isInteger(topUpDays) || topUpDays < 1 || topUpDays > 60) {
+    throw new Error(`PLAYLIST_TOPUP_DAYS must be a whole number from 1 to 60 (got "${topUpDays}")`);
+  }
 
   const cfg = {
     dataDir: str('DATA_DIR', '/data'),
@@ -169,6 +175,7 @@ export function loadConfig() {
     update: {
       mode: updateMode,
       days: playlistDays,
+      topUpDays: Math.min(topUpDays, playlistDays),
       // Below this, the photo for now isn't sent: the next one shows a little early instead.
       minFirstSec: 600,
       // A shorter tail (the gap that keeps a repeating playlist on time) is left out.
@@ -246,7 +253,7 @@ export function describeConfig(cfg) {
     `server: http://${cfg.server.publicHost}:${cfg.server.port}`,
     `schedule: "${cfg.schedule}" (${cfg.timezone}), sleep: ${cfg.sleep.mode}`,
     cfg.update.mode === 'playlist'
-      ? `updates: playlist of ${cfg.update.days} day${cfg.update.days === 1 ? '' : 's'}, the display changes the photo at each SCHEDULE time`
+      ? `updates: playlist of ${cfg.update.days} day${cfg.update.days === 1 ? '' : 's'} (fresh one when fewer than ${cfg.update.topUpDays} are left), the display changes the photo at each SCHEDULE time`
       : 'updates: the NAS sends a photo at each SCHEDULE time',
     `image: dither=${cfg.image.dither} method=${cfg.image.method} kernel=${cfg.image.kernel} sat=${cfg.image.saturation} contrast=${cfg.image.contrast}`,
   ].join('\n  ');

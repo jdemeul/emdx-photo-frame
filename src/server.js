@@ -257,7 +257,7 @@ export function createServer(cfg, app) {
     if (shot && req.method === 'GET') {
       return sendFile(res, app.store.path(shot[1], shot[2]), shot[2].endsWith('.png') ? 'image/png' : 'image/jpeg');
     }
-    const slot = /^\/img\/playlist\/([\w-]+)\/(preview\.jpg|preview\.png|source-[12]\.jpg)$/.exec(p);
+    const slot = /^\/img\/playlist\/([\w-]+)\/(thumb\.jpg|preview\.jpg|preview\.png|source-[12]\.jpg)$/.exec(p);
     if (slot && req.method === 'GET') {
       return sendFile(res, app.store.path('playlist', slot[1], slot[2]), slot[2].endsWith('.png') ? 'image/png' : 'image/jpeg');
     }
