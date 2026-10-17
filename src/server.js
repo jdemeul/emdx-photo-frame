@@ -18,8 +18,8 @@ export function createServer(cfg, app) {
   const thumbnailUrl = `${baseUrl}/emdx/device-thumbnail`;
 
   // Register content for the display to download: one image, or a playlist of images that
-  // the display plays by itself ({ items: [{ buf, ext, durationMs }], contentType:
-  // 'PlaylistContent' }). Returns URLs and a waiter.
+  // the display plays by itself ({ items: [{ buf or file, ext, durationMs }], contentType:
+  // 'PlaylistContent' }; `file`: served from disk). Returns URLs and a waiter.
   //
   // The manifest is the Samsung E-Paper app's: one schedule entry (1970-01-01 to 2999-12-31,
   // from 00:00:00) with the images in order, each with its own duration in milliseconds (the
@@ -35,7 +35,8 @@ export function createServer(cfg, app) {
       const fileId = items.length === 1 ? id : crypto.randomUUID().toUpperCase();
       const ext = it.ext || 'png';
       const fileName = `${fileId}.${ext}`;
-      return { i, fileId, fileName, ext, buf: it.buf, durationMs: it.durationMs ?? 91326, url: `${baseUrl}/emdx/${id}/${fileName}`, fetched: false };
+      const size = it.buf ? it.buf.length : fs.statSync(it.file).size;
+      return { i, fileId, fileName, ext, buf: it.buf, file: it.file, size, durationMs: it.durationMs ?? 91326, url: `${baseUrl}/emdx/${id}/${fileName}`, fetched: false };
     });
     const json = JSON.stringify({
       schedule: [
@@ -48,7 +49,7 @@ export function createServer(cfg, app) {
             file_id: f.fileId,
             file_path: `${EPD_CONTENT_DIR}/${f.fileId}/${f.fileName}`,
             duration: f.durationMs,
-            file_size: `${f.buf.length}`,
+            file_size: `${f.size}`,
             file_name: f.fileName,
           })),
         },
@@ -211,16 +212,17 @@ export function createServer(cfg, app) {
       if (file) {
         res.writeHead(200, {
           'Content-Type': file.ext === 'png' ? 'image/png' : 'image/jpeg',
-          'Content-Length': file.buf.length,
+          'Content-Length': file.size,
         });
         if (req.method === 'HEAD') { res.end(); return; }
         res.on('finish', () => {
           const n = entry.files.length;
-          log.info(`Display downloaded the image${n > 1 ? ` (${file.i + 1} of ${n})` : ''} (${(file.buf.length / 1e6).toFixed(1)} MB)`);
+          log.info(`Display downloaded the image${n > 1 ? ` (${file.i + 1} of ${n})` : ''} (${(file.size / 1e6).toFixed(1)} MB)`);
           file.fetched = true;
           for (const w of [...entry.waiters]) w(true);
         });
-        res.end(file.buf);
+        if (file.buf) res.end(file.buf);
+        else fs.createReadStream(file.file).on('error', () => res.destroy()).pipe(res);
         return;
       }
       res.writeHead(404).end();
@@ -254,6 +256,10 @@ export function createServer(cfg, app) {
     const shot = /^\/img\/(thumbnails|playlist-test)\/([\w.-]+\.(?:png|jpe?g))$/.exec(p);
     if (shot && req.method === 'GET') {
       return sendFile(res, app.store.path(shot[1], shot[2]), shot[2].endsWith('.png') ? 'image/png' : 'image/jpeg');
+    }
+    const slot = /^\/img\/playlist\/([\w-]+)\/(preview\.jpg|preview\.png|source-[12]\.jpg)$/.exec(p);
+    if (slot && req.method === 'GET') {
+      return sendFile(res, app.store.path('playlist', slot[1], slot[2]), slot[2].endsWith('.png') ? 'image/png' : 'image/jpeg');
     }
     const actions = {
       '/api/next': () => app.next('manual'),

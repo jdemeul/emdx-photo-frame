@@ -29,6 +29,19 @@ test('every photo is shown once per cycle, then a new cycle starts', () => {
   assert.equal(state.bag.length, 5);
 });
 
+test('a new cycle opens with photos that are not already planned', () => {
+  const ids = Array.from({ length: 10 }, (_, i) => `p${i}`);
+  for (let run = 0; run < 20; run++) {
+    const state = { history: [] };
+    syncBag(state, ids);
+    for (const id of [...state.bag]) markShown(state, [id]); // the whole round planned
+    const planned = state.shownThisCycle.slice(-4); // the last four still to come
+    syncBag(state, ids, Math.random, Date.now(), planned);
+    assert.equal(state.cycle, 2);
+    assert.deepEqual([...state.bag.slice(-4)].sort(), [...planned].sort());
+  }
+});
+
 test('new photos join the current cycle; deleted ones disappear', () => {
   const state = { history: [] };
   syncBag(state, ['a', 'b', 'c']);

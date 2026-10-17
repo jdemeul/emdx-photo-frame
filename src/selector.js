@@ -19,8 +19,10 @@ export function isExcluded(state, id, now = Date.now()) {
 }
 
 // Bring the bag in line with the album: drop removed photos, slot new ones in at
-// random positions, and start a new shuffled cycle once everything was shown.
-export function syncBag(state, ids, rand = Math.random, now = Date.now()) {
+// random positions, and start a new shuffled cycle once everything was shown. A new cycle
+// doesn't open with what was just on the wall, nor with `avoid` (e.g. photos already planned
+// for the coming days).
+export function syncBag(state, ids, rand = Math.random, now = Date.now(), avoid = []) {
   const usable = ids.filter((id) => !isExcluded(state, id, now));
   const idSet = new Set(usable);
   state.bag = (state.bag || []).filter((id) => idSet.has(id));
@@ -32,7 +34,7 @@ export function syncBag(state, ids, rand = Math.random, now = Date.now()) {
     state.bag.splice(Math.floor(rand() * (state.bag.length + 1)), 0, id);
   }
   if (state.bag.length === 0 && usable.length) {
-    const recent = new Set((state.history || []).filter((h) => h.ok).slice(0, 2).flatMap((h) => h.ids || []));
+    const recent = new Set([...(state.history || []).filter((h) => h.ok).slice(0, 2).flatMap((h) => h.ids || []), ...avoid]);
     const fresh = shuffle(usable.slice(), rand);
     // Don't open the new cycle with what was just on the wall.
     fresh.sort((a, b) => (recent.has(a) ? 1 : 0) - (recent.has(b) ? 1 : 0));

@@ -171,7 +171,7 @@ export function pushToDisplay(cfg, server, png, opts = {}) {
   return pushContent(cfg, server, { items: [{ buf: png, ext: 'png' }] }, opts);
 }
 
-// Push content: one image, or a playlist ({ items: [{ buf, durationMs }], contentType:
+// Push content: one image, or a playlist ({ items: [{ buf or file, durationMs }], contentType:
 // 'PlaylistContent' }), which the display downloads in full and then plays by itself.
 // Waits until the display has fetched every image; options as for pushToDisplay().
 export async function pushContent(cfg, server, content, { networkStandby = null, connect: connectOpts = {} } = {}) {

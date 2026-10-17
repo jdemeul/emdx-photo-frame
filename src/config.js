@@ -126,6 +126,18 @@ export function loadConfig() {
   // beat the NAS ditherer side by side (deeper colours, quieter dark tones).
   const dither = oneOf('DITHER', 'device', ['device', 'local']);
 
+  //   push     - at every SCHEDULE time the NAS sends the next photo (the display must be
+  //              reachable then).
+  //   playlist - the NAS sends the photos for the coming PLAYLIST_DAYS days at once, as the
+  //              display's own playlist, and the display changes the photo itself at every
+  //              SCHEDULE time, also in deep sleep. The NAS tops it up whenever it finds the
+  //              display awake.
+  const updateMode = oneOf('UPDATE_MODE', 'push', ['push', 'playlist']);
+  const playlistDays = num('PLAYLIST_DAYS', 7);
+  if (!Number.isInteger(playlistDays) || playlistDays < 1 || playlistDays > 60) {
+    throw new Error(`PLAYLIST_DAYS must be a whole number from 1 to 60 (got "${playlistDays}")`);
+  }
+
   const cfg = {
     dataDir: str('DATA_DIR', '/data'),
     albumUrls,
@@ -153,6 +165,18 @@ export function loadConfig() {
 
     schedule: str('SCHEDULE', '0 6 * * *'),
     timezone: str('TZ', 'Europe/Brussels'),
+
+    update: {
+      mode: updateMode,
+      days: playlistDays,
+      // Below this, the photo for now isn't sent: the next one shows a little early instead.
+      minFirstSec: 600,
+      // A shorter tail (the gap that keeps a repeating playlist on time) is left out.
+      minTailSec: 300,
+      // After a change: how often to look for the display (see WAKE_WINDOW_MIN).
+      watchEverySec: 10,
+      thumbTimeoutSec: 10, // when the NAS asks the display what it shows
+    },
     runOnStart: bool('RUN_ON_START', false),
     retryMinutes: num('RETRY_MINUTES', 20),
     retries: num('RETRIES', 3),
@@ -168,9 +192,12 @@ export function loadConfig() {
     sleep: {
       mode: oneOf('SLEEP_MODE', 'standby', ['standby', 'deep', 'off']),
       delaySec: num('SLEEP_DELAY_SEC', 120), // let the panel finish redrawing first
-      // Every this many minutes, check that the display is really asleep (0 = never).
-      checkMin: num('SLEEP_CHECK_MIN', 30),
-      // deep: how long a scheduled update waits for the display to wake itself.
+      // Every this many minutes, check that the display is really asleep (0 = never). In
+      // playlist mode this is also how the NAS notices the display is awake (someone pressed
+      // its button, it is charging) to top up its playlist, so it looks more often.
+      checkMin: num('SLEEP_CHECK_MIN', updateMode === 'playlist' ? 5 : 30),
+      // deep: how long a scheduled update waits for the display to wake itself. Playlist
+      // mode: how long the NAS looks for the display after each change.
       wakeWindowMin: num('WAKE_WINDOW_MIN', 15),
       confirmSec: 150, // after a sleep command, how long to wait for it to stop answering
       confirmEverySec: 15,
@@ -218,6 +245,9 @@ export function describeConfig(cfg) {
     `panel: ${cfg.panel.name} ${cfg.panel.width}x${cfg.panel.height} (${cfg.panel.orientation}, rotate ${cfg.panel.rotate})`,
     `server: http://${cfg.server.publicHost}:${cfg.server.port}`,
     `schedule: "${cfg.schedule}" (${cfg.timezone}), sleep: ${cfg.sleep.mode}`,
+    cfg.update.mode === 'playlist'
+      ? `updates: playlist of ${cfg.update.days} day${cfg.update.days === 1 ? '' : 's'}, the display changes the photo at each SCHEDULE time`
+      : 'updates: the NAS sends a photo at each SCHEDULE time',
     `image: dither=${cfg.image.dither} method=${cfg.image.method} kernel=${cfg.image.kernel} sat=${cfg.image.saturation} contrast=${cfg.image.contrast}`,
   ].join('\n  ');
 }

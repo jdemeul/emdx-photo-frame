@@ -2,7 +2,7 @@
 // emdx-photo-frame — a daily photo from a shared Google Photos album on a Samsung EMDX e-paper display.
 //
 //   node src/index.js serve            run the scheduler + web UI (default; what the container does)
-//   node src/index.js once             show the next photo now, then exit
+//   node src/index.js once             show the next photo now (playlist mode: send the playlist), then exit
 //   node src/index.js check-album      read the album(s) and print what was found
 //   node src/index.js display-info     connect to the display and print name/battery/network standby/clock/timer 1 (changes nothing)
 //   node src/index.js test-pattern     send the calibration image to the display
@@ -141,7 +141,7 @@ async function main() {
 
   if (cmd === 'once' || cmd === 'test-pattern' || cmd === 'playlist-test') {
     try {
-      if (cmd === 'once') await app.next('manual');
+      if (cmd === 'once') await (app.daily ? app.resend() : app.next('manual'));
       else if (cmd === 'test-pattern') await app.testPattern();
       else {
         const minutes = args[0] ? args[0].split(',').map(Number) : null;
@@ -162,8 +162,9 @@ async function main() {
   const job = new Cron(cfg.schedule, { timezone: cfg.timezone, protect: true }, () => app.scheduled());
   app.cron = job;
   app.startSleepWatch();
-  log.info(`Next update: ${job.nextRun()?.toISOString()} (UI: http://${cfg.server.publicHost}:${cfg.server.port}/)`);
-  if (cfg.runOnStart) app.scheduled('start');
+  log.info(`Next ${app.daily ? 'change' : 'update'}: ${job.nextRun()?.toISOString()} (UI: http://${cfg.server.publicHost}:${cfg.server.port}/)`);
+  if (app.daily) app.daily.startup({ send: cfg.runOnStart }).catch((err) => log.error('Playlist:', err));
+  else if (cfg.runOnStart) app.scheduled('start');
 
   const stop = async (sig) => {
     log.info(`${sig} received, shutting down`);
