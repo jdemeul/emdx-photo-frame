@@ -12,7 +12,7 @@ const MAX_POST_BYTES = 10 * 1024 * 1024; // what the display may POST to us (thu
 
 export function createServer(cfg, app) {
   const pushes = new Map();
-  // The last requests from the display (and to the endpoints it uses), for the status page.
+  // The last requests from the display (and to the endpoints it uses), in /api/status.
   const traffic = [];
   const baseUrl = `http://${cfg.server.publicHost}:${cfg.server.port}`;
   const thumbnailUrl = `${baseUrl}/emdx/device-thumbnail`;
@@ -112,10 +112,10 @@ export function createServer(cfg, app) {
     });
   }
 
-  // The display POSTs a thumbnail of its screen (multipart: device_id, content_id,
+  // The display may POST a thumbnail of its screen (multipart: device_id, content_id,
   // content_name, content_type, content_player_type, schedule_downloaded_timestamp,
-  // thumbnail_timestamp and an image file) after MDC 0xC7/0x54 with this URL. A body we
-  // can't read is kept for a look (thumbnails/failed-*.bin), and still answered with 200.
+  // thumbnail_timestamp and an image file) after MDC 0xC7/0x54 with this URL. (The EM32DX
+  // never has; Samsung's app gets them at /device-thumbnail.)
   async function receiveThumbnail(req, res, note) {
     let body = null;
     try {
@@ -137,9 +137,7 @@ export function createServer(cfg, app) {
     } catch (err) {
       note.result = `unreadable: ${err.message}`;
       log.warn(`Could not read a thumbnail from the display (${req.headers['content-type'] || 'no content type'}, ${body?.length ?? '?'} bytes): ${err.message}`);
-      if (err.status) { res.writeHead(err.status).end(); return; }
-      res.writeHead(200, { 'Content-Type': 'text/plain' }).end('OK');
-      app.onThumbnailFailure?.({ at: Date.now(), error: err.message, contentType: req.headers['content-type'] || null, body });
+      res.writeHead(err.status || 200, { 'Content-Type': 'text/plain' }).end(err.status ? undefined : 'OK');
     }
   }
 
@@ -150,7 +148,6 @@ export function createServer(cfg, app) {
       note.result = text.slice(0, 160);
       log.info(`Display reported progress (${req.url}): ${text.replace(/\s+/g, ' ')}`);
       res.writeHead(200, { 'Content-Type': 'application/json' }).end(text.startsWith('{') ? text : '{}');
-      app.onDisplayReport?.({ at: Date.now(), path: req.url, text });
     } catch (err) {
       res.writeHead(err.status || 400).end();
     }
@@ -253,9 +250,9 @@ export function createServer(cfg, app) {
       const type = img[2].endsWith('.png') ? 'image/png' : 'image/jpeg';
       return sendFile(res, app.store.path(img[1], img[2]), type);
     }
-    const shot = /^\/img\/(thumbnails|playlist-test)\/([\w.-]+\.(?:png|jpe?g))$/.exec(p);
+    const shot = /^\/img\/thumbnails\/([\w.-]+\.(?:png|jpe?g))$/.exec(p);
     if (shot && req.method === 'GET') {
-      return sendFile(res, app.store.path(shot[1], shot[2]), shot[2].endsWith('.png') ? 'image/png' : 'image/jpeg');
+      return sendFile(res, app.store.path('thumbnails', shot[1]), shot[1].endsWith('.png') ? 'image/png' : 'image/jpeg');
     }
     const slot = /^\/img\/playlist\/([\w-]+)\/(thumb\.jpg|preview\.jpg|preview\.png|source-[12]\.jpg)$/.exec(p);
     if (slot && req.method === 'GET') {
@@ -267,19 +264,14 @@ export function createServer(cfg, app) {
       '/api/test-pattern': () => app.testPattern(),
       '/api/refresh-album': () => app.refreshLibrary(),
       '/api/sleep': () => app.sleepRightAway(),
-      '/api/playlist-test': () => app.playlistTest(),
     };
-    const isAction = actions[p] || p === '/api/display-info' || p === '/api/stop-test';
+    const isAction = actions[p] || p === '/api/display-info';
     if (isAction && req.method === 'POST') {
       // Only accept button presses from this page (no cross-site requests).
       const origin = req.headers.origin;
       let sameHost = true;
       try { sameHost = !origin || new URL(origin).host === req.headers.host; } catch { sameHost = false; }
       if (!sameHost) return json(res, 403, { error: 'Cross-origin request refused' });
-      if (p === '/api/stop-test') {
-        const stopping = app.stopTest();
-        return json(res, stopping ? 202 : 409, stopping ? { ok: true } : { error: 'No test is running' });
-      }
       if (app.busy) return json(res, 409, { error: `Busy: ${app.busy.what}` });
       if (p === '/api/display-info') {
         // Wakes the display and reads it; answers when done.

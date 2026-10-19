@@ -1,10 +1,11 @@
 // UPDATE_MODE=playlist: the NAS sends the photos for the coming PLAYLIST_DAYS days at once, as
 // the display's own playlist, and the display changes the photo by itself at every SCHEDULE
-// time, while it sleeps. The NAS renders the photos ahead (one per change: a "slot"), and
-// sends a fresh playlist whenever it finds the display awake and the display has moved on
-// since the last one (or something changed): after someone pressed its button, while it
-// charges, or if it turns out to come online by itself after a change. Each fresh playlist
-// starts with the photo for now, so the frame keeps its photo until the next change.
+// time, while it sleeps. The NAS renders the photos ahead (one per change: a "slot"). The EM32DX
+// comes online briefly after each change: the NAS looks for it then, reads its battery and
+// sends it back to sleep, or sends a fresh playlist when fewer than PLAYLIST_TOPUP_DAYS days
+// are left (or something changed). A display found awake otherwise (button, charger, Check
+// display) is handled the same way. Each fresh playlist starts with the photo for now, so the
+// frame keeps its photo until the next change. Timing: playlist.js.
 //
 // State (state.playlist):
 //   slots    the plan: [{ key, at, dir, kind, ids, items, renderedAt, inkShare }], one per
@@ -27,7 +28,6 @@ import { matchThumbnail } from './thumbMatch.js';
 
 const FILES = ['device.png', 'preview.png', 'preview.jpg', 'thumb.jpg', 'source-1.jpg', 'source-2.jpg'];
 const pause = (ms) => new Promise((r) => setTimeout(r, ms));
-const DAY = 24 * 3600 * 1000;
 
 export class DailyPlaylist {
   constructor(app) {
@@ -183,12 +183,11 @@ export class DailyPlaylist {
       this.advance(Date.now(), { planOnly: true });
       return null;
     }
-    // In deep sleep nothing on the network wakes the display: don't spend minutes trying
-    // (unless the caller has just seen it awake).
-    const sawIt = ['found awake', 'after a change', 'check display'].includes(reason);
-    if (cfg.sleep.mode === 'deep' && !sawIt && !(await probeDisplay(cfg))) {
-      const e = new Error(`The display is in deep sleep, where Wake-on-LAN does not reach it. Press its power button: within ${cfg.sleep.checkMin || 'a few'} minutes the NAS finds it awake and sends the playlist (or press "Send playlist" then).`);
-      e.unreachable = true;
+    let connect;
+    try {
+      connect = await app.deepSleepConnect(reason);
+    } catch (err) {
+      const e = app.explainUnreachable(err);
       app.addHistory({ ok: false, error: `Playlist not sent: ${e.message}` });
       app.store.save();
       throw e;
@@ -202,15 +201,12 @@ export class DailyPlaylist {
     const when = (t) => dayLabel(t, cfg.timezone, true);
     log.info(`Playlist: sending ${batch.items.length} photos: ${first.at > now ? `${this.label(first.at)}'s photo (a little early)` : 'the photo for now'} until ${when(first.to)}, `
       + `then one per change until ${when(batch.endsAt)}. If no fresh playlist arrives by then, the display starts over.`);
-    const { mode } = cfg.sleep;
     try {
       const { battery } = await pushContent(cfg, app.server, {
         items: seq.map((it) => ({ file: this.file(it, 'device.png'), durationMs: it.durationMs })),
         contentType: 'PlaylistContent',
         name: 'Daily photos',
-      }, {
-        networkStandby: mode === 'standby' ? true : mode === 'deep' ? false : null,
-      });
+      }, { networkStandby: app.networkStandby(), connect });
       const strip = ({ key, at, dir, kind, ids, items, renderedAt, inkShare, durationMs }) => ({ key, at, dir, kind, ids, items, renderedAt, inkShare, durationMs });
       this.st.batch = {
         builtAt: batch.builtAt, sentAt: Date.now(), reason, schedule: cfg.schedule, days: cfg.update.days,
@@ -218,7 +214,7 @@ export class DailyPlaylist {
       };
       this.st.pending = null;
       this.st.replaced = null;
-      if (battery) app.state.battery = { ...battery, at: Date.now() };
+      app.noteBattery(battery);
       app.addHistory({ ok: true, kind: `playlist sent: ${batch.items.length} photos, until ${this.label(batch.endsAt)}`, ids: [], dates: [], battery: battery?.batteryPercent ?? null });
       app.state.lastError = null;
       this.advance(Date.now(), { sent: true });
@@ -229,7 +225,7 @@ export class DailyPlaylist {
       return this.st.batch;
     } catch (err) {
       if (!err.unreachable) app.markAwake();
-      const e = app.explainUnreachable(err, 'manual');
+      const e = app.explainUnreachable(err);
       app.addHistory({ ok: false, error: `Playlist not sent: ${e.message}` });
       app.store.save();
       throw e;
@@ -318,17 +314,17 @@ export class DailyPlaylist {
     }
   }
 
-  // Probe (no Wake-on-LAN) every watchEverySec for WAKE_WINDOW_MIN after a change. If the
-  // display comes online, see what it shows and send a fresh playlist if one is due. (The sleep
-  // check may find it first: it notes that in this.watch, and handles the display itself.)
+  // After a change, probe (no Wake-on-LAN) every watchEverySec for WAKE_WINDOW_MIN: the EM32DX
+  // comes online briefly after changing the photo. Then it gets a fresh playlist if one is due,
+  // otherwise it is sent straight back to sleep; either way the battery is read. (The sleep
+  // check may find it first: foundAwake() notes that, and the check handles it.)
   async watchAfterChange() {
     const app = this.app;
     const cfg = this.cfg;
     const start = Date.now();
     const rec = { at: start, key: slotKey(this.clock.prev(start) ?? start, cfg.timezone), until: start + cfg.sleep.wakeWindowMin * 60000, online: null };
-    this.st.changes = [rec, ...this.st.changes].slice(0, 10);
+    this.st.changes = [rec, ...this.st.changes].slice(0, 30);
     app.store.save();
-    log.info(`Playlist: looking for the display for ${cfg.sleep.wakeWindowMin} min (without Wake-on-LAN), to see whether it comes online after a change…`);
     let mine = false;
     this.watch = rec;
     try {
@@ -346,22 +342,36 @@ export class DailyPlaylist {
     }
     app.store.save();
     if (!rec.online) {
-      log.info(`Playlist: the display did not come online within ${cfg.sleep.wakeWindowMin} min of the change${cfg.sleep.mode === 'deep' ? ' (expected in deep sleep: it changes the photo offline)' : ''}.`);
+      log.info(`Playlist: the display did not come online within ${cfg.sleep.wakeWindowMin} min of the change.`);
       return;
     }
     log.info(`Playlist: the display came online ${Math.round((rec.online - start) / 1000)} s after the change${mine ? '' : ' (found by the sleep check)'}.`);
     if (!mine) return;
-    app.markAwake();
-    app.state.wakeEvents = [{ at: rec.online, afterChange: true }, ...(app.state.wakeEvents || [])].slice(0, 20);
-    let sent = false;
-    try { sent = await this.onAwake('after a change'); } catch (err) { log.warn(`Playlist: ${err.message}`); }
-    if (!sent && cfg.sleep.mode !== 'off') await app.sleepNow().catch((err) => log.warn(`Could not put the display to sleep: ${err.message}`));
+    const event = app.noteWake({ afterChange: true });
+    try {
+      let sent = false;
+      try { sent = await this.onAwake('after a change'); } catch (err) { log.warn(`Playlist: ${err.message}`); }
+      if (sent) event.sent = 'playlist';
+      else if (cfg.sleep.mode !== 'off') await app.sleepNow().catch((err) => log.warn(`Could not put the display to sleep: ${err.message}`));
+    } finally {
+      app.finishWake(event);
+      if (event.battery != null) rec.battery = event.battery;
+      app.store.save();
+    }
+  }
+
+  // The sleep check found the display awake: if that is within the watch after a change, it came
+  // online after the change (and the check takes care of it).
+  foundAwake(event) {
+    if (!this.watch || this.watch.online) return;
+    this.watch.online = event.at;
+    event.afterChange = true;
   }
 
   // The display answers (button, charger, or by itself after a change): note what it shows,
   // and send a fresh playlist if one is due. Returns true if it sent one.
-  async onAwake(how, { look = true } = {}) {
-    if (look) await this.observe(how).catch((err) => log.debug(`No thumbnail: ${err.message}`));
+  async onAwake(how) {
+    await this.observe(how).catch((err) => log.debug(`No thumbnail: ${err.message}`));
     const why = this.due();
     if (!why) return false;
     log.info(`Playlist: the display is awake (${how}); sending a fresh playlist (${why}).`);
@@ -369,10 +379,11 @@ export class DailyPlaylist {
     return true;
   }
 
-  // Ask for a thumbnail of the screen and match it against the photos.
+  // Ask for a thumbnail of the screen and match it against the photos (if the display sends
+  // thumbnails at all).
   async observe(how) {
     const app = this.app;
-    if (!app.server || !this.st.batch) return null;
+    if (!app.server || !this.st.batch || app.thumbnailsWork() === false) return null;
     const th = await app.exclusive('Asking the display what it shows', () => app.askThumbnail(this.cfg.update.thumbTimeoutSec));
     return this.noteThumbnail(th, how);
   }
@@ -442,8 +453,7 @@ export class DailyPlaylist {
     const why = this.due();
     if (send && why) await this.sendIfDue('start');
     else if (why && this.cfg.display.host) {
-      log.info(`Playlist: a fresh playlist is due (${why}). It goes out when the NAS finds the display awake`
-        + `${this.cfg.sleep.checkMin ? ` (it looks every ${this.cfg.sleep.checkMin} min; press the display's power button to wake it)` : ''}, or press "Send playlist".`);
+      log.info(`Playlist: a fresh playlist is due (${why}). It goes out the next time the display is online: after its next change, or after a press on its power button.`);
     }
   }
 
@@ -465,15 +475,18 @@ export class DailyPlaylist {
       nextChange: this.clock.next(now),
       due: this.due(now),
       batch: b ? {
-        sentAt: b.sentAt, count: b.count, photos: b.items.length, endsAt: b.endsAt, first: b.items[0].key, tail: !!b.tail,
-        loop: pos.loop, ranOut: now >= b.endsAt,
+        sentAt: b.sentAt, photos: b.items.length, endsAt: b.endsAt, loop: pos.loop, ranOut: now >= b.endsAt,
       } : null,
       slots: this.st.slots.map((s) => ({
         key: s.key, at: s.at, dir: s.dir, label: this.label(s.at), kind: s.kind,
         dates: (s.items || []).map((i) => i.takenAt ?? null), sent: sent.has(s.dir), now: s.dir === nowDir,
       })),
       replaced: this.st.replaced || null,
-      changes: this.st.changes.slice(0, 5),
+      // After each change: did the display come online (and the battery then)?
+      changes: this.st.changes.slice(0, 7).map((c) => {
+        const wake = (this.app.state.wakeEvents || []).find((e) => e.afterChange && e.at >= c.at && e.at <= c.until);
+        return { ...c, battery: c.battery ?? wake?.battery ?? null };
+      }),
       seen: this.st.seen.slice(0, 5),
       daysLeft: b ? this.daysLeft(now) : null,
       topUpDays: this.cfg.update.topUpDays,

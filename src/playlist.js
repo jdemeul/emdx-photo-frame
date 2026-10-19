@@ -1,14 +1,14 @@
 // Timing for UPDATE_MODE=playlist: one push carries the photos for the coming days as the
 // display's own playlist, and the display changes the photo by itself at every SCHEDULE time.
 //
-// Measured on an EM32DX (17 Oct 2026, playlist test): a pushed playlist starts at its first
-// item straight away, and each item stays up for its own `duration` (ms), counted from the
-// push, not from midnight or 1970. So "change at SCHEDULE" means: item 1 = the photo for now,
-// until the next change; then one item per change, as long as the gap to the change after it
-// (23 or 25 hours across a daylight-saving switch). After the last item the display starts
-// over at item 1, which would come back with item 1's short first duration and push every
-// later change off schedule. A tail item (item 1's photo again) fills the gap, so a repeat
-// runs from one change time to the next too, should the NAS not reach the display in time.
+// Measured on an EM32DX (October 2026): a pushed playlist starts at its first item straight
+// away, each item stays up for its own `duration` (ms), counted from the push (not from
+// midnight or 1970), and after the last item it starts over. So "change at SCHEDULE" means:
+// item 1 = the photo for now, until the next change; then one item per change, as long as the
+// gap to the change after it (23 or 25 hours across a daylight-saving switch). Starting over,
+// item 1 would come back with its short first duration and push every later change off
+// schedule; a tail item (item 1's photo again) fills the gap, so a repeat runs from one change
+// time to the next too, should the NAS not reach the display in time.
 import { Cron } from 'croner';
 
 // The change times of a cron pattern (croner counts in whole seconds).

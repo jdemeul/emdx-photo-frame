@@ -59,8 +59,7 @@ export const UI_HTML = `<!doctype html>
       <button data-act="resend">Send again</button>
       <button data-act="test-pattern">Show test pattern</button>
       <button data-act="refresh-album">Re-read album</button>
-      <button data-act="display-info" title="Wakes the display and reads its battery and Network Standby">Check display</button>
-      <button data-act="playlist-test" title="Sends numbered cards as a playlist and watches how the display plays them (about 1.5 h)">Playlist test</button>
+      <button data-act="display-info" title="Wakes the display (if Wake-on-LAN reaches it) and reads its battery and settings">Check display</button>
     </div>
     <dl id="info"></dl>
     <div id="error" class="err"></div>
@@ -72,6 +71,7 @@ let view = 'preview', last = null;
 const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
 const fmt = (t) => t ? new Date(t).toLocaleString([], { dateStyle:'medium', timeStyle:'short' }) : '–';
+const hm = (t) => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 const day = (t) => t ? new Date(t).toLocaleDateString([], { dateStyle:'long' }) : 'unknown date';
 function renderView(s) {
   const v = Date.now();
@@ -81,13 +81,12 @@ function renderView(s) {
       note = s.dither === 'device'
         ? 'The photo as sent. The display dithers it itself, so on the panel the colours look softer. Click for full size.'
         : 'Simulated with the measured ink colours as your eye sees them, from a distance. Click for the full-size dither.'; }
-    else html = '<p class="muted">Nothing rendered yet. Press “Next photo now”.</p>';
+    else html = '<p class="muted">Nothing rendered yet.</p>';
   } else if (view === 'sources') {
     if (s.current) html = '<div id="sources">' + s.current.items.map((it, i) => '<img src="/img/current/source-' + (i+1) + '.jpg?' + s.current.renderedAt + '" alt="">').join('') + '</div>';
   } else if (view === 'playlist') {
     const pl = s.playlist;
-    if (!pl) html = '<p class="muted">Off. With UPDATE_MODE=playlist the NAS sends the photos for the coming days at once, and the display changes them itself.</p>';
-    else if (!pl.slots.length) html = '<p class="muted">Preparing the photos…</p>';
+    if (!pl || !pl.slots.length) html = '<p class="muted">Preparing the photos…</p>';
     else {
       html = '<div class="slots">' + pl.slots.map((x) => '<figure class="' + (x.now ? 'now' : '') + '"><a href="/img/playlist/' + x.dir + '/preview.png" target="_blank">'
         + '<img loading="lazy" src="/img/playlist/' + x.dir + '/thumb.jpg" data-fallback="/img/playlist/' + x.dir + '/preview.jpg" onerror="this.onerror=null;this.src=this.dataset.fallback" alt=""></a><figcaption>' + esc(x.label) + (x.now ? ' · now' : '')
@@ -100,97 +99,90 @@ function renderView(s) {
   }
   $('#view').innerHTML = html; $('#viewnote').textContent = note;
 }
+function batteryHtml(s) {
+  const b = s.battery;
+  if (!b) return '–';
+  let h = esc(b.batteryPercent + '%' + (b.pluggedIn ? ' (charging)' : '') + ' · ' + fmt(b.at));
+  const days = s.batteryDays || [];
+  if (days.length > 1) h += '<br><span class="muted">' + esc('Per day: ' + days.map((d) => d.day + ' ' + d.percent + '%' + (d.charging ? ' (charging)' : '')).join(' · ')) + '</span>';
+  return h;
+}
 function sleepHtml(s) {
   const z = s.sleep;
-  const hm = (t) => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   if (!z) return '–';
   if (z.mode === 'off') return 'sleeps by its own settings (SLEEP_MODE=off)';
   if (z.asleep) {
     const how = z.self ? ' (went to sleep by itself)' : z.confirmedAfter != null ? ' (confirmed)' : '';
-    const wake = s.playlist ? ', changes the photo by itself' : z.mode === 'deep' ? ', wakes itself at its screen protection time' : ', the next update wakes it';
-    return esc((z.mode === 'deep' ? 'in deep sleep' : 'asleep') + (z.sleptAt ? ' since ' + fmt(z.sleptAt) : '') + how + wake);
+    const next = s.playlist ? ', changes the photo by itself' : z.mode === 'deep' ? '' : ', the next update wakes it';
+    return esc((z.mode === 'deep' ? 'in deep sleep' : 'asleep') + (z.sleptAt ? ' since ' + fmt(z.sleptAt) : '') + how + next);
   }
   if (z.error) return '<span class="err">' + esc(z.error) + '</span>';
   if (z.pending && z.sleepAt) return esc('awake, goes to sleep at ' + hm(z.sleepAt));
   return 'awake';
 }
+// Sleep checks, and when the display was found awake (after a press on its button, while
+// charging). Waking up after a change is expected in playlist mode: that is under "After a change".
 function watchHtml(c) {
   if (!c) return '–';
   let h = esc('every ' + c.everyMin + ' min');
-  if (c.last) h += ' · last ' + esc(fmt(c.last.at)) + ': ' + (c.last.awake ? '<span class="err">awake</span>' : 'asleep');
-  const ev = c.wakeEvents || [];
+  if (c.last) h += ' · last ' + esc(fmt(c.last.at)) + ': ' + (c.last.awake ? 'awake' : 'asleep');
+  const ev = (c.wakeEvents || []).filter((e) => !e.afterChange);
   if (ev.length) {
-    h += '<br><span class="err">Found awake:</span> ' + ev.slice(0, 5).map((e) => esc(fmt(e.at)
+    h += '<br><span class="muted">Found awake:</span> ' + ev.slice(0, 4).map((e) => esc(fmt(e.at)
       + (e.battery != null ? ' (' + e.battery + '%' + (e.charging ? ', charging' : '') + ')' : '')
-      + (e.sent ? (last && last.playlist ? ', sent the playlist' : ', sent the waiting photo') : e.putBack ? '' : e.afterChange ? ', after a change' : ', not put back to sleep'))).join('; ');
+      + (e.sent === 'playlist' ? ', sent the playlist' : e.sent ? ', sent the waiting photo' : e.putBack ? ', put back to sleep' : e.error ? ', ' + e.error : ''))).join('; ');
   }
   return h;
 }
-function checkText(c) {
+function checkText(s) {
+  const c = s.displayCheck;
   if (!c) return '–';
-  return esc(fmt(c.at) + ' · Network Standby ' + c.networkStandby + ' · ' + c.name + ', firmware ' + c.software
-    + (c.clock ? ' · clock ' + c.clock : '') + (c.onTimer ? ' · timer 1: ' + c.onTimer : '')
+  return esc(fmt(c.at) + ' · ' + c.name + ', firmware ' + c.software + ' · Network Standby ' + c.networkStandby
     + (c.sleepAfter ? ' · Sleep After ' + c.sleepAfter : '') + (c.applySleep ? ' · sleep after content update ' + c.applySleep : '')
-    + (c.lowPowerWifi ? ' · low-power Wi-Fi module ' + c.lowPowerWifi : '') + (c.restored ? ' · ' + c.restored : ''));
+    + (c.lowPowerWifi ? ' · low-power Wi-Fi module ' + c.lowPowerWifi : '') + (s.thumbnails === false ? ' · sends no thumbnails' : ''));
 }
 function playlistHtml(pl) {
   let h = pl.batch
     ? esc(pl.batch.photos + ' photos sent ' + fmt(pl.batch.sentAt) + ', until ' + fmt(pl.batch.endsAt) + ' (' + pl.daysLeft + ' to come; a fresh one when fewer than ' + pl.topUpDays + ' are left)')
       + (pl.batch.ranOut ? ' · <span class="err">used up: the display repeats it until it gets a fresh one</span>' : '')
     : '<span class="err">not on the display yet</span>';
-  if (pl.due) h += '<br><span class="muted">' + esc('Fresh playlist due (' + pl.due + '). The NAS sends it when it finds the display awake'
-    + (last && last.check ? ' (it looks every ' + last.check.everyMin + ' min)' : '') + ', or press “Send playlist” after pressing the display’s power button.') + '</span>';
+  if (pl.due) h += '<br><span class="muted">' + esc('Fresh playlist due (' + pl.due + '). It goes out when the display is next online (after its next change, or press its power button).') + '</span>';
   return h;
+}
+function changesHtml(pl) {
+  const rows = (pl.changes || []).slice(0, 3).map((c) => {
+    const bat = c.battery != null ? ', battery ' + c.battery + '%' : '';
+    if (c.online) return esc(fmt(c.at) + ': online ' + Math.round((c.online - c.at) / 1000) + ' s after the change' + bat);
+    if (c.until > Date.now()) return esc(fmt(c.at) + ': looking for the display until ' + hm(c.until) + '…');
+    return esc(fmt(c.at) + ': the display did not come online');
+  });
+  return rows.length ? rows.join('<br>') : '–';
 }
 function slotName(pl, key) {
   const x = pl.slots.find((y) => y.key === key);
   return x ? x.label : key;
 }
-function changesHtml(pl) {
-  const c = pl.changes && pl.changes[0];
-  if (!c) return '–';
-  const hm = (t) => new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  if (c.online) return esc(fmt(c.at) + ': the display came online ' + Math.round((c.online - c.at) / 1000) + ' s after the change');
-  if (c.until > Date.now()) return esc(fmt(c.at) + ': looking for the display until ' + hm(c.until) + '…');
-  return esc(fmt(c.at) + ': the display did not come online (looked until ' + hm(c.until) + ')');
-}
 function seenHtml(pl) {
-  const seen = (pl.seen || []).slice(0, 3);
-  if (!seen.length) return '–';
-  return seen.map((e) => esc(fmt(e.at) + ' (' + e.how + '): ') + (e.seen
-    ? esc((e.sure ? '' : 'probably ') + slotName(pl, e.seen) + '’s photo') + (e.seen === e.expected ? ', as expected' : e.ok ? ', the one before (the change comes a little late)' : ' <span class="err">' + esc('(expected ' + slotName(pl, e.expected) + '’s)') + '</span>')
-    : '<span class="muted">' + esc(e.note || '?') + '</span>')).join('<br>');
-}
-function testHtml(t) {
-  if (!t) return '–';
-  const hm = (x) => new Date(x).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  const seen = (t.observations || []).slice(-6).map((o) => esc(hm(o.at) + ' ' + (o.card ? 'card ' + o.card : o.error ? '?' : 'no card'))
-    + (o.file ? ' (<a href="/img/playlist-test/' + encodeURIComponent(o.file) + '" target="_blank">view</a>)' : '')).join(', ');
-  if (!t.done) {
-    return esc(t.t0 ? 'running: cards on the display since ' + hm(t.t0) + ', watching until ' + hm(t.endsAt) : 'starting…')
-      + (seen ? '<br>' + seen : '') + ' <button id="stoptest" type="button">Stop test</button>';
-  }
-  if (t.error) return '<span class="err">' + esc(fmt(t.startedAt) + ': ' + t.error) + '</span>';
-  const sw = t.result && t.result.transitions && t.result.transitions.length
-    ? '<br>Switches: ' + t.result.transitions.map((x) => esc(x.from + '→' + x.to + ' between ' + hm(x.after) + ' and ' + hm(x.by))).join('; ') : '';
-  return esc(fmt(t.startedAt) + ': ' + (t.result ? t.result.verdict : 'no result')) + sw + (seen ? '<br><span class="muted">Last thumbnails: ' + seen + '</span>' : '');
+  return (pl.seen || []).filter((e) => e.seen).slice(0, 3).map((e) => esc(fmt(e.at) + ' (' + e.how + '): ' + (e.sure ? '' : 'probably ') + slotName(pl, e.seen) + '’s photo')
+    + (e.ok ? ', as expected' : ' <span class="err">' + esc('(expected ' + slotName(pl, e.expected) + '’s)') + '</span>')).join('<br>');
 }
 function render(s) {
   last = s;
   $('#state').textContent = s.busy ? s.busy.what + '…' : 'idle';
   $('#state').className = 'chip' + (s.busy ? ' busy' : '');
   document.querySelectorAll('.actions button').forEach((b) => b.disabled = !!s.busy);
-  $('[data-act="next"]').textContent = s.playlist ? 'New photo for today' : 'Next photo now';
-  $('[data-act="next"]').title = s.playlist ? 'Replaces the photo for now and sends the playlist again' : '';
-  $('[data-act="resend"]').textContent = s.playlist ? 'Send playlist' : 'Send again';
-  $('[data-act="resend"]').title = s.playlist ? 'Sends the photos for the coming days now (the display must be awake: press its power button first)' : '';
-  $('[data-view="playlist"]').hidden = !s.playlist;
-  const c = s.current;
   const pl = s.playlist;
+  $('[data-act="next"]').textContent = pl ? 'New photo for today' : 'Next photo now';
+  $('[data-act="next"]').title = pl ? 'Replaces the photo for now and sends the playlist again' : '';
+  $('[data-act="resend"]').textContent = pl ? 'Send playlist' : 'Send again';
+  $('[data-act="resend"]').title = pl ? 'Sends the photos for the coming days now (the display must be awake: press its power button first)' : '';
+  $('[data-view="playlist"]').hidden = !pl;
+  const c = s.current;
   const tpShowing = s.testPattern && s.testPattern.sent && (!c || !c.pushedAt || s.testPattern.at > c.pushedAt);
   let onFrame = tpShowing ? 'the test pattern (until the next ' + (pl ? 'playlist' : 'update') + ')'
     : c ? c.items.map((it) => day(it.takenAt)).join(' + ') + (c.dryRun ? ' <span class="muted">(dry run: EMDX_HOST not set)</span>' : c.pushed ? '' : ' <span class="err">(not on the display yet)</span>') : '–';
-  if (pl && c && c.since && !tpShowing && c.pushed) onFrame += esc(' · since ' + fmt(c.since) + (c.byDisplay ? ', changed by the display (expected)' : ''));
+  if (pl && c && c.since && !tpShowing && c.pushed) onFrame += esc(' · since ' + fmt(c.since) + (c.byDisplay ? ', changed by the display' : ''));
+  const seen = pl ? seenHtml(pl) : '';
   const rows = [
     ['On the frame', onFrame],
     ['Layout', c ? esc(c.kind) : '–'],
@@ -198,23 +190,20 @@ function render(s) {
       ['Playlist', playlistHtml(pl)],
       ['Next change', fmt(pl.nextChange)],
       ['After a change', changesHtml(pl)],
-      ['Seen on the display', seenHtml(pl)],
+      ...(seen ? [['Seen on the display', seen]] : []),
     ] : [
       ['Sent', c && c.pushedAt ? fmt(c.pushedAt) : '–'],
       ['Next update', fmt(s.nextRun)],
     ]),
-    ['Battery', s.battery ? esc(s.battery.batteryPercent + '%' + (s.battery.pluggedIn ? ' (charging)' : '')) : '–'],
+    ['Battery', batteryHtml(s)],
     ['Display', sleepHtml(s)],
     ['Sleep checks', watchHtml(s.check)],
-    ['Display check', checkText(s.displayCheck)],
+    ['Display check', checkText(s)],
     ['This round', s.cycle ? esc(s.cycle.shown + ' of ' + s.cycle.total + ' photos ' + (pl ? 'shown or planned' : 'shown') + ' (round ' + s.cycle.n + ')') : '–'],
     ['Album', s.library ? esc(s.library.titles.join(', ') + ' · ' + s.library.count + ' photos · read ' ) + fmt(s.library.fetchedAt) : '–'],
   ];
-  if (s.playlistTest) rows.push(['Playlist test', testHtml(s.playlistTest)]);
   if (s.thumbnail && s.thumbnail.file) rows.push(['Screen', '<a href="/img/thumbnails/' + s.thumbnail.file + '?' + s.thumbnail.at + '" target="_blank">thumbnail the display sent ' + esc(fmt(s.thumbnail.at)) + '</a>']);
   $('#info').innerHTML = rows.map(([k, v]) => '<dt>' + k + '</dt><dd>' + v + '</dd>').join('');
-  const stop = $('#stoptest');
-  if (stop) stop.onclick = async () => { stop.disabled = true; await fetch('/api/stop-test', { method: 'POST' }); setTimeout(refresh1, 600); };
   const dup = s.lastError && s.sleep && s.sleep.error === s.lastError.message; // already shown under Display
   $('#error').textContent = s.lastError && !dup ? 'Last problem (' + fmt(s.lastError.at) + '): ' + s.lastError.message : '';
   $('#history').innerHTML = (s.history || []).slice(0, 8).map((h) => '<dt>' + fmt(h.at) + '</dt><dd>' + (h.ok ? esc(h.kind) + (h.dates && h.dates.length ? ' · ' + h.dates.map(day).join(' + ') : '') + (h.battery != null ? ' · battery ' + h.battery + '%' : '') + (h.waited ? ' · waited ' + h.waited + ' s for the display' : '') : '<span class="err">' + esc(h.error) + '</span>') + '</dd>').join('');
@@ -227,11 +216,7 @@ async function refresh() {
 document.querySelectorAll('.tabs button').forEach((b) => b.onclick = () => {
   view = b.dataset.view; document.querySelectorAll('.tabs button').forEach((x) => x.classList.toggle('on', x === b)); if (last) renderView(last);
 });
-async function refresh1() { const r = await fetch('/api/status'); render(await r.json()); }
 document.querySelectorAll('.actions button').forEach((b) => b.onclick = async () => {
-  if (b.dataset.act === 'playlist-test' && !confirm('Playlist test: the display shows four numbered cards as a playlist for about 1.5 hours, '
-    + 'while the NAS asks it every 2 minutes which one is up. Best with the display on USB-C power. '
-    + 'Your photo comes back afterwards. Start?')) return;
   b.disabled = true;
   const r = await fetch('/api/' + b.dataset.act, { method:'POST' });
   if (!r.ok) { const j = await r.json().catch(() => ({})); alert(j.error || 'Failed'); }

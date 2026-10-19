@@ -1,24 +1,24 @@
-// Orchestration: read the album, pick, download, render, push, remember.
+// The service: reads the album, picks and renders photos, sends them to the display and puts it
+// to sleep. In push mode (UPDATE_MODE=push) the NAS sends one photo at every SCHEDULE time, from
+// here; in playlist mode it sends the coming days at once and the display changes the photo
+// itself (daily.js).
 import fs from 'node:fs';
 import sharp from 'sharp';
-import { log, stamp } from './log.js';
+import { log } from './log.js';
 import { fetchAlbum, fetchItemInfo, sizedUrl, downloadImage } from './sources/googleAlbum.js';
 import { scanFolder } from './sources/folder.js';
 import { syncBag, planNext, markShown } from './selector.js';
 import { composeCanvas, renderCanvas, planCells } from './render.js';
-import {
-  pushToDisplay, pushContent, putToSleep, readDisplayInfo, confirmAsleep, probeDisplay, withDisplay,
-  getSleepAfter, setSleepAfter, formatSleepAfter, getApplySleep, setApplySleep, getNetworkStandby,
-  setNetworkStandby, getFeatures, requestThumbnail, SLEEP_AFTER_10_MIN,
-} from './display.js';
+import { pushToDisplay, putToSleep, readDisplayInfo, confirmAsleep, probeDisplay, withDisplay, requestThumbnail } from './display.js';
 import { renderTestPattern } from './testPattern.js';
-import { renderTestCards, classifyThumbnail } from './testCards.js';
-import { analyzePlaylistTest } from './playlistTest.js';
 import { DailyPlaylist } from './daily.js';
 
 const DAY = 24 * 3600 * 1000;
 // Runs that retry when the display can't be reached (manual ones report back instead).
 const SCHEDULED = new Set(['schedule', 'retry', 'start']);
+// After this many requests without a single thumbnail, stop waiting for them: the firmware
+// doesn't send any (the EM32DX's doesn't). Check display still asks, without waiting.
+const THUMB_TRIES = 3;
 
 export class FrameApp {
   constructor(cfg, store, model) {
@@ -33,28 +33,17 @@ export class FrameApp {
     this.sleepTimer = null;
     this.watchTimer = null;
     this.thumbWaiters = new Set(); // callers waiting for the display's next thumbnail
-    this.testStop = false;
-    this.testWake = null;
-    const st = this.state;
-    st.excluded ||= {};
-    st.history ||= [];
-    // A playlist test cut short by a restart: its clean-up never ran. Keep the display's
-    // original settings so Check display (or the next test) can put them back.
-    const pt = st.playlistTest;
-    if (pt && !pt.done) {
-      pt.done = true;
-      pt.error = 'Interrupted: the service restarted during the test. Check display puts the display\'s settings back, Send again the photo.';
-      if (pt.saved) st.pendingRestore = pt.saved;
-      store.save();
-    }
-    // UPDATE_MODE=playlist: the display changes the photos itself (see daily.js).
-    this.daily = cfg.update?.mode === 'playlist' ? new DailyPlaylist(this) : null;
+    upgradeState(this.state);
+    store.save();
+    this.daily = cfg.update.mode === 'playlist' ? new DailyPlaylist(this) : null;
   }
 
   get state() {
     return this.store.state;
   }
 
+  // One thing at a time: the display takes one connection at a time, and the album and the
+  // renders are shared.
   async exclusive(what, fn) {
     if (this.busy) {
       const err = new Error(`Busy: ${this.busy.what}`);
@@ -76,6 +65,20 @@ export class FrameApp {
   setBusy(what) {
     if (this.busy) this.busy.what = what;
     log.info(`${what}…`);
+  }
+
+  // An action that talks to the display. It takes over from a pending sleep, and if it fails
+  // with nothing to follow up, the display is still put back to sleep.
+  async run(what, fn) {
+    try {
+      return await this.exclusive(what, () => {
+        this.cancelSleep();
+        return fn();
+      });
+    } catch (err) {
+      this.afterFailure(err);
+      throw err;
+    }
   }
 
   // ---------- photo library ----------
@@ -123,91 +126,32 @@ export class FrameApp {
     return this.state.library;
   }
 
-  // An action that talks to the display. It takes over from a pending sleep, and if
-  // it fails with nothing to follow up, the display is still put back to sleep.
-  async run(what, fn) {
-    try {
-      return await this.exclusive(what, () => {
-        this.cancelSleep();
-        return fn();
-      });
-    } catch (err) {
-      this.afterFailure(err);
-      throw err;
-    }
-  }
-
-  // ---------- the daily job ----------
-  async scheduled(reason = 'schedule') {
-    if (this.daily) return this.daily.scheduled(reason).catch((err) => log.error('Playlist:', err));
-    clearTimeout(this.retryTimer);
-    this.retryTimer = null;
-    this.retryCount = 0;
-    for (let i = 0; this.busy && i < 120; i++) await new Promise((r) => setTimeout(r, 5000));
-    try {
-      await this.next(reason);
-    } catch (err) {
-      log.error('Scheduled update failed:', err);
-    }
-  }
-
-  scheduleRetry() {
-    if (this.retryCount >= this.cfg.retries) return false;
-    this.retryCount++;
-    const mins = this.cfg.retryMinutes;
-    log.info(`Will retry in ${mins} minutes (${this.retryCount}/${this.cfg.retries})`);
-    clearTimeout(this.retryTimer);
-    this.retryTimer = setTimeout(() => {
-      this.retryTimer = null;
-      this.next('retry').catch((err) => log.error('Retry failed:', err));
-    }, mins * 60 * 1000);
-    return true;
-  }
-
-  next(reason = 'manual') {
-    if (this.daily) return this.daily.newPhotoNow();
-    return this.run('Preparing the next photo', async () => {
-      const st = this.state;
-      if (reason === 'retry' && st.current && !st.current.pushed && fs.existsSync(this.store.path('current', 'device.png'))) {
-        return this.push(st.current, { reason });
-      }
-      await this.prepare(reason);
-      return this.push(st.current, { reason });
-    });
-  }
-
-  async prepare(reason) {
-    const dir = this.store.path('current');
-    const meta = await this.renderPhoto(dir, { fresh: reason === 'schedule' });
-    this.state.current = { ...meta, pushed: false };
-    this.store.save();
-  }
-
   // Pick the next photo(s) from the album, download, crop and render them into `dir`
-  // (device.png for the display, previews and the originals for the page). Returns what was
-  // rendered; marking it as shown is up to the caller. `fresh`: read the album anew. `say`:
-  // reports progress (default: the busy label).
+  // (device.png for the display, previews, a thumbnail and the originals for the page).
+  // Returns what was rendered; marking it as shown is up to the caller. `fresh`: read the
+  // album anew. `say`: reports progress (default: the busy label).
   async renderPhoto(dir, { fresh = false, say = (what) => this.setBusy(what) } = {}) {
     const st = this.state;
     const lib = await this.loadLibrary(fresh ? 0 : 30 * 60 * 1000);
     const byId = new Map(lib.items.map((it) => [it.id, it]));
     const ids = lib.items.map((it) => it.id);
-    const avoid = this.daily?.plannedIds() ?? []; // (a new round shouldn't open with these)
-    syncBag(st, ids, undefined, undefined, avoid);
+    const avoid = this.daily?.plannedIds() ?? []; // a new round shouldn't open with these
+    const sync = () => syncBag(st, ids, undefined, undefined, avoid);
+    sync();
 
     let plan = null;
     let inputs = null;
     for (let attempt = 0; attempt < 10 && !inputs; attempt++) {
       plan = planNext(this.cfg, st, byId);
       if (!plan) throw new Error('No usable photos in the album');
-      if (await this.skipVideos(plan)) { syncBag(st, ids, undefined, undefined, avoid); continue; }
+      if (await this.skipVideos(plan)) { sync(); continue; }
       try {
         say('Downloading');
         inputs = await this.download(plan);
       } catch (err) {
         log.warn(`Skipping ${err.itemId} for a week: ${err.message}`);
         st.excluded[err.itemId] = { reason: 'download failed', until: Date.now() + 7 * DAY };
-        syncBag(st, ids, undefined, undefined, avoid);
+        sync();
       }
     }
     if (!inputs) throw new Error('Could not download any photo (see log)');
@@ -219,7 +163,7 @@ export class FrameApp {
     fs.writeFileSync(`${dir}/device.png`, out.devicePng);
     fs.writeFileSync(`${dir}/preview.png`, out.previewPng);
     fs.writeFileSync(`${dir}/preview.jpg`, out.previewJpg);
-    fs.writeFileSync(`${dir}/thumb.jpg`, await sharp(out.previewJpg).resize(240).jpeg({ quality: 80 }).toBuffer()); // for lists of photos
+    fs.writeFileSync(`${dir}/thumb.jpg`, await sharp(out.previewJpg).resize(240).jpeg({ quality: 80 }).toBuffer());
     fs.rmSync(`${dir}/source-2.jpg`, { force: true });
     for (let i = 0; i < inputs.length; i++) {
       const thumb = await sharp(inputs[i], { failOn: 'none' }).rotate().resize(900, 900, { fit: 'inside' }).jpeg({ quality: 82 }).toBuffer();
@@ -281,46 +225,63 @@ export class FrameApp {
     return inputs;
   }
 
-  // How an update treats network standby and finds the display. Network standby is set
-  // during each update (standby: on, deep: off), as the display may doze off by itself
-  // before the NAS sends it to sleep. In deep sleep Wake-on-LAN doesn't reach it, so a
-  // scheduled update waits WAKE_WINDOW_MIN for it to wake itself (its screen protection
-  // time) instead of sending Wake-on-LAN.
-  pushOptions(reason = 'manual') {
-    const { mode, wakeWindowMin } = this.cfg.sleep;
-    if (mode === 'off') return { networkStandby: null };
-    if (mode === 'standby') return { networkStandby: true };
-    return {
-      networkStandby: false,
-      connect: reason === 'schedule' ? { windowSec: wakeWindowMin * 60, wol: false, quiet: true } : {},
-    };
-  }
-
-  // Say why a sleeping display could not be reached, and what to do about it.
-  explainUnreachable(err, reason = 'manual') {
-    const { mode, wakeWindowMin } = this.cfg.sleep;
-    if (!err.unreachable || mode === 'off') return err;
-    let hint;
-    if (mode === 'deep') {
-      hint = reason === 'schedule'
-        ? `It did not wake by itself within ${wakeWindowMin} minutes: check that its screen protection time ` +
-          '(Samsung E-Paper app) matches SCHEDULE. Pressing its power button wakes it for a few minutes: ' +
-          'then press "Send again".'
-        : 'It is in deep sleep, where Wake-on-LAN does not reach it: press its power button, then try again.';
-    } else {
-      hint = this.cfg.display.mac
-        ? 'Wake-on-LAN did not wake it: check its battery and that its Network Standby is on ' +
-          '(sleep-test checks the setup). Pressing its power button wakes it too.'
-        : 'Set EMDX_MAC so the NAS can wake it from sleep with Wake-on-LAN.';
+  // ---------- push mode: one photo per SCHEDULE time ----------
+  async scheduled(reason = 'schedule') {
+    if (this.daily) return this.daily.scheduled(reason).catch((err) => log.error('Playlist:', err));
+    clearTimeout(this.retryTimer);
+    this.retryTimer = null;
+    this.retryCount = 0;
+    for (let i = 0; this.busy && i < 120; i++) await new Promise((r) => setTimeout(r, 5000));
+    try {
+      await this.next(reason);
+    } catch (err) {
+      log.error('Scheduled update failed:', err);
     }
-    const e = new Error(`${err.what || err.message}. ${hint}`);
-    e.unreachable = true;
-    return e;
   }
 
-  // We talked to the display, so whatever it was doing before, it is awake now.
-  markAwake() {
-    if (this.state.sleep) this.state.sleep.asleep = false;
+  scheduleRetry() {
+    if (this.retryCount >= this.cfg.retries) return false;
+    this.retryCount++;
+    const mins = this.cfg.retryMinutes;
+    log.info(`Will retry in ${mins} minutes (${this.retryCount}/${this.cfg.retries})`);
+    clearTimeout(this.retryTimer);
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      this.next('retry').catch((err) => log.error('Retry failed:', err));
+    }, mins * 60 * 1000);
+    return true;
+  }
+
+  // "Next photo now" (playlist mode: "New photo for today").
+  next(reason = 'manual') {
+    if (this.daily) return this.daily.newPhotoNow();
+    return this.run('Preparing the next photo', async () => {
+      const st = this.state;
+      if (reason === 'retry' && this.photoWaiting()) return this.push(st.current, { reason });
+      await this.prepare(reason);
+      return this.push(st.current, { reason });
+    });
+  }
+
+  async prepare(reason) {
+    const meta = await this.renderPhoto(this.store.path('current'), { fresh: reason === 'schedule' });
+    this.state.current = { ...meta, pushed: false };
+    this.store.save();
+  }
+
+  // "Send again" (playlist mode: "Send playlist").
+  resend() {
+    if (this.daily) return this.run('Sending the playlist', () => this.daily.send('resend'));
+    return this.run('Sending again', async () => {
+      if (!this.state.current) throw new Error('Nothing rendered yet');
+      return this.push(this.state.current, { reason: 'resend' });
+    });
+  }
+
+  // Network standby is set during each update (standby: on, deep: off), as the display may
+  // doze off by itself before the NAS sends it to sleep.
+  networkStandby() {
+    return { standby: true, deep: false, off: null }[this.cfg.sleep.mode];
   }
 
   async push(current, { reason = 'manual' } = {}) {
@@ -328,7 +289,7 @@ export class FrameApp {
     this.setBusy('Sending to the display');
     const png = fs.readFileSync(this.store.path('current', 'device.png'));
     if (!this.cfg.display.host) {
-      // Dry run (no EMDX_HOST): render only, so you can preview the album in the web UI.
+      // Dry run (no EMDX_HOST): render only, so you can preview the album on the page.
       log.info('EMDX_HOST not set: dry run, nothing sent to a display.');
       current.dryRun = true;
       markShown(st, current.ids);
@@ -337,12 +298,13 @@ export class FrameApp {
       return current;
     }
     try {
-      const opts = this.pushOptions(reason);
-      if (opts.connect?.windowSec) log.info(`Waiting up to ${this.cfg.sleep.wakeWindowMin} min for the display to wake itself…`);
-      const { battery, waitedSec } = await pushToDisplay(this.cfg, this.server, png, opts);
+      const { battery, waitedSec } = await pushToDisplay(this.cfg, this.server, png, {
+        networkStandby: this.networkStandby(),
+        connect: await this.deepSleepConnect(reason),
+      });
       current.pushed = true;
       current.pushedAt = Date.now();
-      if (battery) st.battery = { ...battery, at: Date.now() };
+      this.noteBattery(battery);
       markShown(st, current.ids);
       this.addHistory({
         ok: true, kind: current.kind, ids: current.ids, dates: current.items.map((i) => i.takenAt),
@@ -357,16 +319,57 @@ export class FrameApp {
       return current;
     } catch (err) {
       if (!err.unreachable) this.markAwake();
-      const e = this.explainUnreachable(err, reason);
+      const e = this.explainUnreachable(err);
       this.addHistory({ ok: false, error: e.message });
       this.store.save();
-      // In deep sleep the display won't wake for a retry; a sleep check catches it awake.
+      // In deep sleep a retry wouldn't reach it either; the sleep check catches it awake.
       if (SCHEDULED.has(reason) && this.cfg.sleep.mode !== 'deep') this.scheduleRetry();
       throw e;
     }
   }
 
+  // In deep sleep nothing on the network wakes the display, so don't spend minutes on Wake-on-LAN:
+  // a scheduled run looks once; a button on the page waits a little for a display that is just
+  // waking up (someone pressed its power button). Returns connect options for pushContent().
+  async deepSleepConnect(reason) {
+    if (this.cfg.sleep.mode !== 'deep' || ['awake', 'found awake', 'after a change', 'check display'].includes(reason)) return {};
+    if (!SCHEDULED.has(reason)) return { windowSec: this.cfg.display.awakeWindowSec, wol: false, quiet: true };
+    if (await probeDisplay(this.cfg)) return {};
+    throw Object.assign(new Error('Could not reach the display'), { unreachable: true });
+  }
+
+  // Say why a sleeping display could not be reached, and what to do about it.
+  explainUnreachable(err) {
+    const { mode } = this.cfg.sleep;
+    if (!err.unreachable || mode === 'off') return err;
+    let hint;
+    if (mode === 'deep') {
+      hint = this.daily
+        ? 'It is in deep sleep, where Wake-on-LAN does not reach it. It gets the playlist the next time it is online: after its next change, or after a press on its power button.'
+        : 'It is in deep sleep, where Wake-on-LAN does not reach it: the photo goes out when the NAS next finds it awake (press its power button). On battery, UPDATE_MODE=playlist lets the display change photos by itself.';
+    } else {
+      hint = this.cfg.display.mac
+        ? 'Wake-on-LAN did not wake it: check its battery and that its Network Standby is on '
+          + '(sleep-test checks the setup). Pressing its power button wakes it too.'
+        : 'Set EMDX_MAC so the NAS can wake it from sleep with Wake-on-LAN.';
+    }
+    const e = new Error(`${err.what || err.message}. ${hint}`);
+    e.unreachable = true;
+    return e;
+  }
+
+  // A rendered photo that never reached the display (e.g. it slept through the update).
+  photoWaiting() {
+    const c = this.state.current;
+    return !!c && !c.pushed && !c.dryRun && fs.existsSync(this.store.path('current', 'device.png'));
+  }
+
   // ---------- sleep ----------
+  // We talked to the display, so whatever it was doing before, it is awake now.
+  markAwake() {
+    if (this.state.sleep) this.state.sleep.asleep = false;
+  }
+
   cancelSleep() {
     clearTimeout(this.sleepTimer);
     this.sleepTimer = null;
@@ -389,13 +392,17 @@ export class FrameApp {
     return !!z?.asleep && z.mode === this.cfg.sleep.mode;
   }
 
-  // After a failed action: unless a retry follows or the display is out of reach
-  // anyway, don't leave it awake.
+  // After a failed action: unless a retry follows or the display is out of reach anyway,
+  // don't leave it awake.
   afterFailure(err) {
     if (err.busy || err.unreachable || this.retryTimer || this.believedAsleep()) return;
     this.scheduleSleep();
   }
 
+  // Send the sleep command (network standby on for standby, off for deep sleep), then make
+  // sure it worked: the display must stop answering (probed without Wake-on-LAN). An awake
+  // display keeps using its battery, so a failure gets a second try. A display that is out of
+  // reach already went to sleep by itself, with network standby as the last update set it.
   async sleepNow() {
     if (this.busy) { // something else is talking to the display; try again shortly
       this.sleepTimer = setTimeout(() => {
@@ -406,11 +413,6 @@ export class FrameApp {
     }
     const { mode, confirmSec, confirmEverySec, checkMin } = this.cfg.sleep;
     const pause = (sec) => new Promise((r) => setTimeout(r, sec * 1000));
-    // Sends the sleep command (network standby on for standby, off for deep sleep), then
-    // makes sure it worked: the display must stop answering (probed without Wake-on-LAN).
-    // An awake display keeps using its battery, so a failure gets a second try. A display
-    // that is out of reach already went to sleep by itself, with network standby as the
-    // last update set it.
     return this.exclusive('Putting the display to sleep', async () => {
       let problem = null;
       for (let attempt = 1; attempt <= 2; attempt++) {
@@ -421,7 +423,7 @@ export class FrameApp {
         let reached = true;
         try {
           const { battery } = await putToSleep(this.cfg, { networkStandby: mode === 'standby' });
-          if (battery?.batteryPercent != null) this.state.battery = { ...battery, at: Date.now() };
+          this.noteBattery(battery);
         } catch (err) {
           if (!err.unreachable) { problem = err.message; continue; }
           reached = false;
@@ -430,7 +432,7 @@ export class FrameApp {
         if (after === null) { problem = `it still answered ${confirmSec} s after the power-off command`; continue; }
         const self = !reached && attempt === 1;
         this.state.sleep = { mode, asleep: true, sleptAt: Date.now(), self, confirmedAfter: after };
-        const next = mode === 'deep' ? (this.daily ? '. It changes the photo by itself at each change time' : '. It wakes itself at its screen protection time')
+        const next = mode === 'deep' ? (this.daily ? '. It changes the photo by itself' : '')
           : this.cfg.display.mac ? '. Wake-on-LAN wakes it for the next update' : '';
         log.info(self ? 'The display had already gone to sleep by itself.'
           : `Display is asleep: it stopped answering ${after} s after the power-off command${next}.`);
@@ -439,22 +441,37 @@ export class FrameApp {
       }
       const b = this.state.battery;
       const charging = b?.pluggedIn && Date.now() - b.at < 10 * 60000;
-      const message = `The display did not go to sleep, after two tries: ${problem}. ` +
-        (charging ? 'It is charging, so for now that costs no battery.' : 'Awake, it keeps using its battery.') +
-        (checkMin ? ` The NAS tries again at its next sleep check (every ${checkMin} min).` : '');
+      const message = `The display did not go to sleep, after two tries: ${problem}. `
+        + (charging ? 'It is charging, so for now that costs no battery.' : 'Awake, it keeps using its battery.')
+        + (checkMin ? ` The NAS tries again at its next sleep check (every ${checkMin} min).` : '');
       this.state.sleep = { mode, asleep: false, error: message, at: Date.now() };
       this.store.save();
       throw new Error(message);
     });
   }
 
+  // "Sleep now" (/api/sleep): put the display to sleep without waiting for SLEEP_DELAY_SEC.
+  async sleepRightAway() {
+    this.cancelSleep();
+    await this.sleepNow();
+  }
+
+  // For one-shot commands: wait for the pending sleep instead of exiting before it.
+  async flushSleep() {
+    if (!this.sleepTimer) return;
+    const wait = Math.max(0, (this.state.sleep?.sleepAt ?? Date.now()) - Date.now());
+    this.cancelSleep();
+    log.info(`Waiting ${Math.round(wait / 1000)} s for the panel to finish, then putting it to sleep…`);
+    await new Promise((r) => setTimeout(r, wait));
+    await this.sleepNow();
+  }
+
   // ---------- sleep check ----------
-  // Every SLEEP_CHECK_MIN minutes, unless the display is meant to be awake (an update, a
-  // pending sleep or a pending retry) or a scheduled update is due within 20 minutes (in
-  // deep sleep the display wakes itself for it), check that it is asleep: probe it without
-  // Wake-on-LAN, so a sleeping display stays asleep. One that answers gets the photo that
-  // is still waiting to be shown, if any (in playlist mode: a fresh playlist, if one is
-  // due); otherwise it is put back to sleep. Either way it is noted.
+  // Every SLEEP_CHECK_MIN minutes, unless the display is meant to be awake (an update, a pending
+  // sleep or a pending retry), check that it is asleep: probe it without Wake-on-LAN, so a
+  // sleeping display stays asleep. One that answers (someone pressed its power button, it is
+  // charging) gets the photo that is still waiting to be shown, or in playlist mode a fresh
+  // playlist if one is due; otherwise it is put back to sleep. Either way it is noted.
   startSleepWatch() {
     const { mode, checkMin } = this.cfg.sleep;
     if (!checkMin || mode === 'off' || !this.cfg.display.host) return;
@@ -470,104 +487,73 @@ export class FrameApp {
   }
 
   async checkAsleep() {
-    // (In playlist mode the display doesn't wake for the NAS at a change: no pause before it.)
-    const updateSoon = !this.daily && this.minutesToNextRun() < 20;
-    if (this.busy || this.sleepTimer || this.retryTimer || updateSoon) return null;
-    // Holding the lock: the display takes one connection at a time.
+    if (this.busy || this.sleepTimer || this.retryTimer) return null;
     const awake = await this.exclusive('Checking that the display is asleep', () => probeDisplay(this.cfg));
-    const st = this.state;
-    st.lastCheck = { at: Date.now(), awake };
+    this.state.lastCheck = { at: Date.now(), awake };
     if (!awake) {
       this.store.save();
       return false;
     }
-    const event = { at: Date.now(), wasAsleep: this.believedAsleep() };
-    st.wakeEvents = [event, ...(st.wakeEvents || [])].slice(0, 20);
+    const event = this.noteWake();
+    if (this.daily) this.daily.foundAwake(event);
+    try {
+      if (this.daily) {
+        let sent = false;
+        try {
+          sent = await this.daily.onAwake('found awake');
+        } catch (err) {
+          log.warn(`Sleep check: could not send the playlist: ${err.message}`);
+          event.error = err.message;
+          if (err.busy || err.unreachable || this.sleepTimer) return true; // (a failed send already scheduled the sleep)
+        }
+        if (sent) {
+          event.sent = 'playlist'; // it goes back to sleep after the update, as always
+          return true;
+        }
+        if (!event.error) log.info('Sleep check: the display is awake and its playlist is up to date; putting it back to sleep.');
+      } else if (this.photoWaiting()) {
+        log.info('Sleep check: the display is awake and a photo is waiting; sending it.');
+        await this.run('Sending the waiting photo', () => this.push(this.state.current, { reason: 'awake' }));
+        event.sent = 'photo';
+        return true;
+      } else {
+        log.warn('Sleep check: the display is awake although it should be asleep; putting it back to sleep.');
+      }
+      await this.sleepNow();
+      event.putBack = true;
+      return true;
+    } finally {
+      this.finishWake(event);
+    }
+  }
+
+  // The display was found awake: note when (the battery reading taken meanwhile is added by
+  // finishWake). `extra`: e.g. { afterChange: true }.
+  noteWake(extra = {}) {
+    const event = { at: Date.now(), wasAsleep: this.believedAsleep(), ...extra };
+    this.state.wakeEvents = [event, ...(this.state.wakeEvents || [])].slice(0, 30);
     this.markAwake();
     this.store.save();
-    if (this.daily) return this.checkedAwakePlaylist(event);
-    const waiting = this.photoWaiting();
-    if (waiting) log.info('Sleep check: the display is awake and a photo is waiting; sending it.');
-    else log.warn('Sleep check: the display is awake although it should be asleep; putting it back to sleep.');
-    try {
-      if (waiting) {
-        await this.run('Sending the waiting photo', () => this.push(st.current, { reason: 'awake' }));
-        event.sent = true; // it goes back to sleep SLEEP_DELAY_SEC later, as after any update
-      } else {
-        await this.sleepNow();
-        event.putBack = true;
-      }
-    } finally {
-      const b = st.battery; // read just now
-      if (b?.at >= event.at) Object.assign(event, { battery: b.batteryPercent ?? null, charging: !!b.pluggedIn });
-      this.store.save();
-    }
-    return true;
+    return event;
   }
 
-  // Playlist mode: the sleep check found the display awake. See what it shows and send a fresh
-  // playlist if one is due; otherwise put it back to sleep.
-  async checkedAwakePlaylist(event) {
-    const st = this.state;
-    const watch = this.daily.watch; // just after a change: the NAS is looking out for it
-    if (watch && !watch.online) watch.online = event.at;
-    try {
-      let sent = false;
-      try {
-        sent = await this.daily.onAwake('found awake');
-      } catch (err) {
-        log.warn(`Sleep check: could not send the playlist: ${err.message}`);
-        event.error = err.message;
-        if (err.busy || err.unreachable || this.sleepTimer) return true; // (a failed send already scheduled the sleep)
-      }
-      if (sent) {
-        event.sent = true; // it goes back to sleep after the update, as always
-      } else {
-        if (!event.error) log.info('Sleep check: the display is awake and its playlist is up to date; putting it back to sleep.');
-        await this.sleepNow();
-        event.putBack = true;
-      }
-    } finally {
-      const b = st.battery;
-      if (b?.at >= event.at) Object.assign(event, { battery: b.batteryPercent ?? null, charging: !!b.pluggedIn });
-      this.store.save();
-    }
-    return true;
+  finishWake(event) {
+    const b = this.state.battery;
+    if (b?.at >= event.at) Object.assign(event, { battery: b.batteryPercent ?? null, charging: !!b.pluggedIn });
+    this.store.save();
   }
 
-  // A rendered photo that never reached the display (e.g. it slept through the update).
-  photoWaiting() {
-    const c = this.state.current;
-    return !!c && !c.pushed && !c.dryRun && fs.existsSync(this.store.path('current', 'device.png'));
+  // A battery reading (from any conversation with the display): the latest is shown on the
+  // page, and one per half hour goes into the battery log (the morning readings in playlist
+  // mode show the daily drain).
+  noteBattery(battery) {
+    if (battery?.batteryPercent == null) return;
+    const at = Date.now();
+    this.state.battery = { ...battery, at };
+    addBatteryReading(this.state.batteryLog, { at, percent: battery.batteryPercent, charging: !!battery.pluggedIn });
   }
 
-  minutesToNextRun() {
-    try {
-      const t = this.cron?.nextRun();
-      return t ? (t.getTime() - Date.now()) / 60000 : Infinity;
-    } catch {
-      return Infinity;
-    }
-  }
-
-  // For one-shot commands: wait for the pending sleep instead of exiting before it.
-  async flushSleep() {
-    if (!this.sleepTimer) return;
-    const wait = Math.max(0, (this.state.sleep?.sleepAt ?? Date.now()) - Date.now());
-    this.cancelSleep();
-    log.info(`Waiting ${Math.round(wait / 1000)} s for the panel to finish, then putting it to sleep…`);
-    await new Promise((r) => setTimeout(r, wait));
-    await this.sleepNow();
-  }
-
-  resend() {
-    if (this.daily) return this.run('Sending the playlist', () => this.daily.send('resend'));
-    return this.run('Sending again', async () => {
-      if (!this.state.current) throw new Error('Nothing rendered yet');
-      return this.push(this.state.current, { reason: 'resend' });
-    });
-  }
-
+  // ---------- test pattern and display check ----------
   testPattern({ push = true } = {}) {
     return this.run('Test pattern', async () => {
       const { devicePng, previewPng } = await renderTestPattern(this.cfg, this.model);
@@ -580,10 +566,11 @@ export class FrameApp {
       if (push && this.cfg.display.host) {
         this.setBusy('Sending the test pattern');
         try {
-          await pushToDisplay(this.cfg, this.server, devicePng, this.pushOptions());
+          const { battery } = await pushToDisplay(this.cfg, this.server, devicePng, { networkStandby: this.networkStandby() });
+          this.noteBattery(battery);
         } catch (err) {
           if (!err.unreachable) this.markAwake();
-          throw this.explainUnreachable(err, 'manual');
+          throw this.explainUnreachable(err);
         }
         this.state.testPattern.sent = true;
         this.daily?.replaced('the test pattern');
@@ -594,59 +581,56 @@ export class FrameApp {
     });
   }
 
-  // "Check display": read its name, firmware, battery and network standby. This wakes
-  // it (Wake-on-LAN), so it is sent back to sleep SLEEP_DELAY_SEC later. In playlist mode, a
-  // display that is awake for this gets a fresh playlist if one is due.
+  // "Check display": read its name, firmware, battery and settings, and ask for a thumbnail of
+  // its screen. This wakes it (Wake-on-LAN), so it is sent back to sleep SLEEP_DELAY_SEC later.
+  // In playlist mode, a display that is awake for this gets a fresh playlist if one is due.
   async displayInfo() {
-    const info = await this.readDisplay();
+    const info = await this.exclusive('Checking the display', async () => {
+      const read = await readDisplayInfo(this.cfg, { thumbnailUrl: this.server?.thumbnailUrl });
+      if (read.thumbnail === 'asked') this.state.thumbs.asked++;
+      this.markAwake();
+      this.scheduleSleep();
+      this.noteBattery(read.battery);
+      this.state.displayCheck = { ...read, at: Date.now() };
+      this.store.save();
+      return read;
+    });
     if (this.daily) this.daily.sendIfDue('check display').catch((err) => log.warn(`Playlist: ${err.message}`));
     return info;
   }
 
-  readDisplay() {
-    return this.exclusive('Checking the display', async () => {
-      this.checkAskedAt = Date.now(); // it asks for a thumbnail, which arrives on its own
-      const info = await readDisplayInfo(this.cfg, { thumbnailUrl: this.server?.thumbnailUrl });
-      const saved = this.state.pendingRestore;
-      if (saved) { // settings an interrupted playlist test changed
-        try {
-          await withDisplay(this.cfg, {}, async (device) => {
-            await setSleepAfter(device, saved.sleepAfter?.length ? saved.sleepAfter : SLEEP_AFTER_10_MIN);
-            if (saved.applySleep != null) {
-              await new Promise((r) => setTimeout(r, 300));
-              await setApplySleep(device, saved.applySleep);
-            }
-          });
-          info.restored = `Sleep After ${formatSleepAfter(saved.sleepAfter?.length ? saved.sleepAfter : SLEEP_AFTER_10_MIN)}`
-            + (saved.applySleep != null ? `, sleep after content update ${saved.applySleep ? 'on' : 'off'}` : '')
-            + ' (put back after the interrupted playlist test)';
-          log.info(`Check display: ${info.restored}`);
-          delete this.state.pendingRestore;
-        } catch (err) {
-          info.restored = `could not put back the settings from before the interrupted playlist test: ${err.message}`;
-        }
-      }
-      this.markAwake();
-      this.scheduleSleep();
-      if (info.battery?.batteryPercent != null) this.state.battery = { ...info.battery, at: Date.now() };
-      this.state.displayCheck = { ...info, at: Date.now() };
+  // ---------- thumbnails of the screen ----------
+  // Does this display send thumbnails of its screen (MDC 0xC7/0x54)? null: not known yet.
+  thumbnailsWork() {
+    const t = this.state.thumbs;
+    return t.received > 0 ? true : t.asked >= THUMB_TRIES ? false : null;
+  }
+
+  // Ask the display for a thumbnail and wait for it; null if none came (or none ever comes).
+  async askThumbnail(timeoutSec = 10) {
+    if (!this.server || this.thumbnailsWork() === false) return null;
+    let deliver;
+    const got = new Promise((resolve) => { deliver = resolve; });
+    this.thumbWaiters.add(deliver);
+    const timer = setTimeout(() => { this.thumbWaiters.delete(deliver); deliver(null); }, timeoutSec * 1000);
+    try {
+      await withDisplay(this.cfg, { quiet: true }, (device) => requestThumbnail(device, this.server.thumbnailUrl));
+      this.state.thumbs.asked++; // (counted once the display has taken the request)
+      const th = await got;
+      if (!th && this.thumbnailsWork() === false) log.info(`No thumbnail after ${THUMB_TRIES} requests: this display doesn't send them; not asking any more.`);
+      return th;
+    } finally {
+      clearTimeout(timer);
+      this.thumbWaiters.delete(deliver);
       this.store.save();
-      return info;
-    });
+    }
   }
 
-  // Put the display to sleep now (instead of waiting for SLEEP_DELAY_SEC).
-  async sleepRightAway() {
-    this.cancelSleep();
-    await this.sleepNow();
-  }
-
-  // ---------- what the display reports ----------
-  // A thumbnail of the display's screen, which it POSTs after MDC 0xC7/0x54. Kept as
-  // thumbnails/latest.*; whoever asked for it gets it, and during a playlist test one that
-  // arrives unasked is noted too (it would mean the display reports switches by itself).
+  // A thumbnail the display POSTed: kept as thumbnails/latest.*, handed to whoever asked for it,
+  // and in playlist mode matched against the photos.
   onThumbnail(th) {
     const st = this.state;
+    st.thumbs.received++;
     if (th.image?.buf?.length) {
       const ext = /png/i.test(th.image.type || '') || /\.png$/i.test(th.image.name || '') ? 'png' : 'jpg';
       const dir = this.store.path('thumbnails');
@@ -660,232 +644,10 @@ export class FrameApp {
     const waiters = [...this.thumbWaiters];
     this.thumbWaiters.clear();
     for (const w of waiters) w(th);
-    if (!waiters.length && st.playlistTest && !st.playlistTest.done) {
-      this.recordTestThumbnail(th, { asked: false }).catch((err) => log.warn(`Playlist test: ${err.message}`));
-    } else if (!waiters.length && this.daily) { // e.g. after Check display
-      const how = Date.now() - (this.checkAskedAt ?? 0) < 120000 ? 'check display' : 'sent by itself';
-      this.daily.noteThumbnail(th, how).catch((err) => log.warn(`Playlist: ${err.message}`));
-    }
+    if (!waiters.length && this.daily) this.daily.noteThumbnail(th, 'check display').catch((err) => log.warn(`Playlist: ${err.message}`));
   }
 
-  // A thumbnail POST we couldn't read: keep the body (thumbnails/failed-<time>.bin) so the
-  // format can be looked at, and note it on the status page.
-  onThumbnailFailure(f) {
-    const dir = this.store.path('thumbnails');
-    fs.mkdirSync(dir, { recursive: true });
-    const file = `failed-${stamp(new Date(f.at)).replace(/\D/g, '').slice(8, 14)}.bin`;
-    if (f.body?.length) fs.writeFileSync(`${dir}/${file}`, f.body);
-    const st = this.state;
-    st.thumbnailFailures = [{ at: f.at, error: f.error, contentType: f.contentType, bytes: f.body?.length ?? 0, file }, ...(st.thumbnailFailures || [])].slice(0, 5);
-    this.store.save();
-  }
-
-  // Download progress the display reports (Samsung's app has an endpoint for it).
-  onDisplayReport(report) {
-    const t = this.state.playlistTest;
-    if (t && !t.done) {
-      t.reports = [...(t.reports || []), { at: report.at, path: report.path, text: report.text.slice(0, 500) }].slice(-20);
-      this.store.save();
-    }
-  }
-
-  // Ask the display for a thumbnail of its screen and wait for it; null if none came.
-  async askThumbnail(timeoutSec = 45) {
-    let deliver;
-    const got = new Promise((resolve) => { deliver = resolve; });
-    this.thumbWaiters.add(deliver);
-    const timer = setTimeout(() => { this.thumbWaiters.delete(deliver); deliver(null); }, timeoutSec * 1000);
-    try {
-      await withDisplay(this.cfg, { quiet: true }, (device) => requestThumbnail(device, this.server.thumbnailUrl));
-      return await got;
-    } finally {
-      clearTimeout(timer);
-      this.thumbWaiters.delete(deliver);
-    }
-  }
-
-  // ---------- playlist test ----------
-  // Does the display play a playlist by itself, and how does it time it? This pushes
-  // numbered cards as a playlist, the way Samsung's E-Paper app sends one (each card with
-  // its own duration), then asks the display every `pollSec` for a thumbnail of its screen
-  // and notes which card is showing. The display is kept awake meanwhile (Sleep After off,
-  // no sleep after the update, network standby on), so run it with the display on USB-C
-  // power. Afterwards its settings and the photo are put back. `unitMs`: length of a "minute"
-  // (tests use shorter ones).
-  playlistTest({ minutes = [10, 20, 20, 20], pollSec = 120, extraMin = 25, unitMs = 60000, thumbTimeoutSec = 45 } = {}) {
-    return this.run('Playlist test', async () => {
-      const cfg = this.cfg;
-      if (!cfg.display.host) throw new Error('Set EMDX_HOST first: the test needs the display.');
-      const st = this.state;
-      const dir = this.store.path('playlist-test');
-      fs.rmSync(dir, { recursive: true, force: true });
-      fs.mkdirSync(dir, { recursive: true });
-      this.testStop = false;
-      const durations = minutes.map((m) => Math.round(m * unitMs));
-      const total = durations.reduce((a, b) => a + b, 0) + extraMin * unitMs;
-      const t = { startedAt: Date.now(), minutes, unitMs, durations, observations: [], reports: [], notes: [], done: false };
-      st.playlistTest = t;
-      const note = (msg, level = 'info') => {
-        log[level](`Playlist test: ${msg}`);
-        t.notes.push({ at: Date.now(), msg });
-        this.store.save();
-      };
-      const wait = (ms) => new Promise((resolve) => {
-        const timer = setTimeout(resolve, ms);
-        this.testWake = () => { clearTimeout(timer); resolve(); };
-      });
-      const readOr = async (fn) => { try { return await fn(); } catch (err) { log.debug(err.message); return null; } };
-      const tryTo = async (fn, what) => { try { await fn(); } catch (err) { note(`could not ${what}: ${err.message}`, 'warn'); } };
-      const pause = () => new Promise((r) => setTimeout(r, 300)); // the display drops commands sent too fast
-
-      // 1. Note the display's settings, then keep it awake for the test. After an interrupted
-      // test, the settings it noted are the real ones (the display still has the test's).
-      const saved = {};
-      const earlier = st.pendingRestore;
-      try {
-        await withDisplay(cfg, {}, async (device) => {
-          saved.battery = await readOr(() => device.getBatteryState()); await pause();
-          saved.sleepAfter = earlier?.sleepAfter ?? await readOr(() => getSleepAfter(device)); await pause();
-          saved.applySleep = earlier ? earlier.applySleep : await readOr(() => getApplySleep(device)); await pause();
-          if (earlier) note('using the settings noted before the interrupted test.');
-          saved.networkStandby = await readOr(() => getNetworkStandby(device)); await pause();
-          saved.features = await readOr(() => getFeatures(device)); await pause();
-          const b = saved.battery;
-          note(`display before the test: Sleep After ${saved.sleepAfter ? formatSleepAfter(saved.sleepAfter) : 'unknown'}, `
-            + `sleep after content update ${saved.applySleep == null ? 'unknown' : saved.applySleep ? 'on' : 'off'}, `
-            + `network standby ${saved.networkStandby == null ? 'unknown' : saved.networkStandby ? 'on' : 'off'}, `
-            + `low-power Wi-Fi module ${saved.features?.lowPowerWifi == null ? 'unknown' : saved.features.lowPowerWifi ? 'yes' : 'no'}`
-            + (b ? `, battery ${b.batteryPercent}%${b.pluggedIn ? ' (charging)' : ''}` : '') + '.');
-          if (b && !b.pluggedIn) note(`the display is not charging; staying awake for the test (about ${Math.round(total / 60000)} min) costs some battery.`, 'warn');
-          await tryTo(() => setSleepAfter(device, [0x00]), 'switch Sleep After off'); await pause();
-          await tryTo(() => setApplySleep(device, false), 'switch off "apply sleep mode after content update"'); await pause();
-          await tryTo(() => setNetworkStandby(device, true), 'switch network standby on');
-        });
-      } catch (err) {
-        t.done = true;
-        t.error = err.message;
-        this.store.save();
-        throw this.explainUnreachable(err, 'manual');
-      }
-      t.saved = { sleepAfter: saved.sleepAfter, applySleep: saved.applySleep, networkStandby: saved.networkStandby, features: saved.features };
-      this.markAwake();
-
-      try {
-        // 2. The cards, sent as a playlist.
-        this.setBusy('Playlist test: sending the cards');
-        const cards = await renderTestCards(cfg, { minutes, sentAt: new Date() });
-        for (const c of cards) fs.writeFileSync(`${dir}/card-${c.card}.png`, c.png);
-        const { battery } = await pushContent(cfg, this.server, {
-          items: cards.map((c, i) => ({ buf: c.png, durationMs: durations[i] })),
-          contentType: 'PlaylistContent',
-          name: 'Playlist test',
-        }, { networkStandby: true });
-        if (battery) st.battery = { ...battery, at: Date.now() };
-        t.t0 = Date.now();
-        t.endsAt = t.t0 + total;
-        note(`the display downloaded the ${cards.length} cards; card durations ${minutes.join('/')}`
-          + `${unitMs === 60000 ? ' min' : ` × ${unitMs} ms`}. Watching until ${stamp(new Date(t.endsAt)).slice(11, 16)}.`);
-
-        // 3. Watch: a thumbnail every pollSec.
-        this.setBusy(`Playlist test: watching until ${stamp(new Date(t.endsAt)).slice(11, 16)}`);
-        await wait(Math.min(20000, pollSec * 1000)); // let it draw card 1 first
-        while (!this.testStop && Date.now() < t.endsAt) {
-          const asked = Date.now();
-          try {
-            const th = await this.askThumbnail(thumbTimeoutSec);
-            if (th) await this.recordTestThumbnail(th, { asked: true });
-            else {
-              t.observations.push({ at: asked, card: null, error: `no thumbnail within ${thumbTimeoutSec} s` });
-              note(`no thumbnail came back within ${thumbTimeoutSec} s.`, 'warn');
-            }
-          } catch (err) {
-            t.observations.push({ at: asked, card: null, error: err.message });
-            note(`could not ask for a thumbnail: ${err.message}`, 'warn');
-          }
-          this.store.save();
-          const until = Math.min(asked + pollSec * 1000, t.endsAt);
-          if (!this.testStop && Date.now() < until) await wait(until - Date.now());
-        }
-        if (this.testStop) note('stopped early, as asked.');
-        t.result = analyzePlaylistTest({
-          t0: t.t0, durations, observations: t.observations, tz: cfg.timezone,
-          toleranceMs: Math.min(100000, Math.min(...durations) / 4),
-        });
-        note(t.result.verdict);
-        this.addHistory({ ok: true, kind: 'playlist test', ids: [], dates: [] });
-      } catch (err) {
-        t.error = err.message;
-        note(`failed: ${err.message}`, 'warn');
-        throw err;
-      } finally {
-        // 4. Put things back: the display's settings, then the photo (which ends the playlist).
-        this.setBusy('Playlist test: putting things back');
-        await tryTo(() => withDisplay(cfg, {}, async (device) => {
-          await setSleepAfter(device, saved.sleepAfter?.length ? saved.sleepAfter : SLEEP_AFTER_10_MIN);
-          await pause();
-          if (saved.applySleep != null) await setApplySleep(device, saved.applySleep);
-        }), 'put the display\'s Sleep After and "apply sleep mode after content update" back');
-        const c = st.current;
-        if (this.daily) {
-          this.daily.replaced('the playlist test');
-          try {
-            await this.daily.send('resend'); // the photo for now, then the coming days
-            note('the daily playlist is back on the frame.');
-          } catch (err) {
-            note(`could not send the daily playlist (${err.message}); press "Send playlist".`, 'warn');
-          }
-        } else if (c && !c.dryRun && fs.existsSync(this.store.path('current', 'device.png'))) {
-          try {
-            await this.push(c, { reason: 'resend' }); // also sets network standby as SLEEP_MODE wants and schedules sleep
-            note('the photo is back on the frame.');
-          } catch (err) {
-            note(`could not put the photo back (${err.message}); press "Send again".`, 'warn');
-          }
-        } else {
-          note('no photo to put back: the frame keeps cycling the test cards until the next update.', 'warn');
-          this.scheduleSleep();
-        }
-        delete st.pendingRestore;
-        t.done = true;
-        t.endedAt = Date.now();
-        this.testWake = null;
-        this.store.save();
-      }
-      return t;
-    });
-  }
-
-  // Classify a thumbnail for the running playlist test and keep it as an observation.
-  async recordTestThumbnail(th, { asked }) {
-    const t = this.state.playlistTest;
-    if (!t || t.done) return null;
-    if (!th.image?.buf?.length) {
-      t.observations.push({ at: th.at, card: null, asked, error: 'thumbnail without an image' });
-      this.store.save();
-      return null;
-    }
-    const cls = await classifyThumbnail(th.image.buf, t.minutes.length);
-    const ext = th.file?.endsWith('png') ? 'png' : 'jpg';
-    const file = `thumb-${stamp(new Date(th.at)).replace(/\D/g, '').slice(8, 14)}-${cls.card ? `card${cls.card}` : 'unknown'}${asked ? '' : '-unasked'}.${ext}`;
-    fs.writeFileSync(this.store.path('playlist-test', file), th.image.buf);
-    const obs = { at: th.at, card: cls.card, share: cls.share, rgb: cls.rgb, file, asked };
-    t.observations.push(obs);
-    t.fields ||= th.fields; // what the display says about itself, once
-    this.store.save();
-    log.info(`Playlist test: ${asked ? '' : 'unasked '}thumbnail shows ${cls.card ? `card ${cls.card}` : 'no test card'}`
-      + ` (${Math.round(cls.share * 100)}% of the middle; average colour rgb(${cls.rgb.join(',')}))`);
-    return obs;
-  }
-
-  // "Stop test": ends a running playlist test early (it still puts things back).
-  stopTest() {
-    const t = this.state.playlistTest;
-    if (!t || t.done || !this.busy) return false;
-    this.testStop = true;
-    this.testWake?.();
-    return true;
-  }
-
+  // ---------- history and status ----------
   addHistory(entry) {
     const st = this.state;
     st.history.unshift({ at: Date.now(), ...entry });
@@ -899,11 +661,12 @@ export class FrameApp {
     try { nextRun = this.cron?.nextRun()?.toISOString() || null; } catch { /* ignore */ }
     return {
       busy: this.busy,
-      mode: this.cfg.update?.mode ?? 'push',
+      mode: this.cfg.update.mode,
       playlist: this.daily ? this.daily.status() : null,
       current: st.current || null,
       nextRun,
       battery: st.battery || null,
+      batteryDays: batteryDays(st.batteryLog, this.cfg.timezone),
       cycle: st.cycle ? { n: st.cycle, shown: (st.shownThisCycle || []).length, total: (st.shownThisCycle || []).length + (st.bag || []).length } : null,
       library: lib ? { count: lib.items.length, fetchedAt: lib.fetchedAt, titles: lib.albums.map((a) => a.title + (a.stale ? ' (cached)' : '')) } : null,
       lastError: st.lastError || null,
@@ -913,24 +676,11 @@ export class FrameApp {
       sleep: this.cfg.display.host ? this.sleepStatus() : null,
       displayCheck: st.displayCheck || null,
       check: this.cfg.display.host && this.cfg.sleep.mode !== 'off' && this.cfg.sleep.checkMin
-        ? { everyMin: this.cfg.sleep.checkMin, last: st.lastCheck || null, wakeEvents: (st.wakeEvents || []).slice(0, 10) }
+        ? { everyMin: this.cfg.sleep.checkMin, last: st.lastCheck || null, wakeEvents: (st.wakeEvents || []).filter((e) => !e.afterChange).slice(0, 10) }
         : null,
+      thumbnails: this.thumbnailsWork(),
       thumbnail: st.thumbnail || null,
-      thumbnailFailures: st.thumbnailFailures || [],
       displayTraffic: this.server?.recentTraffic?.().slice(0, 20) ?? [],
-      playlistTest: st.playlistTest ? this.testSummary(st.playlistTest) : null,
-    };
-  }
-
-  testSummary(t) {
-    return {
-      startedAt: t.startedAt, t0: t.t0 ?? null, endsAt: t.endsAt ?? null, endedAt: t.endedAt ?? null, done: t.done,
-      minutes: t.minutes, unitMs: t.unitMs, error: t.error ?? null, saved: t.saved ?? null,
-      reports: (t.reports || []).slice(-5).map(({ at, path, text }) => ({ at, path, text: text.slice(0, 300) })),
-      observations: t.observations.slice(-60).map(({ at, card, error, file, asked }) => ({ at, card, error, file, asked })),
-      notes: t.notes.slice(-12),
-      fields: t.fields ?? null,
-      result: t.result ? { verdict: t.result.verdict, model: t.result.model, transitions: t.result.transitions, scores: t.result.scores } : null,
     };
   }
 
@@ -939,4 +689,59 @@ export class FrameApp {
     const z = this.state.sleep?.mode === mode ? this.state.sleep : {}; // ignore state from another SLEEP_MODE
     return { ...z, mode, pending: !!this.sleepTimer, asleep: this.believedAsleep() };
   }
+}
+
+// The battery log keeps one reading per half hour (the latest), 200 at most.
+function addBatteryReading(logEntries, entry) {
+  const last = logEntries.at(-1);
+  if (last && entry.at - last.at < 30 * 60000) logEntries[logEntries.length - 1] = entry;
+  else logEntries.push(entry);
+  if (logEntries.length > 200) logEntries.splice(0, logEntries.length - 200);
+}
+
+// The first battery reading of each of the last 7 days (in playlist mode: the one taken when
+// the display came online after the morning change), newest first.
+export function batteryDays(logEntries, timezone, days = 7) {
+  const fmt = new Intl.DateTimeFormat('en-GB', { timeZone: timezone, weekday: 'short', day: 'numeric', month: 'short' });
+  const seen = new Map();
+  for (const e of logEntries || []) {
+    const day = fmt.format(new Date(e.at)).replace(',', '');
+    if (!seen.has(day)) seen.set(day, { day, at: e.at, percent: e.percent, charging: e.charging });
+  }
+  return [...seen.values()].sort((a, b) => b.at - a.at).slice(0, days);
+}
+
+// State written by earlier versions: drop what the playlist test left (saying so if it was cut
+// short and left the display's settings changed), count its unanswered thumbnail requests (so the
+// NAS doesn't keep waiting for thumbnails that never come), label old wake-ups, and start the
+// battery log from the readings in the history.
+export function upgradeState(st) {
+  st.excluded ||= {};
+  st.history ||= [];
+  const saved = st.pendingRestore || (st.playlistTest && !st.playlistTest.done ? st.playlistTest.saved : null);
+  if (saved) {
+    const message = 'A playlist test was cut short and left the display\'s Sleep After (and "apply sleep mode after content update") as the test set them: set them back in the Samsung E-Paper app.';
+    log.warn(message);
+    st.lastError = { at: Date.now(), message };
+    if (st.playlist) st.playlist.pending = 'the playlist test replaced the playlist';
+  }
+  for (const e of st.wakeEvents || []) {
+    if (e.sent !== true) continue;
+    const playlist = st.history.some((h) => h.ok && /^playlist sent/.test(h.kind || '') && h.at >= e.at && h.at - e.at < 10 * 60000);
+    e.sent = playlist ? 'playlist' : 'photo';
+  }
+  if (!st.thumbs) {
+    const misses = (st.playlistTest?.observations || []).filter((o) => o.error).length
+      + (st.playlist?.seen || []).filter((e) => e.note === 'no thumbnail came back').length;
+    st.thumbs = st.thumbnail ? { asked: 0, received: 1 } : { asked: misses, received: 0 };
+  }
+  if (!st.batteryLog) {
+    st.batteryLog = [];
+    const readings = [
+      ...st.history.filter((h) => h.ok && h.battery != null).map((h) => ({ at: h.at, percent: h.battery, charging: false })),
+      ...(st.wakeEvents || []).filter((e) => e.battery != null).map((e) => ({ at: e.at, percent: e.battery, charging: !!e.charging })),
+    ].sort((a, b) => a.at - b.at);
+    for (const r of readings) addBatteryReading(st.batteryLog, r);
+  }
+  for (const key of ['playlistTest', 'pendingRestore', 'thumbnailFailures']) delete st[key];
 }

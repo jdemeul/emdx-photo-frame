@@ -126,12 +126,13 @@ export function loadConfig() {
   // beat the NAS ditherer side by side (deeper colours, quieter dark tones).
   const dither = oneOf('DITHER', 'device', ['device', 'local']);
 
-  //   push     - at every SCHEDULE time the NAS sends the next photo (the display must be
-  //              reachable then).
+  // How the photo changes at every SCHEDULE time:
+  //   push     - the NAS sends the next photo (the display must be reachable then: mains
+  //              power, or network standby with Wake-on-LAN).
   //   playlist - the NAS sends the photos for the coming PLAYLIST_DAYS days at once, as the
-  //              display's own playlist, and the display changes the photo itself at every
-  //              SCHEDULE time, also in deep sleep. The NAS tops it up whenever it finds the
-  //              display awake.
+  //              display's own playlist, and the display changes the photo itself, also in
+  //              deep sleep. It comes online briefly after each change, and the NAS sends a
+  //              fresh playlist then when fewer than PLAYLIST_TOPUP_DAYS days are left.
   const updateMode = oneOf('UPDATE_MODE', 'push', ['push', 'playlist']);
   const playlistDays = num('PLAYLIST_DAYS', 7);
   if (!Number.isInteger(playlistDays) || playlistDays < 1 || playlistDays > 60) {
@@ -160,6 +161,10 @@ export function loadConfig() {
       connectAttempts: num('CONNECT_ATTEMPTS', 6),
       fetchTimeoutSec: num('FETCH_TIMEOUT_SEC', 180),
       pushAttempts: num('PUSH_ATTEMPTS', 2),
+      // Deep sleep: how long a button on the page waits for a display that is just waking up.
+      awakeWindowSec: 30,
+      // How long the NAS keeps trying to reach the display to send it to sleep.
+      sleepWindowSec: 60,
     },
 
     server: {
@@ -188,13 +193,12 @@ export function loadConfig() {
     retryMinutes: num('RETRY_MINUTES', 20),
     retries: num('RETRIES', 3),
 
-    // What the display does once a photo is up.
-    //   standby - power off with its Wi-Fi listener (network standby) on, so the next
-    //             update can wake it with Wake-on-LAN. The listener costs battery, and on
-    //             battery the EM32DX stops hearing Wake-on-LAN after many hours anyway.
-    //   deep    - network standby off, then power off: hardly any battery use, but nothing
-    //             on the network wakes it. It wakes itself at its "screen protection time"
-    //             (Samsung E-Paper app), and the scheduled update waits for it then.
+    // What the display does once a photo (or playlist) is up.
+    //   standby - power off with its Wi-Fi listener (network standby) on, so the next update
+    //             can wake it with Wake-on-LAN. The listener costs about 1.5% battery an hour,
+    //             and on battery the EM32DX stops hearing Wake-on-LAN after many hours.
+    //   deep    - network standby off, then power off: hardly any battery use, but nothing on
+    //             the network wakes it. Best with UPDATE_MODE=playlist.
     //   off     - leave it to the display's own settings (e.g. when it is on mains power)
     sleep: {
       mode: oneOf('SLEEP_MODE', 'standby', ['standby', 'deep', 'off']),
@@ -203,8 +207,7 @@ export function loadConfig() {
       // playlist mode this is also how the NAS notices the display is awake (someone pressed
       // its button, it is charging) to top up its playlist, so it looks more often.
       checkMin: num('SLEEP_CHECK_MIN', updateMode === 'playlist' ? 5 : 30),
-      // deep: how long a scheduled update waits for the display to wake itself. Playlist
-      // mode: how long the NAS looks for the display after each change.
+      // Playlist mode: how long the NAS looks for the display after each change.
       wakeWindowMin: num('WAKE_WINDOW_MIN', 15),
       confirmSec: 150, // after a sleep command, how long to wait for it to stop answering
       confirmEverySec: 15,

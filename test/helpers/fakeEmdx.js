@@ -1,17 +1,16 @@
-// A fake Samsung EMDX for tests: speaks the MDC handshake (banner, TLS, PIN),
-// answers commands, and on 0xC7 downloads content.json + the image like the
-// real display does. Power-off (0x11 0x00) puts it to sleep: it then refuses
-// connections until a Wake-on-LAN packet for its MAC arrives (only heard with
-// network standby on) or wake() (someone pressing its button). Like the EM32DX,
-// it refuses (NAKs) 0x25 with a timer payload. It answers the clock (0xA7) and,
-// unless `hasTimer` is false, refuses timer 1 (0xA4).
+// A fake Samsung EMDX for tests: speaks the MDC handshake (banner, TLS, PIN), answers
+// commands, and on 0xC7 downloads content.json and the images in it like the real display
+// does. Power-off (0x11 0x00) puts it to sleep: it then refuses connections until a
+// Wake-on-LAN packet for its MAC arrives (only heard with network standby on) or wake()
+// (someone pressing its button).
 //
-// Playlists: a content.json with several images is downloaded in full and then played
-// by itself: `state.playlistModel` 'push' (each image for its own duration, counted from
-// the download), 'equal' (every image for the first one's duration) or 'stuck' (never
-// moves on). On 0xC7/0x54 + URL it POSTs a thumbnail (the image it shows) to that URL,
-// unless `thumbnails` is false. It keeps Sleep After (0xC6/0x81) and "apply sleep mode
-// after content update" (0xC7/0x53 type 0x01).
+// A playlist (several images) is played by itself like the EM32DX does: each image for its
+// own duration, counted from the download, starting over after the last one (also while
+// asleep). With `state.wakeOnChangeMs`, it comes online for that long after each change, as the
+// EM32DX does briefly. On 0xC7/0x54 + URL it POSTs a thumbnail (the image it shows) to that URL;
+// with `thumbnails` false it takes the request and sends nothing, like the EM32DX. It keeps
+// Sleep After (0xC6/0x81) and "apply sleep mode after content update" (0xC7/0x53 type 0x01).
+// `state.battery` changes the battery level.
 import dgram from 'node:dgram';
 import net from 'node:net';
 import tls from 'node:tls';
@@ -32,9 +31,7 @@ function reply(sock, displayId, cmd, payload = [], ack = true) {
   sock.write(Buffer.from([0xaa, ...body, checksum]));
 }
 
-// `thumbnailPath`: post thumbnails to this path on the given host instead of the URL's own
-// path (e.g. '/device-thumbnail', the Samsung app's).
-export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage = true, mac = '02:00:00:00:00:01', thumbnails = true, thumbnailPath = null } = {}) {
+export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage = true, mac = '02:00:00:00:00:01', thumbnails = true } = {}) {
   const { key, cert } = makeCert();
   // Events look like 'auth', 'cmd:1b', 'cmd:b5:1' (hex command, decimal payload), 'wol'.
   const events = [];
@@ -44,14 +41,14 @@ export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage =
   // (Infinity: all of them).
   const state = {
     awake: true, networkStandby: true, hearsWol: true, ignoresPowerOff: 0, pluggedIn: false,
-    sleepAfter: [0x07], applySleep: false, playlistModel: 'push', playing: null, thumbnailsPosted: 0,
+    sleepAfter: [0x07], applySleep: false, playing: null, thumbnailsPosted: 0, wakeOnChangeMs: 0,
   };
   // The image it shows now (playlists move on by themselves).
   const showing = () => {
     const p = state.playing;
     if (!p) return null;
-    if (p.images.length === 1 || state.playlistModel === 'stuck') return { index: 0, ...p };
-    const ds = state.playlistModel === 'equal' ? p.durations.map(() => p.durations[0]) : p.durations;
+    if (p.images.length === 1) return { index: 0, ...p };
+    const ds = p.durations;
     let x = (Date.now() - p.startedAt) % ds.reduce((a, b) => a + b, 0);
     let index = 0;
     while (x >= ds[index]) x -= ds[index++];
@@ -68,7 +65,6 @@ export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage =
     form.append('schedule_downloaded_timestamp', String(now?.startedAt || 0));
     form.append('thumbnail_timestamp', String(Date.now()));
     if (now) form.append('file', new Blob([now.images[now.index]], { type: 'image/png' }), 'thumbnail.png');
-    if (thumbnailPath) url = new URL(thumbnailPath, url).href;
     try {
       await fetch(url, { method: 'POST', body: form });
       state.thumbnailsPosted++;
@@ -112,17 +108,13 @@ export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage =
         if (len > 2 && payload[1] === 0x01) state.applySleep = payload[2] === 0x01;
         return reply(sock, id, cmd, [0x53, 0x01, state.applySleep ? 0x01 : 0x00]);
       }
-      if (cmd === 0xc7 && sub === 0x54) {
-        if (!thumbnails) return reply(sock, id, cmd, [0x00], false);
+      if (cmd === 0xc7 && sub === 0x54) { // (like the EM32DX: takes the request, and with thumbnails off sends nothing)
         const url = payload.subarray(1).toString();
         reply(sock, id, cmd, [0x54]);
-        setTimeout(() => postThumbnail(url), 20);
+        if (thumbnails) setTimeout(() => postThumbnail(url), 20);
         return;
       }
-      if (cmd === 0x1b) return reply(sock, id, cmd, [0x73, 0x00, 0x01, 0x00, battery, 0x00, state.pluggedIn ? 0x02 : 0x00]);
-      if (cmd === 0x25 && len > 1) return reply(sock, id, cmd, [0x01], false);
-      if (cmd === 0xa7 && !len) return reply(sock, id, cmd, [16, 1, 5, 10, 0x07, 0xea, 0x00]); // 16 Oct 2026 13:05
-      if (cmd === 0xa4 && !len) return reply(sock, id, cmd, [0x01], false);
+      if (cmd === 0x1b) return reply(sock, id, cmd, [0x73, 0x00, 0x01, 0x00, state.battery ?? battery, 0x00, state.pluggedIn ? 0x02 : 0x00]);
       if (cmd === 0xb5 && !len) return reply(sock, id, cmd, [state.networkStandby ? 0x01 : 0x00]);
       if (cmd === 0xb5 && len) state.networkStandby = payload[0] === 0x01;
       if (cmd === 0x11 && len && payload[0] === 0x00) {
@@ -156,6 +148,21 @@ export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage =
   });
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
 
+  // Coming online after a change of the playlist (wakeOnChangeMs), then dozing off again.
+  let lastIndex = null;
+  let dozeTimer = null;
+  const changeWatch = setInterval(() => {
+    const now = showing();
+    const index = now && now.images.length > 1 ? now.index : null;
+    if (index !== null && lastIndex !== null && index !== lastIndex && state.wakeOnChangeMs && !state.awake) {
+      state.awake = true;
+      events.push('woke-after-change');
+      clearTimeout(dozeTimer);
+      dozeTimer = setTimeout(() => { state.awake = false; }, state.wakeOnChangeMs);
+    }
+    lastIndex = index;
+  }, 50);
+
   // Wake-on-LAN: 6 x 0xFF followed by the MAC 16 times.
   const magic = Buffer.concat([Buffer.alloc(6, 0xff), ...Array(16).fill(Buffer.from(mac.replace(/:/g, ''), 'hex'))]);
   const wol = dgram.createSocket('udp4');
@@ -176,6 +183,6 @@ export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage =
     state,
     showing,
     wake() { state.awake = true; },
-    close: () => new Promise((r) => { wol.close(); server.close(r); }),
+    close: () => new Promise((r) => { clearInterval(changeWatch); clearTimeout(dozeTimer); wol.close(); server.close(r); }),
   };
 }

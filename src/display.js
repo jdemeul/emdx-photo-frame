@@ -1,23 +1,11 @@
-// Talking to the Samsung EMDX over Samsung MDC (TCP 1515, TLS + PIN), using
-// @weejewel/samsung-mdc. The update trick is the one from
-// github.com/WeeJeWel/node-samsung-emdx: tell the display (MDC command 0xC7) to
-// download a small JSON "schedule" from our HTTP server, which points at the image.
-//
-// Sleep uses two more MDC commands that the EM32DX accepts (see the command notes in
-// github.com/taylorRichie/node-samsung-emdx): 0x11 power (0x00 = off) and 0xB5 network
-// standby, the Wi-Fi listener that Wake-on-LAN needs. With network standby off (deep
-// sleep), nothing on the network wakes the display: Wake-on-LAN reached it half a minute
-// into deep sleep but not seven hours later, and on battery even network standby stops
-// hearing it after many hours. The display does wake itself once a day for its "screen
-// protection time" (set in the Samsung E-Paper app). The EM32DX refuses 0x25, which those
-// notes list as an on-timer; "Check display" also reads Samsung's standard MDC clock
-// (0xA7) and timer 1 (0xA4), to see whether those are a way to set a wake-up time.
-//
-// From Samsung's own E-Paper app (Android 1.3.3, decompiled): 0xC7 with sub-command 0x53
-// and type 0x01 is "apply sleep mode after content update", 0xC7/0x54 + a URL makes the
-// display POST a thumbnail of its screen to that URL, 0xC6/0x81 is "Sleep After" and 0xCB
-// lists optional features. The same app sends playlists as one schedule entry with several
-// images, each with its own duration in milliseconds.
+// Talking to the Samsung EMDX over Samsung MDC (TCP 1515, TLS + PIN), with
+// @weejewel/samsung-mdc. Content goes the way Samsung's E-Paper app sends it (and
+// github.com/WeeJeWel/node-samsung-emdx): MDC 0xC7 points the display at a JSON manifest on our
+// HTTP server, and the display downloads it and the images in it. Sleep uses 0x11 (power off)
+// and 0xB5 (network standby, the Wi-Fi listener that Wake-on-LAN needs). The other commands here
+// come from Samsung's Android app (decompiled): 0xC7/0x53 type 0x01 "apply sleep mode after
+// content update", 0xC7/0x54 a thumbnail of the screen, 0xC6/0x81 "Sleep After", 0xCB optional
+// features. What the EM32DX does with them: docs/findings.md.
 import dgram from 'node:dgram';
 import { Device } from '@weejewel/samsung-mdc';
 import { log } from './log.js';
@@ -26,15 +14,12 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const CMD_POWER = 0x11;
 const CMD_NETWORK_STANDBY = 0xb5;
-const CMD_TIMER1 = 0xa4;
-const CMD_CLOCK = 0xa7;
 const CMD_CONTENT = 0xc7; // sub 0x53: content download (type 0x80) / apply sleep after update (type 0x01); 0x54: thumbnail
 const CMD_SLEEP_AFTER = 0xc6; // sub 0x81
 const CMD_FEATURES = 0xcb;
 
 // "Sleep After" codes, as the Samsung app sets them (0xF0 = custom, followed by 2 bytes).
 const SLEEP_AFTER_TEXT = { 0x00: 'off', 0x06: '5 min', 0x07: '10 min', 0x08: '20 min', 0x09: '30 min', 0x0a: '60 min' };
-export const SLEEP_AFTER_10_MIN = [0x07];
 
 const hex = (bytes) => Array.from(bytes || []).map((x) => x.toString(16).padStart(2, '0')).join(' ');
 
@@ -76,8 +61,8 @@ async function cmd(device, commandId, data, what) {
   }
 }
 
-// Wake-on-LAN magic packet (6 x 0xFF, then the MAC 16 times). Sent with the broadcast
-// flag always on, so a subnet broadcast address (e.g. 192.168.1.255) works too.
+// Wake-on-LAN magic packet (6 x 0xFF, then the MAC 16 times). Sent with the broadcast flag
+// always on, so a subnet broadcast address (e.g. 192.168.1.255) works too.
 export async function sendWakeOnLan(cfg) {
   const d = cfg.display;
   if (!d.mac) throw new Error('EMDX_MAC is not set');
@@ -97,10 +82,10 @@ export async function sendWakeOnLan(cfg) {
   }
 }
 
-// Connect, sending Wake-on-LAN first when a MAC is known (unless `wol` is false). By
-// default this makes CONNECT_ATTEMPTS tries; with `windowSec` it keeps trying until that
-// much time has passed. `quiet`: progress at debug level (the caller reports the outcome).
-// The device gets `waitedSec`: how long it took to answer, when it needed more than one try.
+// Connect, sending Wake-on-LAN first when a MAC is known (unless `wol` is false). By default
+// this makes CONNECT_ATTEMPTS tries; with `windowSec` it keeps trying until that much time has
+// passed. `quiet`: progress at debug level (the caller reports the outcome). The device gets
+// `waitedSec`: how long it took to answer, when it needed more than one try.
 async function connect(cfg, { windowSec = 0, quiet = false, wol = true } = {}) {
   const d = cfg.display;
   if (!d.host) throw new Error('EMDX_HOST is not set');
@@ -144,8 +129,33 @@ async function connect(cfg, { windowSec = 0, quiet = false, wol = true } = {}) {
   throw e;
 }
 
-// Switch network standby (the Wi-Fi listener Wake-on-LAN needs) on or off, if it isn't
-// already. Returns what it was: true, false, or null when it couldn't be read.
+// Connect (options as for connect()), run fn(device), disconnect.
+export async function withDisplay(cfg, opts, fn) {
+  const device = await connect(cfg, opts);
+  try {
+    return await fn(device);
+  } finally {
+    await close(device);
+  }
+}
+
+// One quick connection attempt without Wake-on-LAN: is the display awake right now?
+export async function probeDisplay(cfg) {
+  const d = cfg.display;
+  const device = new Device({ host: d.host, port: d.port, pin: d.pin });
+  try {
+    await withTimeout(device.connect(), 6000, 'Probe');
+    guard(device);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    await close(device);
+  }
+}
+
+// Switch network standby on or off, if it isn't already. Returns what it was: true, false, or
+// null when it couldn't be read.
 async function setNetworkStandby(device, on) {
   let was = null;
   try {
@@ -162,18 +172,17 @@ async function setNetworkStandby(device, on) {
   return was;
 }
 
-// Push an image. `networkStandby` true/false switches network standby on/off during the
-// update (null leaves it alone): the display may go to sleep by itself before the NAS
-// sends it to sleep, and then sleeps the way it is set. `connect`: options for finding
-// the display (see connect()). Returns { battery, waitedSec }; throws when the display
-// never fetched the image.
+// Push one image (a PNG for the display).
 export function pushToDisplay(cfg, server, png, opts = {}) {
   return pushContent(cfg, server, { items: [{ buf: png, ext: 'png' }] }, opts);
 }
 
 // Push content: one image, or a playlist ({ items: [{ buf or file, durationMs }], contentType:
 // 'PlaylistContent' }), which the display downloads in full and then plays by itself.
-// Waits until the display has fetched every image; options as for pushToDisplay().
+// `networkStandby` true/false switches network standby on/off during the update (null leaves
+// it alone): the display may go to sleep by itself before the NAS sends it to sleep, and then
+// sleeps the way it is set. `connect`: options for finding the display (see connect()).
+// Waits until the display has fetched every image. Returns { battery, waitedSec }.
 export async function pushContent(cfg, server, content, { networkStandby = null, connect: connectOpts = {} } = {}) {
   const d = cfg.display;
   const push = server.registerContent(content);
@@ -219,76 +228,16 @@ export async function pushContent(cfg, server, content, { networkStandby = null,
     push.done();
   }
   throw new Error(
-    `The display accepted the command but never downloaded ${push.imageUrl}. ` +
-      'Check that it can reach this NAS on that address (SERVER_HOST, HTTP_PORT, NAS firewall).',
+    `The display accepted the command but never downloaded ${push.imageUrl}. `
+      + 'Check that it can reach this NAS on that address (SERVER_HOST, HTTP_PORT, NAS firewall).',
   );
 }
 
-// Connect (Wake-on-LAN first when a MAC is known; options as for connect()), run fn(device),
-// disconnect.
-export async function withDisplay(cfg, opts, fn) {
-  const device = await connect(cfg, opts);
-  try {
-    return await fn(device);
-  } finally {
-    await close(device);
-  }
-}
-
-// Answers to sub-commands start with the sub-command itself; drop it.
-const stripSub = (sub, r) => [...(r?.[0] === sub ? r.subarray(1) : r || [])];
-
-// "Sleep After" (0xC6/0x81), the display's own inactivity timer: [code] or [0xF0, hi, lo].
-export async function getSleepAfter(device) {
-  return stripSub(0x81, await cmd(device, CMD_SLEEP_AFTER, [0x81], 'Reading Sleep After'));
-}
-
-export async function setSleepAfter(device, bytes) {
-  await cmd(device, CMD_SLEEP_AFTER, [0x81, ...bytes], 'Setting Sleep After');
-}
-
-export function formatSleepAfter(bytes) {
-  if (!bytes?.length) return 'unknown';
-  if (bytes[0] === 0xf0 && bytes.length >= 3) return `custom (${(bytes[1] << 8) | bytes[2]})`;
-  return SLEEP_AFTER_TEXT[bytes[0]] ?? `code ${bytes[0]}`;
-}
-
-// "Apply sleep mode after content update" (0xC7/0x53, type 0x01): sleep as soon as an update
-// has been shown. Returns true/false, or null for an answer we don't understand.
-export async function getApplySleep(device) {
-  const d = stripSub(0x53, await cmd(device, CMD_CONTENT, [0x53], 'Reading "apply sleep mode after content update"'));
-  return d.length >= 2 && d[0] === 0x01 ? d[1] === 0x01 : null;
-}
-
-export async function setApplySleep(device, on) {
-  await cmd(device, CMD_CONTENT, [0x53, 0x01, on ? 0x01 : 0x00], `Turning "apply sleep mode after content update" ${on ? 'on' : 'off'}`);
-}
-
-// Ask the display to POST a thumbnail of what it shows to `url` (0xC7/0x54 + URL).
-export async function requestThumbnail(device, url) {
-  if (url.length > 250) throw new Error('Thumbnail URL is too long for MDC');
-  await cmd(device, CMD_CONTENT, [0x54, ...Buffer.from(url)], 'Asking for a thumbnail');
-}
-
-// Optional features (0xCB): bit 0 of the second byte = a low-power (2.4 GHz) Wi-Fi module
-// that Samsung's app uses for remote wake-up.
-export async function getFeatures(device) {
-  const r = await cmd(device, CMD_FEATURES, [], 'Reading features');
-  return { lowPowerWifi: r.length > 1 ? (r[1] & 1) === 1 : null, raw: hex(r) };
-}
-
-export async function getNetworkStandby(device) {
-  return (await cmd(device, CMD_NETWORK_STANDBY, [], 'Reading network standby'))[0] === 0x01;
-}
-
-export { setNetworkStandby };
-
-// Put the display to sleep, then power it off. With `networkStandby` (standby), network
-// standby is switched on first so that Wake-on-LAN can wake it; if that fails, the
-// display stays awake rather than risk being powered off out of reach. Without it
-// (deep sleep), network standby is switched off. Returns { battery }.
+// Put the display to sleep: network standby on (standby, so that Wake-on-LAN can wake it; if
+// that fails it stays awake rather than risk being powered off out of reach) or off (deep
+// sleep), then power off. Returns { battery }.
 export async function putToSleep(cfg, { networkStandby = true } = {}) {
-  const device = await connect(cfg, { windowSec: cfg.display.sleepWindowSec ?? 60, quiet: true });
+  const device = await connect(cfg, { windowSec: cfg.display.sleepWindowSec, quiet: true });
   let battery = null;
   try {
     try {
@@ -319,9 +268,9 @@ export async function putToSleep(cfg, { networkStandby = true } = {}) {
   return { battery };
 }
 
-// After a sleep command: did it really go to sleep? Probe without Wake-on-LAN (which
-// would wake it) until it stops answering. Returns the seconds that took, or null if
-// it still answers after `timeoutSec`.
+// After a sleep command: did it really go to sleep? Probe without Wake-on-LAN (which would
+// wake it) until it stops answering. Returns the seconds that took, or null if it still
+// answers after `timeoutSec`.
 export async function confirmAsleep(cfg, { timeoutSec = 150, everySec = 15 } = {}) {
   const start = Date.now();
   while (Date.now() - start < timeoutSec * 1000) {
@@ -331,64 +280,42 @@ export async function confirmAsleep(cfg, { timeoutSec = 150, everySec = 15 } = {
   return null;
 }
 
-// One quick connection attempt without Wake-on-LAN: is the display awake right now?
-export async function probeDisplay(cfg) {
-  const d = cfg.display;
-  const device = new Device({ host: d.host, port: d.port, pin: d.pin });
-  try {
-    await withTimeout(device.connect(), 6000, 'Probe');
-    guard(device);
-    return true;
-  } catch {
-    return false;
-  } finally {
-    await close(device);
-  }
+// Answers to sub-commands start with the sub-command itself; drop it.
+const stripSub = (sub, r) => [...(r?.[0] === sub ? r.subarray(1) : r || [])];
+
+// "Sleep After" (0xC6/0x81), the display's own inactivity timer, as text.
+export function formatSleepAfter(bytes) {
+  if (!bytes?.length) return 'unknown';
+  if (bytes[0] === 0xf0 && bytes.length >= 3) return `custom (${(bytes[1] << 8) | bytes[2]})`;
+  return SLEEP_AFTER_TEXT[bytes[0]] ?? `code ${bytes[0]}`;
 }
 
-// MDC clock (0xA7): day, hour (1-12), minute, month, year (2 bytes), AM (1) / PM (0).
-export function formatClock(b) {
-  const raw = `[${hex(b)}]`;
-  if (!b || b.length < 7) return `unexpected answer ${raw}`;
-  const [day, h12, min, month, y1, y2, am] = b;
-  if (h12 === 0xff || min === 0xff) return 'not set';
-  if (h12 < 1 || h12 > 12 || min > 59 || am > 1) return `unexpected answer ${raw}`;
-  const p = (n) => String(n).padStart(2, '0');
-  return `${(y1 << 8) | y2}-${p(month)}-${p(day)} ${p((h12 % 12) + (am ? 0 : 12))}:${p(min)}`;
+// Ask the display to POST a thumbnail of what it shows to `url` (0xC7/0x54 + URL).
+export async function requestThumbnail(device, url) {
+  if (url.length > 250) throw new Error('Thumbnail URL is too long for MDC');
+  await cmd(device, CMD_CONTENT, [0x54, ...Buffer.from(url)], 'Asking for a thumbnail');
 }
 
-// MDC timer 1 (0xA4): on time (hour 1-12, minute, AM/PM, active), off time (same), then
-// repeat, weekdays, (15-byte version: off repeat, off weekdays), volume, source, holidays.
-export function formatTimer(b) {
-  const raw = `[${hex(b)}]`;
-  if (!b || (b.length !== 13 && b.length !== 15)) return `unexpected answer ${raw}`;
-  const p = (n) => String(n).padStart(2, '0');
-  const time = (h, m, am) => (h === 0xff || m === 0xff ? 'not set' : `${p((h % 12) + (am ? 0 : 12))}:${p(m)}`);
-  const repeat = ['once', 'every day', 'Mon-Fri', 'Mon-Sat', 'Sat-Sun', 'chosen days'][b[8]] ?? `repeat ${b[8]}`;
-  const on = b[3] ? `on at ${time(b[0], b[1], b[2])} ${repeat}` : 'no on time';
-  const off = b[7] ? `off at ${time(b[4], b[5], b[6])}` : 'no off time';
-  return `${on}, ${off} ${raw}`;
-}
-
-// `thumbnailUrl`: also ask the display to POST a thumbnail of its screen there.
+// "Check display": name, firmware, battery and settings. `thumbnailUrl`: also ask the display
+// to POST a thumbnail of its screen there.
 export async function readDisplayInfo(cfg, { thumbnailUrl = null } = {}) {
   const device = await connect(cfg);
   try {
     const info = {};
-    const onOff = (v) => (v == null ? 'unknown' : v ? 'on' : 'off');
+    const onOff = (v) => (v ? 'on' : 'off');
     for (const [key, fn] of [
       ['name', () => device.getDeviceName()],
       ['serial', () => device.getSerialNumber()],
       ['software', () => device.getSoftwareVersion()],
       ['battery', () => device.getBatteryState()],
-      ['networkStandby', async () => ((await device.sendCommand({ commandId: CMD_NETWORK_STANDBY }))[0] === 0x01 ? 'on' : 'off')],
-      // Read only: a possible way to set a wake-up time (see the notes at the top).
-      ['clock', async () => formatClock(await cmd(device, CMD_CLOCK, [], 'Reading the clock'))],
-      ['onTimer', async () => formatTimer(await cmd(device, CMD_TIMER1, [], 'Reading timer 1'))],
-      // Settings from the Samsung app (see the notes at the top).
-      ['sleepAfter', async () => formatSleepAfter(await getSleepAfter(device))],
-      ['applySleep', async () => onOff(await getApplySleep(device))],
-      ['lowPowerWifi', async () => { const f = await getFeatures(device); return f.lowPowerWifi == null ? `unknown [${f.raw}]` : f.lowPowerWifi ? 'yes' : 'no'; }],
+      ['networkStandby', async () => onOff((await cmd(device, CMD_NETWORK_STANDBY, [], 'Reading network standby'))[0] === 0x01)],
+      ['sleepAfter', async () => formatSleepAfter(stripSub(0x81, await cmd(device, CMD_SLEEP_AFTER, [0x81], 'Reading Sleep After')))],
+      ['applySleep', async () => {
+        const d = stripSub(0x53, await cmd(device, CMD_CONTENT, [0x53], 'Reading "apply sleep mode after content update"'));
+        return d.length >= 2 && d[0] === 0x01 ? onOff(d[1] === 0x01) : `unknown [${hex(d)}]`;
+      }],
+      // Bit 0 of the second byte: a low-power (2.4 GHz) Wi-Fi module for remote wake-up (EMDX-A).
+      ['lowPowerWifi', async () => { const r = await cmd(device, CMD_FEATURES, [], 'Reading features'); return r.length > 1 ? ((r[1] & 1) ? 'yes' : 'no') : `unknown [${hex(r)}]`; }],
       ...(thumbnailUrl ? [['thumbnail', async () => { await requestThumbnail(device, thumbnailUrl); return 'asked'; }]] : []),
     ]) {
       try {

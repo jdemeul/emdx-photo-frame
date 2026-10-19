@@ -35,6 +35,19 @@ test('the display sleeps with network standby on by default; deep and off are th
   assert.throws(() => withEnv({ ...unset, SLEEP_MODE: 'nap' }, loadConfig), /SLEEP_MODE must be one of standby, deep, off/);
 });
 
+test('playlist mode looks for the display more often, and tops up no later than the playlist ends', () => {
+  const unset = { SLEEP_CHECK_MIN: null, PLAYLIST_DAYS: null, PLAYLIST_TOPUP_DAYS: null };
+  const push = withEnv({ ...unset, UPDATE_MODE: null }, loadConfig);
+  assert.deepEqual([push.update.mode, push.sleep.checkMin], ['push', 30]);
+  const daily = withEnv({ ...unset, UPDATE_MODE: 'playlist' }, loadConfig);
+  assert.deepEqual([daily.update.mode, daily.update.days, daily.update.topUpDays, daily.sleep.checkMin], ['playlist', 7, 7, 5]);
+  const long = withEnv({ ...unset, UPDATE_MODE: 'playlist', PLAYLIST_DAYS: '30' }, loadConfig);
+  assert.deepEqual([long.update.days, long.update.topUpDays], [30, 7]);
+  const short = withEnv({ ...unset, UPDATE_MODE: 'playlist', PLAYLIST_DAYS: '3' }, loadConfig);
+  assert.equal(short.update.topUpDays, 3);
+  assert.throws(() => withEnv({ ...unset, PLAYLIST_DAYS: '90' }, loadConfig), /PLAYLIST_DAYS must be a whole number from 1 to 60/);
+});
+
 test('a malformed EMDX_MAC is caught when the config loads', () => {
   assert.equal(withEnv({ EMDX_MAC: '02:00:00:00:00:01' }, loadConfig).display.mac, '02:00:00:00:00:01');
   assert.throws(() => withEnv({ EMDX_MAC: '02:00:00:00:01' }, loadConfig), /EMDX_MAC must be a MAC address/);
