@@ -141,14 +141,29 @@ export async function withDisplay(cfg, opts, fn) {
 
 // One quick connection attempt without Wake-on-LAN: is the display awake right now?
 export async function probeDisplay(cfg) {
+  return (await lookForDisplay(cfg)).awake;
+}
+
+// The same, and with `battery`, read the battery while connected. Returns { awake, battery }.
+export async function lookForDisplay(cfg, { battery: readBattery = false } = {}) {
   const d = cfg.display;
   const device = new Device({ host: d.host, port: d.port, pin: d.pin });
   try {
-    await withTimeout(device.connect(), 6000, 'Probe');
-    guard(device);
-    return true;
-  } catch {
-    return false;
+    try {
+      await withTimeout(device.connect(), 6000, 'Probe');
+      guard(device);
+    } catch {
+      return { awake: false, battery: null };
+    }
+    let battery = null;
+    if (readBattery) {
+      try {
+        battery = await withTimeout(device.getBatteryState(), 6000, 'Reading battery');
+      } catch (err) {
+        log.debug(`No battery info: ${err.message}`);
+      }
+    }
+    return { awake: true, battery };
   } finally {
     await close(device);
   }
@@ -182,7 +197,8 @@ export function pushToDisplay(cfg, server, png, opts = {}) {
 // `networkStandby` true/false switches network standby on/off during the update (null leaves
 // it alone): the display may go to sleep by itself before the NAS sends it to sleep, and then
 // sleeps the way it is set. `connect`: options for finding the display (see connect()).
-// Waits until the display has fetched every image. Returns { battery, waitedSec }.
+// Waits until the display has fetched every image. Returns { battery, waitedSec, content }
+// (`content`: what the NAS served, to serve it again after a restart).
 export async function pushContent(cfg, server, content, { networkStandby = null, connect: connectOpts = {} } = {}) {
   const d = cfg.display;
   const push = server.registerContent(content);
@@ -217,7 +233,7 @@ export async function pushContent(cfg, server, content, { networkStandby = null,
       const got = await push.waitForImages(d.fetchTimeoutSec * 1000);
       if (got === push.count) {
         log.info(`The display downloaded ${what}; it will refresh in a moment.`);
-        return { battery, waitedSec };
+        return { battery, waitedSec, content: push.saved() };
       }
       if (got > 0) {
         throw new Error(`The display downloaded ${got} of ${push.count} images, then stopped (nothing for ${d.fetchTimeoutSec}s).`);

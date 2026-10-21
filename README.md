@@ -47,7 +47,7 @@ Open `http://<NAS-IP>:8321` and press the display's power button to wake it.
 Use it with `SLEEP_MODE=deep`.
 
 - The NAS renders the photos for the coming `PLAYLIST_DAYS` (default 7, up to 60) and sends them as the display's own playlist: the photo for now until the next `SCHEDULE` time, then one photo per change. The display changes the photo by itself and sleeps in between, with its Wi-Fi off.
-- After each change the EM32DX comes online briefly. The NAS looks for it then (for up to `WAKE_WINDOW_MIN`), reads its battery and sends it straight back to sleep. Once fewer than `PLAYLIST_TOPUP_DAYS` (7) days are left on it, the NAS sends a fresh playlist instead. No button presses needed.
+- After each change the EM32DX comes online briefly. The NAS looks for it then (for up to `WAKE_WINDOW_MIN`) and reads its battery. Once fewer than `PLAYLIST_TOPUP_DAYS` (7) days are left on it, the NAS sends a fresh playlist; otherwise it leaves the display alone, and the display goes back to sleep by itself. No button presses needed.
 - A fresh playlist starts with the photo already on the frame, so nothing changes on screen. If none arrives in time, the display starts its playlist over, still at the change times. Changes follow `SCHEDULE` in your time zone, also across daylight-saving switches.
 - **How long a playlist?** Each photo goes to the display as a full-colour PNG of typically 2–4 MB, so 30 days come to roughly 60–130 MB; the display has 8 GB of storage. What costs battery is the download (Wi-Fi on for as long as it takes), not changing the photo. A long playlist that is only topped up in its last week therefore means a few big downloads instead of many. The page lists the battery for every day.
 
@@ -57,7 +57,7 @@ At every `SCHEDULE` time the NAS renders the next photo and sends it, so the dis
 
 ### Sleep
 
-Two minutes after an update (`SLEEP_DELAY_SEC`, time for the panel to redraw), the NAS powers the display off: with network standby off (`deep`), or on (`standby`), or it leaves sleeping to the display's own settings (`off`). It then checks that the display stopped answering, and if not, tries once more and reports it on the page. Every `SLEEP_CHECK_MIN` minutes (5 in playlist mode, 30 in push mode) it also checks, without waking it, that the display is still asleep. A display found awake (someone pressed its button, it is charging) gets what is waiting for it, a photo or a fresh playlist, or is put back to sleep.
+Two minutes after an update (`SLEEP_DELAY_SEC`, time for the panel to redraw), the NAS powers the display off: with network standby off (`deep`), or on (`standby`), or it leaves sleeping to the display's own settings (`off`). It then checks that the display stopped answering, and if not, tries once more and reports it on the page. Every `SLEEP_CHECK_MIN` minutes (5 in playlist mode, 30 in push mode) it also checks, without waking it, that the display is still asleep. A display found awake (someone pressed its button, it is charging) gets what is waiting for it, a photo or a fresh playlist, or is put back to sleep. In playlist mode the display also wakes up by itself and goes back to sleep by itself, so the NAS leaves it alone from 15 minutes before each change until 15 minutes after, and otherwise puts it back to sleep only when it was already awake at the previous check.
 
 ## 5. The web page
 
@@ -121,6 +121,7 @@ To try it without a display, leave `EMDX_HOST` empty: `docker build -t emdx-phot
 - **"Incorrect PIN"**: check `EMDX_PIN`. After several wrong PINs the display may block MDC for a while.
 - **"It is in deep sleep, where Wake-on-LAN does not reach it"**: press the display's power button, then the button on the page again (it waits up to 30 s for the display); or leave it to the next sleep check (every `SLEEP_CHECK_MIN` minutes), which sends whatever is waiting. In playlist mode the display also comes online by itself after each change.
 - **"Fresh playlist due"** (playlist mode): the display needs a new playlist. It gets one the next time it is online, after its next change or a press on its power button. Until then it keeps playing the playlist it has.
+- **The photo didn't change** (playlist mode): press the display's power button, then **Send playlist**. That starts a fresh playlist with the photo for today, so the display and the page agree again. Keep the display's own screen protection time (Samsung E-Paper app) away from the change time.
 - **"Could not connect"** (push mode): the display is asleep or offline. Check `EMDX_MAC`, its battery, and run `sleep-test`; try `WOL_BROADCAST` set to your network's broadcast address.
 - **"The display did not go to sleep"**: it took the power-off command but kept answering, so it is using battery. The NAS tries again at every sleep check.
 - **Album errors**: run `check-album`. If it fails while the link opens fine in a browser, Google probably changed the page format; the frame keeps using the cached list meanwhile.

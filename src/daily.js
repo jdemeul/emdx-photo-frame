@@ -22,7 +22,7 @@ import crypto from 'node:crypto';
 import sharp from 'sharp';
 import { log } from './log.js';
 import { markShown } from './selector.js';
-import { pushContent, probeDisplay } from './display.js';
+import { pushContent, lookForDisplay } from './display.js';
 import { changeClock, slotKey, dayLabel, buildBatch, positionAt } from './playlist.js';
 import { matchThumbnail } from './thumbMatch.js';
 
@@ -202,7 +202,7 @@ export class DailyPlaylist {
     log.info(`Playlist: sending ${batch.items.length} photos: ${first.at > now ? `${this.label(first.at)}'s photo (a little early)` : 'the photo for now'} until ${when(first.to)}, `
       + `then one per change until ${when(batch.endsAt)}. If no fresh playlist arrives by then, the display starts over.`);
     try {
-      const { battery } = await pushContent(cfg, app.server, {
+      const { battery, content } = await pushContent(cfg, app.server, {
         items: seq.map((it) => ({ file: this.file(it, 'device.png'), durationMs: it.durationMs })),
         contentType: 'PlaylistContent',
         name: 'Daily photos',
@@ -211,6 +211,8 @@ export class DailyPlaylist {
       this.st.batch = {
         builtAt: batch.builtAt, sentAt: Date.now(), reason, schedule: cfg.schedule, days: cfg.update.days,
         items: batch.items.map(strip), tail: batch.tail ? strip(batch.tail) : null, endsAt: batch.endsAt, count: seq.length,
+        // What the display downloaded, to serve it again after a restart.
+        content: content && { id: content.id, json: content.json, files: content.files.map((f, i) => ({ ...f, dir: seq[i].dir })) },
       };
       this.st.pending = null;
       this.st.replaced = null;
@@ -315,9 +317,10 @@ export class DailyPlaylist {
   }
 
   // After a change, probe (no Wake-on-LAN) every watchEverySec for WAKE_WINDOW_MIN: the EM32DX
-  // comes online briefly after changing the photo. Then it gets a fresh playlist if one is due,
-  // otherwise it is sent straight back to sleep; either way the battery is read. (The sleep
-  // check may find it first: foundAwake() notes that, and the check handles it.)
+  // comes online briefly after changing the photo. The probe reads its battery, and a fresh
+  // playlist goes out if one is due. Otherwise the NAS leaves it alone: it goes back to sleep by
+  // itself. (On 21 Oct 2026 the photo did not change after the NAS had sent the display to sleep
+  // seconds after it came online, and 3 minutes before the change.)
   async watchAfterChange() {
     const app = this.app;
     const cfg = this.cfg;
@@ -325,15 +328,15 @@ export class DailyPlaylist {
     const rec = { at: start, key: slotKey(this.clock.prev(start) ?? start, cfg.timezone), until: start + cfg.sleep.wakeWindowMin * 60000, online: null };
     this.st.changes = [rec, ...this.st.changes].slice(0, 30);
     app.store.save();
-    let mine = false;
+    let battery = null;
     this.watch = rec;
     try {
-      while (Date.now() < rec.until && !rec.online) {
+      while (Date.now() < rec.until) {
         // (Not while it is awake because of something the NAS did, e.g. a playlist just sent.)
         if (!app.busy && !app.sleepTimer) {
-          let awake = false;
-          try { awake = await app.exclusive('Looking for the display after the change', () => probeDisplay(cfg)); } catch { /* busy */ }
-          if (awake && !rec.online) { rec.online = Date.now(); mine = true; break; }
+          let found = null;
+          try { found = await app.exclusive('Looking for the display after the change', () => lookForDisplay(cfg, { battery: true })); } catch { /* busy */ }
+          if (found?.awake) { rec.online = Date.now(); battery = found.battery; break; }
         }
         await pause(cfg.update.watchEverySec * 1000);
       }
@@ -345,14 +348,15 @@ export class DailyPlaylist {
       log.info(`Playlist: the display did not come online within ${cfg.sleep.wakeWindowMin} min of the change.`);
       return;
     }
-    log.info(`Playlist: the display came online ${Math.round((rec.online - start) / 1000)} s after the change${mine ? '' : ' (found by the sleep check)'}.`);
-    if (!mine) return;
     const event = app.noteWake({ afterChange: true });
+    app.noteBattery(battery);
+    log.info(`Playlist: the display came online ${Math.round((rec.online - start) / 1000)} s after the change`
+      + `${battery?.batteryPercent != null ? ` (battery ${battery.batteryPercent}%)` : ''}.`);
     try {
       let sent = false;
       try { sent = await this.onAwake('after a change'); } catch (err) { log.warn(`Playlist: ${err.message}`); }
       if (sent) event.sent = 'playlist';
-      else if (cfg.sleep.mode !== 'off') await app.sleepNow().catch((err) => log.warn(`Could not put the display to sleep: ${err.message}`));
+      else log.info('Playlist: nothing to send; the display goes back to sleep by itself.');
     } finally {
       app.finishWake(event);
       if (event.battery != null) rec.battery = event.battery;
@@ -360,12 +364,27 @@ export class DailyPlaylist {
     }
   }
 
-  // The sleep check found the display awake: if that is within the watch after a change, it came
-  // online after the change (and the check takes care of it).
-  foundAwake(event) {
-    if (!this.watch || this.watch.online) return;
-    this.watch.online = event.at;
-    event.afterChange = true;
+  // Whether the sleep check should leave the display alone: from update.quietSec before a change
+  // until as long after it (and while the NAS looks for it after the change). The display wakes
+  // up by itself around a change (to change the photo; an EM32DX was also found awake 3 minutes
+  // before one, probably for its daily screen refresh), and the NAS has no business with it then.
+  nearChange(now = Date.now()) {
+    if (this.watch) return true;
+    const next = this.clock.next(now);
+    const prev = this.clock.prev(now);
+    if (next == null || prev == null) return false;
+    // (With changes less than an hour apart, a quarter of the gap on either side.)
+    const quiet = Math.min(this.cfg.update.quietSec * 1000, (next - prev) / 4);
+    return next - now < quiet || now - prev < quiet;
+  }
+
+  // After a restart: serve the playlist on the display again (the NAS's addresses for it are
+  // forgotten otherwise), in case the display asks for it again.
+  serveAgain() {
+    const c = this.st.batch?.content;
+    if (!c || !this.app.server?.restoreContent) return;
+    const n = this.app.server.restoreContent({ id: c.id, json: c.json, files: c.files.map((f) => ({ ...f, file: this.file(f, 'device.png') })) });
+    log.debug(`Playlist: serving the playlist on the display again (${n} of ${c.files.length} images).`);
   }
 
   // The display answers (button, charger, or by itself after a change): note what it shows,
@@ -441,6 +460,7 @@ export class DailyPlaylist {
   // what happens next. With RUN_ON_START, also try to send the playlist.
   async startup({ send = false } = {}) {
     const app = this.app;
+    this.serveAgain();
     try {
       await app.exclusive('Preparing the coming photos', async () => {
         this.advance();

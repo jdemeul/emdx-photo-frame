@@ -117,6 +117,26 @@ test('spring forward: 02:30 does not exist on 28 Mar 2027, so that change comes 
   assert.deepEqual([slotKey(x, TZ), slotKey(y, TZ)], ['2026-10-17 17:00:12', '2026-10-17 17:00:24']);
 });
 
+test('the sleep check leaves the display alone from 15 minutes before a change until 15 minutes after', async () => {
+  const { DailyPlaylist } = await import('../src/daily.js');
+  const app = {
+    cfg: { schedule: '0 6 * * *', timezone: TZ, update: { days: 30, topUpDays: 7, quietSec: 15 * 60 } },
+    state: {},
+    store: { save() {}, path: (...p) => path.join(os.tmpdir(), 'no-such-dir', ...p) },
+  };
+  const daily = new DailyPlaylist(app);
+  const quiet = (hm) => daily.nearChange(at(`2026-10-21T${hm}:00+02:00`));
+  assert.deepEqual(['05:02', '05:44', '05:46', '05:57', '06:00', '06:14', '06:16', '12:00'].map(quiet),
+    [false, false, true, true, true, true, false, false]);
+  daily.watch = { at: at('2026-10-21T06:00:00+02:00') }; // still looking for it after the change
+  assert.equal(quiet('06:16'), true);
+  // Changes every 20 minutes: 5 minutes on either side, so the sleep check still runs in between.
+  app.cfg.schedule = '*/20 * * * *';
+  const often = new DailyPlaylist(app);
+  const quietOften = (hm) => often.nearChange(at(`2026-10-21T${hm}:00+02:00`));
+  assert.deepEqual(['06:04', '06:06', '06:14', '06:16'].map(quietOften), [true, false, false, true]);
+});
+
 test('a long playlist gets a fresh one only once it runs short (PLAYLIST_TOPUP_DAYS)', async () => {
   const { DailyPlaylist } = await import('../src/daily.js');
   const app = {
@@ -207,7 +227,7 @@ test('playlist mode: plan, send when found awake, the display moves on by itself
     const { FrameApp } = await import('../src/app.js');
     const { createServer } = await import('../src/server.js');
     const cfg = loadConfig();
-    Object.assign(cfg.update, { minFirstSec: 1, minTailSec: 0.2, watchEverySec: 0.5, thumbTimeoutSec: 3 });
+    Object.assign(cfg.update, { minFirstSec: 1, minTailSec: 0.2, watchEverySec: 0.5, thumbTimeoutSec: 3, quietSec: 0.5 });
     Object.assign(cfg.sleep, { confirmSec: 2, confirmEverySec: 0.2 });
     Object.assign(cfg.display, { sleepWindowSec: 1, awakeWindowSec: 1 });
     const app = new FrameApp(cfg, new Store(dataDir), buildPaletteModel(cfg.image.measuredPalette, DEVICE_PALETTE));
@@ -252,12 +272,16 @@ test('playlist mode: plan, send when found awake, the display moves on by itself
     assert.equal(app.daily.due(), null);
     await until(() => app.state.sleep?.asleep && !emdx.state.awake);
 
-    // Found awake again before the next change: nothing due, so back to sleep.
+    // Found awake again before the next change, with nothing due: it goes back to sleep by itself,
+    // so the NAS leaves it alone; still awake at the next check, it is sent to sleep.
     emdx.wake();
+    assert.equal(await app.checkAsleep(), true);
+    assert.equal(app.state.wakeEvents[0].leftAlone, true);
+    assert.equal(emdx.state.awake, true);
+    assert.equal(pl().seen[0].seen, pl().seen[0].expected);
     assert.equal(await app.checkAsleep(), true);
     assert.equal(app.state.wakeEvents[0].putBack, true);
     assert.equal(emdx.state.awake, false);
-    assert.equal(pl().seen[0].seen, pl().seen[0].expected);
 
     // At the change the display moves on by itself (in deep sleep); the NAS notes it, looks for
     // the display for a while (it stays offline) and prepares the photo for the new last day.
@@ -344,7 +368,7 @@ test('playlist mode: plan, send when found awake, the display moves on by itself
   }
 });
 
-test('playlist mode: the display comes online after each change; the NAS logs the battery and sends it back to sleep, tops it up when it runs short, and stops asking for thumbnails that never come', { skip: !hasOpenssl && 'openssl not available', timeout: 180000 }, async () => {
+test('playlist mode: the display comes online after each change; the NAS reads the battery and leaves it alone, tops it up when it runs short, stops asking for thumbnails that never come, and serves the playlist again after a restart', { skip: !hasOpenssl && 'openssl not available', timeout: 180000 }, async () => {
   const { startFakeEmdx } = await import('./helpers/fakeEmdx.js');
   const emdx = await startFakeEmdx({ pin: '626262', thumbnails: false });
   emdx.state.wakeOnChangeMs = 6000;
@@ -365,7 +389,7 @@ test('playlist mode: the display comes online after each change; the NAS logs th
     const { FrameApp } = await import('../src/app.js');
     const { createServer } = await import('../src/server.js');
     const cfg = loadConfig();
-    Object.assign(cfg.update, { minFirstSec: 1, minTailSec: 0.2, watchEverySec: 0.3, thumbTimeoutSec: 1 });
+    Object.assign(cfg.update, { minFirstSec: 1, minTailSec: 0.2, watchEverySec: 0.3, thumbTimeoutSec: 1, quietSec: 0.5 });
     Object.assign(cfg.sleep, { confirmSec: 2, confirmEverySec: 0.2 });
     Object.assign(cfg.display, { sleepWindowSec: 1, awakeWindowSec: 1 });
     const app = new FrameApp(cfg, new Store(dataDir), buildPaletteModel(cfg.image.measuredPalette, DEVICE_PALETTE));
@@ -376,13 +400,14 @@ test('playlist mode: the display comes online after each change; the NAS logs th
     const clock = app.daily.clock;
     const pl = () => app.state.playlist;
     const asks = () => emdx.events.filter((e) => e.startsWith('cmd:c7/54')).length;
+    const powerOffs = () => emdx.events.filter((e) => e === 'cmd:11:0').length;
     const nextChange = async () => {
       await sleepMs(clock.next(Date.now()) - Date.now() + 100);
       await app.scheduled('schedule');
     };
 
     // The first playlist, sent when found awake (one thumbnail request, unanswered).
-    await sleepMs(clock.next(Date.now()) - Date.now() + 300);
+    await sleepMs(clock.next(Date.now()) - Date.now() + 600);
     await app.daily.startup();
     assert.equal(await app.checkAsleep(), true);
     assert.equal(app.state.wakeEvents[0].sent, 'playlist');
@@ -390,17 +415,21 @@ test('playlist mode: the display comes online after each change; the NAS logs th
     await until(() => app.state.sleep?.asleep && !emdx.state.awake);
     const first = pl().batch.sentAt;
 
-    // Change 1: online after the change; 2 days still to come, so no top-up: battery read, back to sleep.
+    // Change 1: online after the change; 2 days still to come, so no top-up. The battery is read,
+    // and the NAS sends no power-off command: the display goes back to sleep by itself.
     emdx.state.battery = 86;
+    const offs = powerOffs();
     await nextChange();
     const c1 = pl().changes[0];
     assert.ok(c1.online, 'came online after the change');
+    assert.equal(c1.battery, 86);
     assert.equal(app.state.wakeEvents[0].afterChange, true);
     assert.equal(app.state.wakeEvents[0].battery, 86);
     assert.equal(pl().batch.sentAt, first);
-    assert.equal(emdx.state.awake, false);
     assert.equal(app.state.batteryLog.at(-1).percent, 86);
     assert.equal(asks(), 1);
+    await until(() => !emdx.state.awake);
+    assert.equal(powerOffs(), offs);
 
     // Change 2: only 1 day left, so it gets a fresh playlist. (Thumbnail request 2.)
     emdx.state.battery = 85;
@@ -426,6 +455,26 @@ test('playlist mode: the display comes online after each change; the NAS logs th
     assert.ok(status.playlist.changes.slice(0, 3).every((c) => c.online && c.battery != null), JSON.stringify(status.playlist.changes));
     assert.ok(status.check === null || status.check.wakeEvents.every((e) => e.afterChange || e.sent));
     assert.equal(status.batteryDays[0].percent, 85); // (readings within half an hour: the latest)
+
+    // After a restart the NAS forgets what it served, unless it serves the playlist on the
+    // display again, under the same addresses.
+    const last = emdx.received.at(-1);
+    const imageUrl = last.content.schedule[0].contents[1].image_url;
+    const contentUrl = imageUrl.replace(/[^/]+$/, 'content.json');
+    await server.close();
+    await sleepMs(200); // (so that fetch notices the old connections are gone)
+    const server2 = createServer(cfg, app);
+    app.server = server2;
+    await server2.listen();
+    cleanups.push(() => server2.close());
+    assert.equal((await fetch(contentUrl)).status, 404);
+    await app.daily.startup();
+    const manifest = await fetch(contentUrl);
+    assert.equal(manifest.status, 200);
+    assert.deepEqual(await manifest.json(), last.content);
+    const img = await fetch(imageUrl);
+    assert.equal(img.status, 200);
+    assert.ok(Buffer.from(await img.arrayBuffer()).equals(last.images[1]));
   } finally {
     for (const k of ['PHOTO_DIR', 'UPDATE_MODE', 'PLAYLIST_DAYS', 'PLAYLIST_TOPUP_DAYS', 'SCHEDULE', 'PANEL_WIDTH', 'PANEL_HEIGHT', 'WAKE_WINDOW_MIN', 'SLEEP_CHECK_MIN']) delete process.env[k];
   }

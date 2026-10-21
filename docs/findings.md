@@ -8,6 +8,7 @@ Samsung's E-Paper app (Android 1.3.3, decompiled) sends a playlist as the same J
 
 - **Timing** (four test cards of 10, 20, 20 and 20 minutes, on USB-C power): the display starts at the first card straight away, shows each one for its own duration counted from the push, and starts over after the last. Counted from midnight, the changes would have come at other times. Each visible change came about a minute after push + duration, probably the time the panel takes to draw.
 - **In deep sleep** (network standby off, nights of 18 and 19 October): it still changes the photo at the right time, and comes online about 10 seconds after each change, long enough for the NAS to send it a new playlist; within a few minutes it was back in deep sleep by itself. The NAS uses that moment to read the battery and, when needed, send the next playlist, so playlist mode needs no button presses.
+- **Leave it alone around a change** (21 October): the photo did not change at 06:00. That morning the NAS had found the display awake at 05:02 and at 05:57 (probably its daily screen protection refresh, set to 05:55) and sent it to sleep both times, and at 06:00 sent it to sleep again within seconds of it coming online. On the mornings before, the NAS had not caught it awake before the change, and after the change it had either sent a playlist or waited about 10 s (for a thumbnail) before the power-off command. Since then the NAS sends no power-off command from 15 minutes before a change until 15 minutes after, nor right after a change.
 
 ## Sleep and wake-up
 

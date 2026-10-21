@@ -187,6 +187,9 @@ export function loadConfig() {
       minTailSec: 300,
       // After a change: how often to look for the display (see WAKE_WINDOW_MIN).
       watchEverySec: 10,
+      // The sleep check leaves the display alone this long before and after each change: it
+      // wakes up by itself then (to change the photo, maybe for its daily screen refresh).
+      quietSec: 15 * 60,
       thumbTimeoutSec: 10, // when the NAS asks the display what it shows
     },
     runOnStart: bool('RUN_ON_START', false),

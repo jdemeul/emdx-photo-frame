@@ -90,7 +90,18 @@ export function createServer(cfg, app) {
       done() {
         for (const w of [...entry.waiters]) w(false);
       },
+      // What restoreContent() needs to serve it again (images in `items` order).
+      saved: () => ({ id, json, files: files.map(({ fileName, ext }) => ({ fileName, ext })) }),
     };
+  }
+
+  // After a restart: serve content pushed before it again, under the same addresses, in case the
+  // display asks for it again. `files`: [{ fileName, ext, file }], served from disk.
+  function restoreContent({ id, json, files }) {
+    const served = files.map((f, i) => ({ ...f, i })).filter((f) => fs.existsSync(f.file))
+      .map((f) => ({ ...f, size: fs.statSync(f.file).size, fetched: true }));
+    pushes.set(id, { id, files: served, json, waiters: new Set() });
+    return served.length;
   }
 
   function registerPush(buf, ext = 'png') {
@@ -289,6 +300,7 @@ export function createServer(cfg, app) {
     thumbnailUrl,
     registerContent,
     registerPush,
+    restoreContent,
     recentTraffic: () => traffic.map((t) => ({ ...t })),
     listen() {
       return new Promise((resolve, reject) => {

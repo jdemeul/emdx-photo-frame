@@ -130,7 +130,7 @@ function watchHtml(c) {
   if (ev.length) {
     h += '<br><span class="muted">Found awake:</span> ' + ev.slice(0, 4).map((e) => esc(fmt(e.at)
       + (e.battery != null ? ' (' + e.battery + '%' + (e.charging ? ', charging' : '') + ')' : '')
-      + (e.sent === 'playlist' ? ', sent the playlist' : e.sent ? ', sent the waiting photo' : e.putBack ? ', put back to sleep' : e.error ? ', ' + e.error : ''))).join('; ');
+      + (e.sent === 'playlist' ? ', sent the playlist' : e.sent ? ', sent the waiting photo' : e.putBack ? ', put back to sleep' : e.leftAlone ? ', left to go back to sleep by itself' : e.error ? ', ' + e.error : ''))).join('; ');
   }
   return h;
 }

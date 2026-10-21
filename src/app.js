@@ -9,7 +9,7 @@ import { fetchAlbum, fetchItemInfo, sizedUrl, downloadImage } from './sources/go
 import { scanFolder } from './sources/folder.js';
 import { syncBag, planNext, markShown } from './selector.js';
 import { composeCanvas, renderCanvas, planCells } from './render.js';
-import { pushToDisplay, putToSleep, readDisplayInfo, confirmAsleep, probeDisplay, withDisplay, requestThumbnail } from './display.js';
+import { pushToDisplay, putToSleep, readDisplayInfo, confirmAsleep, probeDisplay, lookForDisplay, withDisplay, requestThumbnail } from './display.js';
 import { renderTestPattern } from './testPattern.js';
 import { DailyPlaylist } from './daily.js';
 
@@ -471,7 +471,10 @@ export class FrameApp {
   // sleep or a pending retry), check that it is asleep: probe it without Wake-on-LAN, so a
   // sleeping display stays asleep. One that answers (someone pressed its power button, it is
   // charging) gets the photo that is still waiting to be shown, or in playlist mode a fresh
-  // playlist if one is due; otherwise it is put back to sleep. Either way it is noted.
+  // playlist if one is due; otherwise it is put back to sleep. Either way it is noted, with its
+  // battery. In playlist mode the display also wakes up by itself and goes back to sleep by
+  // itself: the check leaves it alone around a change, and puts it back to sleep only when it
+  // was already awake at the previous check.
   startSleepWatch() {
     const { mode, checkMin } = this.cfg.sleep;
     if (!checkMin || mode === 'off' || !this.cfg.display.host) return;
@@ -487,15 +490,20 @@ export class FrameApp {
   }
 
   async checkAsleep() {
-    if (this.busy || this.sleepTimer || this.retryTimer) return null;
-    const awake = await this.exclusive('Checking that the display is asleep', () => probeDisplay(this.cfg));
-    this.state.lastCheck = { at: Date.now(), awake };
+    if (this.busy || this.sleepTimer || this.retryTimer || this.daily?.nearChange()) return null;
+    const { awake, battery } = await this.exclusive('Checking that the display is asleep', () => lookForDisplay(this.cfg, { battery: true }));
+    const st = this.state;
+    const prev = st.lastCheck;
+    st.lastCheck = { at: Date.now(), awake };
     if (!awake) {
+      // Believed awake, but it doesn't answer: it went to sleep by itself.
+      const z = st.sleep;
+      if (z && !z.asleep && z.mode === this.cfg.sleep.mode) st.sleep = { mode: z.mode, asleep: true, sleptAt: Date.now(), self: true };
       this.store.save();
       return false;
     }
     const event = this.noteWake();
-    if (this.daily) this.daily.foundAwake(event);
+    this.noteBattery(battery);
     try {
       if (this.daily) {
         let sent = false;
@@ -510,7 +518,15 @@ export class FrameApp {
           event.sent = 'playlist'; // it goes back to sleep after the update, as always
           return true;
         }
-        if (!event.error) log.info('Sleep check: the display is awake and its playlist is up to date; putting it back to sleep.');
+        // (Awake at the previous check too, and not sent to sleep since.)
+        const { checkMin } = this.cfg.sleep;
+        const stillAwake = prev?.awake && !(st.sleep?.sleptAt > prev.at) && (!checkMin || event.at - prev.at <= 2 * checkMin * 60000);
+        if (!stillAwake && !event.error) {
+          log.info('Sleep check: the display is awake and its playlist is up to date; it goes back to sleep by itself (if it is still awake at the next check, the NAS sends it to sleep).');
+          event.leftAlone = true;
+          return true;
+        }
+        if (!event.error) log.info('Sleep check: the display is still awake and its playlist is up to date; putting it back to sleep.');
       } else if (this.photoWaiting()) {
         log.info('Sleep check: the display is awake and a photo is waiting; sending it.');
         await this.run('Sending the waiting photo', () => this.push(this.state.current, { reason: 'awake' }));
