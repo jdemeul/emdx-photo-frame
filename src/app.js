@@ -617,11 +617,13 @@ export class FrameApp {
   }
 
   // "Check display": read its name, firmware, battery and settings, and ask for a thumbnail of
-  // its screen. This wakes it (Wake-on-LAN), so it is sent back to sleep SLEEP_DELAY_SEC later.
-  // In playlist mode, a display that is awake for this gets a fresh playlist if one is due.
+  // its screen (unless it never sends one). This wakes it (Wake-on-LAN), so it goes back to sleep
+  // afterwards. In playlist mode, a display that is awake for this gets a fresh playlist if one
+  // is due.
   async displayInfo() {
     const info = await this.exclusive('Checking the display', async () => {
-      const read = await readDisplayInfo(this.cfg, { thumbnailUrl: this.server?.thumbnailUrl });
+      const thumbnailUrl = this.thumbnailsWork() === false ? null : this.server?.thumbnailUrl;
+      const read = await readDisplayInfo(this.cfg, { thumbnailUrl });
       if (read.thumbnail === 'asked') this.state.thumbs.asked++;
       this.markAwake();
       this.scheduleSleep();

@@ -472,6 +472,10 @@ test('playlist mode: the display comes online after each change; the NAS reads t
     assert.equal(await app.checkAsleep(), true);
     assert.deepEqual([app.state.wakeEvents[0].leftAlone, app.state.wakeEvents[0].charging, emdx.state.awake, powerOffs()], [true, true, true, 0]);
     emdx.state.pluggedIn = false;
+    // Check display doesn't ask for a thumbnail any more either.
+    await app.displayInfo();
+    assert.equal(asks(), 3);
+    assert.equal(app.state.displayCheck.thumbnail, undefined);
 
     // After a restart the NAS forgets what it served, unless it serves the playlist on the
     // display again, under the same addresses.
