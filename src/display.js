@@ -152,7 +152,7 @@ export async function lookForDisplay(cfg, { battery: readBattery = false } = {})
   const device = new Device({ host: d.host, port: d.port, pin: d.pin });
   try {
     try {
-      await withTimeout(device.connect(), 6000, 'Probe');
+      await withTimeout(device.connect(), (d.probeTimeoutSec ?? 6) * 1000, 'Probe');
       guard(device);
     } catch (err) {
       return { awake: false, battery: null, network: networkState(err) };
@@ -295,6 +295,45 @@ export async function putToSleep(cfg, { networkStandby = true } = {}) {
     await close(device);
   }
   return { battery };
+}
+
+// "Deep sleep now", the way Samsung's E-Paper app does it: its "Deep sleep mode" setting sent
+// again (network standby switched on and then off, so that the display sees it change, and
+// Sleep After as it was: 10 min if it was off, as deep sleep mode needs it), then the command of
+// its Sleep button ("the device will enter deep sleep mode"), 0x11 00. The app has no other
+// command for deep sleep. Wakes a display in a light sleep with Wake-on-LAN first.
+// Returns { battery, sleepAfter }.
+export async function deepSleepNow(cfg) {
+  const device = await connect(cfg, { quiet: true });
+  let battery = null;
+  let sleepAfter = null;
+  try {
+    try {
+      battery = await withTimeout(device.getBatteryState(), 6000, 'Reading battery');
+    } catch (err) {
+      log.debug(`No battery info: ${err.message}`);
+    }
+    await sleep(300);
+    await cmd(device, CMD_NETWORK_STANDBY, [0x01], 'Turning network standby on');
+    await sleep(300);
+    await cmd(device, CMD_NETWORK_STANDBY, [0x00], 'Turning network standby off');
+    await sleep(300);
+    let after = stripSub(0x81, await cmd(device, CMD_SLEEP_AFTER, [0x81], 'Reading Sleep After'));
+    if (!after.length || after[0] === 0x00) after = [0x07];
+    await sleep(300);
+    await cmd(device, CMD_SLEEP_AFTER, [0x81, ...after], 'Setting Sleep After');
+    sleepAfter = formatSleepAfter(after);
+    await sleep(300);
+    try {
+      await cmd(device, CMD_POWER, [0x00], 'Sleep now');
+    } catch (err) {
+      log.debug(`No acknowledgement for sleep now: ${err.message}`); // (it may sleep before answering)
+    }
+  } finally {
+    await close(device);
+  }
+  log.info(`Deep sleep now sent (network standby off, Sleep After ${sleepAfter}).`);
+  return { battery, sleepAfter };
 }
 
 // After a sleep command: did it really go to sleep? Probe without Wake-on-LAN (which would

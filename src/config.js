@@ -212,6 +212,8 @@ export function loadConfig() {
       // Playlist mode with deep sleep: how long the display gets to go to sleep by itself after
       // an update before the sleep check looks at it (its own Sleep After is 10 min or so).
       ownSleepSec: 15 * 60,
+      // "Deep sleep now": once asleep, look whether it is off the Wi-Fi after these pauses (s).
+      offWifiChecksSec: [15, 15, 30, 60, 120, 240],
       // Playlist mode: how long the NAS looks for the display after each change.
       wakeWindowMin: num('WAKE_WINDOW_MIN', 15),
       confirmSec: 150, // after a sleep command, how long to wait for it to stop answering

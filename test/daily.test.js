@@ -477,6 +477,21 @@ test('playlist mode: the display comes online after each change; the NAS reads t
     assert.equal(asks(), 3);
     assert.equal(app.state.displayCheck.thumbnail, undefined);
 
+    // "Deep sleep now": the Samsung app's way (its deep sleep mode setting again, then its Sleep
+    // button), then the NAS watches whether it leaves the Wi-Fi. This one stays on it.
+    await until(() => !app.busy);
+    emdx.state.lightSleep = true;
+    cfg.display.probeTimeoutSec = 0.3;
+    Object.assign(cfg.sleep, { offWifiChecksSec: [0.2, 0.2] });
+    const from = emdx.events.length;
+    await app.deepSleep();
+    assert.deepEqual(emdx.events.slice(from).filter((e) => /^cmd:(b5|c6|11)/.test(e)), ['cmd:b5:1', 'cmd:b5:0', 'cmd:c6:129', 'cmd:c6:129,7', 'cmd:11:0']);
+    assert.deepEqual([app.state.deepSleep.step, app.state.deepSleep.sleepAfter, app.state.sleep.network], ['still on the Wi-Fi', '10 min', 'on']);
+    const shown = await (await fetch('http://127.0.0.1:18462/api/status')).json();
+    assert.equal(shown.deepSleep.step, 'still on the Wi-Fi');
+    emdx.state.lightSleep = false;
+    emdx.wake();
+
     // After a restart the NAS forgets what it served, unless it serves the playlist on the
     // display again, under the same addresses.
     const last = emdx.received.at(-1);

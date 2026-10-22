@@ -60,6 +60,7 @@ export const UI_HTML = `<!doctype html>
       <button data-act="test-pattern">Show test pattern</button>
       <button data-act="refresh-album">Re-read album</button>
       <button data-act="display-info" title="Wakes the display (if Wake-on-LAN reaches it) and reads its battery and settings">Check display</button>
+      <button data-act="deep-sleep" hidden title="Sends the display into deep sleep the way the Samsung app does (its deep sleep mode setting again, then its Sleep button), then checks that it drops off the Wi-Fi">Deep sleep now</button>
     </div>
     <dl id="info"></dl>
     <div id="error" class="err"></div>
@@ -126,6 +127,25 @@ function sleepHtml(s) {
   if (z.own) return 'awake, goes to sleep by itself';
   return 'awake';
 }
+// The last "Deep sleep now", step by step.
+function deepSleepHtml(d) {
+  if (!d) return '';
+  const head = 'Deep sleep now ' + fmt(d.at) + ': ';
+  const asleep = d.asleepAfter != null ? 'asleep after ' + d.asleepAfter + ' s' : '';
+  let text;
+  let bad = false;
+  if (d.step === 'sending') text = 'waking it and sending the command…';
+  else if (d.step === 'sent') text = 'sent; waiting for it to stop answering…';
+  else if (d.step === 'asleep') text = asleep + '; is it off the Wi-Fi?…';
+  else if (d.step === 'off the Wi-Fi') text = asleep + ', off the Wi-Fi after ' + d.offAfter + ' s: deep sleep';
+  else if (d.step === 'still on the Wi-Fi') { text = asleep + ', but still on the Wi-Fi at ' + hm(d.checkedAt) + ': a light sleep'; bad = true; }
+  else if (d.step === 'asleep (Wi-Fi unknown)') text = asleep + '; whether it left the Wi-Fi is unknown';
+  else if (d.step === 'awake again') text = asleep + '; awake again after ' + d.awakeAfter + ' s';
+  else if (d.step === 'not reached') text = 'no answer, not even to Wake-on-LAN (in deep sleep already?)';
+  else if (d.step === 'still awake') { text = 'it took the command but stayed awake'; bad = true; }
+  else { text = d.error || d.step; bad = true; }
+  return '<br><span class="' + (bad ? 'err' : 'muted') + '">' + esc(head + text) + '</span>';
+}
 // Sleep checks, and when the display was found awake (after a press on its button, while
 // charging). Waking up after a change is expected in playlist mode: that is under "After a change".
 function watchHtml(c) {
@@ -183,6 +203,7 @@ function render(s) {
   $('[data-act="resend"]').textContent = pl ? 'Send playlist' : 'Send again';
   $('[data-act="resend"]').title = pl ? 'Sends the photos for the coming days now (the display must be awake: press its power button first)' : '';
   $('[data-view="playlist"]').hidden = !pl;
+  $('[data-act="deep-sleep"]').hidden = !(s.sleep && s.sleep.mode === 'deep');
   const c = s.current;
   const tpShowing = s.testPattern && s.testPattern.sent && (!c || !c.pushedAt || s.testPattern.at > c.pushedAt);
   let onFrame = tpShowing ? 'the test pattern (until the next ' + (pl ? 'playlist' : 'update') + ')'
@@ -202,7 +223,7 @@ function render(s) {
       ['Next update', fmt(s.nextRun)],
     ]),
     ['Battery', batteryHtml(s)],
-    ['Display', sleepHtml(s)],
+    ['Display', sleepHtml(s) + deepSleepHtml(s.deepSleep)],
     ['Sleep checks', watchHtml(s.check)],
     ['Display check', checkText(s)],
     ['This round', s.cycle ? esc(s.cycle.shown + ' of ' + s.cycle.total + ' photos ' + (pl ? 'shown or planned' : 'shown') + ' (round ' + s.cycle.n + ')') : '–'],

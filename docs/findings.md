@@ -31,6 +31,7 @@ Guides for signage software describe the same behaviour: on battery the display 
 - **Thumbnails of the screen** (MDC `0xC7`/`0x54` + a URL, as the app asks for them): the display accepts the request but has never sent one, on any path of the NAS's server. The service stops waiting for them after three tries.
 - **Download progress**: the display POSTs JSON reports to `/content-transfer-progress` on the host and port it downloads from.
 - **"Apply sleep mode after content update"** (`0xC7`/`0x53` type `0x01`) and **Sleep After** (`0xC6`/`0x81`) can be read and set. This service leaves both as set in the app.
+- **Deep sleep has no command of its own.** The Samsung app's *Sleep* button ("the device will enter deep sleep mode") sends `0x11 00`, the same power-off this service uses; choosing *Deep sleep mode* sends network standby off (`0xB5 00`) and Sleep After. How deeply the display sleeps is up to its network standby setting.
 - The display drops answers when commands follow each other faster than about 300 ms.
 
 ## Dithering: the NAS or the panel?

@@ -275,6 +275,7 @@ export function createServer(cfg, app) {
       '/api/test-pattern': () => app.testPattern(),
       '/api/refresh-album': () => app.refreshLibrary(),
       '/api/sleep': () => app.sleepRightAway(),
+      '/api/deep-sleep': () => app.deepSleep(),
     };
     const isAction = actions[p] || p === '/api/display-info';
     if (isAction && req.method === 'POST') {

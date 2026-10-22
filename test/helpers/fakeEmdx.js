@@ -39,11 +39,14 @@ export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage =
   // hearsWol: false simulates a sleeping display that Wake-on-LAN doesn't reach at all;
   // ignoresPowerOff: how many power-off commands it acknowledges but then stays awake
   // (Infinity: all of them). wakeOnChangeMs: after a playlist change it comes online for that
-  // long; sleepsAfterUpdateMs: it goes to sleep by itself that long after downloading content.
+  // long; sleepsAfterUpdateMs: it goes to sleep by itself that long after downloading content;
+  // lightSleep: asleep but still on the Wi-Fi, so a connection attempt hangs instead of failing.
   const state = {
     awake: true, networkStandby: true, hearsWol: true, ignoresPowerOff: 0, pluggedIn: false,
     sleepAfter: [0x07], applySleep: false, playing: null, thumbnailsPosted: 0, wakeOnChangeMs: 0, sleepsAfterUpdateMs: 0,
+    lightSleep: false,
   };
+  const held = new Set();
   let updateTimer = null;
   // The image it shows now (playlists move on by themselves).
   const showing = () => {
@@ -79,7 +82,7 @@ export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage =
     raw.on('error', () => {});
     if (!state.awake) { // asleep: nothing answers
       events.push('refused');
-      raw.destroy();
+      if (state.lightSleep) { held.add(raw); raw.on('close', () => held.delete(raw)); } else raw.destroy();
       return;
     }
     raw.write('MDCSTART<<TLS>>');
@@ -189,6 +192,6 @@ export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage =
     state,
     showing,
     wake() { state.awake = true; },
-    close: () => new Promise((r) => { clearInterval(changeWatch); clearTimeout(dozeTimer); clearTimeout(updateTimer); wol.close(); server.close(r); }),
+    close: () => new Promise((r) => { clearInterval(changeWatch); clearTimeout(dozeTimer); clearTimeout(updateTimer); for (const s of held) s.destroy(); wol.close(); server.close(r); }),
   };
 }

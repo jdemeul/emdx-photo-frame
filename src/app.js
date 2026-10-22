@@ -9,7 +9,7 @@ import { fetchAlbum, fetchItemInfo, sizedUrl, downloadImage } from './sources/go
 import { scanFolder } from './sources/folder.js';
 import { syncBag, planNext, markShown } from './selector.js';
 import { composeCanvas, renderCanvas, planCells } from './render.js';
-import { pushToDisplay, putToSleep, readDisplayInfo, confirmAsleep, probeDisplay, lookForDisplay, withDisplay, requestThumbnail } from './display.js';
+import { pushToDisplay, putToSleep, readDisplayInfo, confirmAsleep, probeDisplay, lookForDisplay, deepSleepNow, withDisplay, requestThumbnail } from './display.js';
 import { renderTestPattern } from './testPattern.js';
 import { DailyPlaylist } from './daily.js';
 
@@ -463,6 +463,63 @@ export class FrameApp {
     });
   }
 
+  // "Deep sleep now" (/api/deep-sleep): what Samsung's app does for deep sleep (deepSleepNow() in
+  // display.js), then watch the display: it should stop answering within a minute or so, and
+  // then drop off the Wi-Fi. state.deepSleep says how far it got, for the page.
+  async deepSleep() {
+    const cfg = this.cfg;
+    const rec = { at: Date.now(), step: 'sending' };
+    const note = (fields) => { Object.assign(rec, fields); this.store.save(); };
+    this.state.deepSleep = rec;
+    await this.exclusive('Deep sleep now', async () => {
+      this.cancelSleep();
+      try {
+        const { battery, sleepAfter } = await deepSleepNow(cfg);
+        this.noteBattery(battery);
+        note({ step: 'sent', sleepAfter });
+      } catch (err) {
+        if (!err.unreachable) {
+          note({ step: 'failed', error: err.message });
+          throw err;
+        }
+        // No answer, not even to Wake-on-LAN: maybe it is in deep sleep already.
+        note({ step: 'not reached' });
+        return;
+      }
+      const after = await confirmAsleep(cfg, { timeoutSec: cfg.sleep.confirmSec, everySec: cfg.sleep.confirmEverySec });
+      if (after === null) {
+        note({ step: 'still awake' });
+        throw new Error(`The display took the deep sleep command but still answered ${cfg.sleep.confirmSec} s later.`);
+      }
+      this.state.sleep = { mode: cfg.sleep.mode, asleep: true, sleptAt: Date.now(), confirmedAfter: after };
+      note({ step: 'asleep', asleepAfter: after });
+    });
+    // Then: off the Wi-Fi? One short knock now and then (sleep.offWifiChecksSec apart).
+    let network = null;
+    for (const sec of cfg.sleep.offWifiChecksSec) {
+      await new Promise((r) => setTimeout(r, sec * 1000));
+      let found = null;
+      try {
+        found = await this.exclusive('Is the display off the Wi-Fi?', () => lookForDisplay(cfg));
+      } catch { continue; } // (busy)
+      if (found.awake) {
+        note({ step: 'awake again', awakeAfter: Math.round((Date.now() - rec.at) / 1000) });
+        this.markAwake();
+        return;
+      }
+      network = found.network ?? network;
+      if (this.state.sleep?.asleep && found.network) this.state.sleep.network = found.network;
+      if (network === 'off') {
+        note({ step: 'off the Wi-Fi', offAfter: Math.round((Date.now() - rec.at) / 1000) });
+        log.info(`Deep sleep now: the display is off the Wi-Fi, ${rec.offAfter} s after the command.`);
+        return;
+      }
+      note({ checkedAt: Date.now(), network });
+    }
+    note({ step: network === 'on' ? 'still on the Wi-Fi' : 'asleep (Wi-Fi unknown)' });
+    if (network === 'on') log.warn('Deep sleep now: the display is asleep but still on the Wi-Fi (a light sleep).');
+  }
+
   // "Sleep now" (/api/sleep): put the display to sleep without waiting for SLEEP_DELAY_SEC.
   async sleepRightAway() {
     this.cancelSleep();
@@ -711,6 +768,7 @@ export class FrameApp {
       testPattern: st.testPattern || null,
       dither: this.cfg.image.dither,
       sleep: this.cfg.display.host ? this.sleepStatus() : null,
+      deepSleep: st.deepSleep || null,
       displayCheck: st.displayCheck || null,
       check: this.cfg.display.host && this.cfg.sleep.mode !== 'off' && this.cfg.sleep.checkMin
         ? { everyMin: this.cfg.sleep.checkMin, last: st.lastCheck || null, wakeEvents: (st.wakeEvents || []).filter((e) => !e.afterChange).slice(0, 10) }
