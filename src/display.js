@@ -28,7 +28,7 @@ function withTimeout(promise, ms, what) {
   return Promise.race([
     promise.finally(() => clearTimeout(timer)),
     new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`${what} timed out after ${Math.round(ms / 1000)}s`)), ms);
+      timer = setTimeout(() => reject(Object.assign(new Error(`${what} timed out after ${Math.round(ms / 1000)}s`), { timedOut: true })), ms);
     }),
   ]);
 }
@@ -144,7 +144,9 @@ export async function probeDisplay(cfg) {
   return (await lookForDisplay(cfg)).awake;
 }
 
-// The same, and with `battery`, read the battery while connected. Returns { awake, battery }.
+// The same, and with `battery`, read the battery while connected. Returns { awake, battery,
+// network }: for a display that doesn't answer, whether it is still on the network (see
+// networkState()).
 export async function lookForDisplay(cfg, { battery: readBattery = false } = {}) {
   const d = cfg.display;
   const device = new Device({ host: d.host, port: d.port, pin: d.pin });
@@ -152,8 +154,8 @@ export async function lookForDisplay(cfg, { battery: readBattery = false } = {})
     try {
       await withTimeout(device.connect(), 6000, 'Probe');
       guard(device);
-    } catch {
-      return { awake: false, battery: null };
+    } catch (err) {
+      return { awake: false, battery: null, network: networkState(err) };
     }
     let battery = null;
     if (readBattery) {
@@ -167,6 +169,17 @@ export async function lookForDisplay(cfg, { battery: readBattery = false } = {})
   } finally {
     await close(device);
   }
+}
+
+// Why a connection failed tells whether a sleeping display is still on the network: no answer
+// at all (EHOSTUNREACH: nothing answers its address) means its Wi-Fi is off, as in deep sleep;
+// an attempt that times out or is refused means it is still on the Wi-Fi, only asleep (on an
+// EM32DX that costs about 1.5% battery an hour). Returns 'off', 'on' or null (can't tell).
+export function networkState(err) {
+  const code = err?.code ?? err?.cause?.code;
+  if (['EHOSTUNREACH', 'EHOSTDOWN', 'ENETUNREACH'].includes(code)) return 'off';
+  if (err?.timedOut || code === 'ETIMEDOUT' || code === 'ECONNREFUSED') return 'on';
+  return null;
 }
 
 // Switch network standby on or off, if it isn't already. Returns what it was: true, false, or

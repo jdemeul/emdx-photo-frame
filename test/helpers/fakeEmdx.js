@@ -38,11 +38,13 @@ export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage =
   const received = [];
   // hearsWol: false simulates a sleeping display that Wake-on-LAN doesn't reach at all;
   // ignoresPowerOff: how many power-off commands it acknowledges but then stays awake
-  // (Infinity: all of them).
+  // (Infinity: all of them). wakeOnChangeMs: after a playlist change it comes online for that
+  // long; sleepsAfterUpdateMs: it goes to sleep by itself that long after downloading content.
   const state = {
     awake: true, networkStandby: true, hearsWol: true, ignoresPowerOff: 0, pluggedIn: false,
-    sleepAfter: [0x07], applySleep: false, playing: null, thumbnailsPosted: 0, wakeOnChangeMs: 0,
+    sleepAfter: [0x07], applySleep: false, playing: null, thumbnailsPosted: 0, wakeOnChangeMs: 0, sleepsAfterUpdateMs: 0,
   };
+  let updateTimer = null;
   // The image it shows now (playlists move on by themselves).
   const showing = () => {
     const p = state.playing;
@@ -138,6 +140,10 @@ export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage =
           }
           received.push({ content, image: images[0], images });
           state.playing = { content, images, durations: items.map((c) => c.duration), startedAt: Date.now() };
+          if (state.sleepsAfterUpdateMs) {
+            clearTimeout(updateTimer);
+            updateTimer = setTimeout(() => { state.awake = false; events.push('slept-by-itself'); }, state.sleepsAfterUpdateMs);
+          }
         } catch (err) {
           events.push(`fetch-error:${err.message}`);
         }
@@ -183,6 +189,6 @@ export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage =
     state,
     showing,
     wake() { state.awake = true; },
-    close: () => new Promise((r) => { clearInterval(changeWatch); clearTimeout(dozeTimer); wol.close(); server.close(r); }),
+    close: () => new Promise((r) => { clearInterval(changeWatch); clearTimeout(dozeTimer); clearTimeout(updateTimer); wol.close(); server.close(r); }),
   };
 }

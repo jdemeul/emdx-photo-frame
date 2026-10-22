@@ -375,11 +375,24 @@ export class FrameApp {
     this.sleepTimer = null;
   }
 
-  // Put the display to sleep SLEEP_DELAY_SEC from now (time for the panel to redraw).
+  // Playlist mode with deep sleep: the display goes to sleep by itself, and the NAS sends it no
+  // power-off command. On an EM32DX that command (sent right after a change, on 20 Oct 2026)
+  // left it asleep but on the Wi-Fi for days, at about 1.5% battery an hour; after going to
+  // sleep by itself following an update it was off the Wi-Fi until the next change.
+  ownSleep() {
+    return !!this.daily && this.cfg.sleep.mode === 'deep';
+  }
+
+  // Put the display to sleep SLEEP_DELAY_SEC from now (time for the panel to redraw), or with
+  // ownSleep(), leave that to the display (the sleep check notes when it has gone to sleep).
   scheduleSleep() {
     const { mode, delaySec } = this.cfg.sleep;
     if (mode === 'off' || !this.cfg.display.host) return;
     this.cancelSleep();
+    if (this.ownSleep()) {
+      this.state.sleep = { mode, asleep: false, own: true, at: Date.now() };
+      return;
+    }
     this.state.sleep = { mode, asleep: false, sleepAt: Date.now() + delaySec * 1000 };
     this.sleepTimer = setTimeout(() => {
       this.sleepTimer = null;
@@ -491,14 +504,18 @@ export class FrameApp {
 
   async checkAsleep() {
     if (this.busy || this.sleepTimer || this.retryTimer || this.daily?.nearChange()) return null;
-    const { awake, battery } = await this.exclusive('Checking that the display is asleep', () => lookForDisplay(this.cfg, { battery: true }));
+    const own = this.state.sleep?.own && !this.state.sleep.asleep ? this.state.sleep : null;
+    if (own && Date.now() - own.at < this.cfg.sleep.ownSleepSec * 1000) return null; // (give it time to go to sleep)
+    const { awake, battery, network } = await this.exclusive('Checking that the display is asleep', () => lookForDisplay(this.cfg, { battery: true }));
     const st = this.state;
     const prev = st.lastCheck;
-    st.lastCheck = { at: Date.now(), awake };
+    st.lastCheck = { at: Date.now(), awake, network: awake ? 'on' : network };
     if (!awake) {
-      // Believed awake, but it doesn't answer: it went to sleep by itself.
+      // Believed awake, but it doesn't answer: it went to sleep by itself. Either way, note
+      // whether it is still on the Wi-Fi.
       const z = st.sleep;
       if (z && !z.asleep && z.mode === this.cfg.sleep.mode) st.sleep = { mode: z.mode, asleep: true, sleptAt: Date.now(), self: true };
+      if (st.sleep?.asleep && network) st.sleep.network = network;
       this.store.save();
       return false;
     }
@@ -521,8 +538,10 @@ export class FrameApp {
         // (Awake at the previous check too, and not sent to sleep since.)
         const { checkMin } = this.cfg.sleep;
         const stillAwake = prev?.awake && !(st.sleep?.sleptAt > prev.at) && (!checkMin || event.at - prev.at <= 2 * checkMin * 60000);
-        if (!stillAwake && !event.error) {
-          log.info('Sleep check: the display is awake and its playlist is up to date; it goes back to sleep by itself (if it is still awake at the next check, the NAS sends it to sleep).');
+        const charging = !!battery?.pluggedIn;
+        if ((!stillAwake || charging) && !event.error) {
+          log.info(charging ? 'Sleep check: the display is awake and charging; leaving it alone.'
+            : 'Sleep check: the display is awake and its playlist is up to date; it goes back to sleep by itself (if it is still awake at the next check, the NAS sends it to sleep).');
           event.leftAlone = true;
           return true;
         }

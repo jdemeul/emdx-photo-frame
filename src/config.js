@@ -206,10 +206,12 @@ export function loadConfig() {
     sleep: {
       mode: oneOf('SLEEP_MODE', 'standby', ['standby', 'deep', 'off']),
       delaySec: num('SLEEP_DELAY_SEC', 120), // let the panel finish redrawing first
-      // Every this many minutes, check that the display is really asleep (0 = never). In
-      // playlist mode this is also how the NAS notices the display is awake (someone pressed
-      // its button, it is charging) to top up its playlist, so it looks more often.
-      checkMin: num('SLEEP_CHECK_MIN', updateMode === 'playlist' ? 5 : 30),
+      // Every this many minutes, check that the display is really asleep, and whether it is
+      // off the Wi-Fi (0 = never). Every check knocks on the display's door, so not too often.
+      checkMin: num('SLEEP_CHECK_MIN', 30),
+      // Playlist mode with deep sleep: how long the display gets to go to sleep by itself after
+      // an update before the sleep check looks at it (its own Sleep After is 10 min or so).
+      ownSleepSec: 15 * 60,
       // Playlist mode: how long the NAS looks for the display after each change.
       wakeWindowMin: num('WAKE_WINDOW_MIN', 15),
       confirmSec: 150, // after a sleep command, how long to wait for it to stop answering

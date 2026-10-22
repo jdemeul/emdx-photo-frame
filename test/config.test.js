@@ -35,12 +35,12 @@ test('the display sleeps with network standby on by default; deep and off are th
   assert.throws(() => withEnv({ ...unset, SLEEP_MODE: 'nap' }, loadConfig), /SLEEP_MODE must be one of standby, deep, off/);
 });
 
-test('playlist mode looks for the display more often, and tops up no later than the playlist ends', () => {
+test('the sleep check runs every 30 min in both modes, and playlist mode tops up no later than the playlist ends', () => {
   const unset = { SLEEP_CHECK_MIN: null, PLAYLIST_DAYS: null, PLAYLIST_TOPUP_DAYS: null };
   const push = withEnv({ ...unset, UPDATE_MODE: null }, loadConfig);
   assert.deepEqual([push.update.mode, push.sleep.checkMin], ['push', 30]);
   const daily = withEnv({ ...unset, UPDATE_MODE: 'playlist' }, loadConfig);
-  assert.deepEqual([daily.update.mode, daily.update.days, daily.update.topUpDays, daily.sleep.checkMin], ['playlist', 7, 7, 5]);
+  assert.deepEqual([daily.update.mode, daily.update.days, daily.update.topUpDays, daily.sleep.checkMin], ['playlist', 7, 7, 30]);
   const long = withEnv({ ...unset, UPDATE_MODE: 'playlist', PLAYLIST_DAYS: '30' }, loadConfig);
   assert.deepEqual([long.update.days, long.update.topUpDays], [30, 7]);
   const short = withEnv({ ...unset, UPDATE_MODE: 'playlist', PLAYLIST_DAYS: '3' }, loadConfig);

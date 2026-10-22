@@ -57,13 +57,17 @@ At every `SCHEDULE` time the NAS renders the next photo and sends it, so the dis
 
 ### Sleep
 
-Two minutes after an update (`SLEEP_DELAY_SEC`, time for the panel to redraw), the NAS powers the display off: with network standby off (`deep`), or on (`standby`), or it leaves sleeping to the display's own settings (`off`). It then checks that the display stopped answering, and if not, tries once more and reports it on the page. Every `SLEEP_CHECK_MIN` minutes (5 in playlist mode, 30 in push mode) it also checks, without waking it, that the display is still asleep. A display found awake (someone pressed its button, it is charging) gets what is waiting for it, a photo or a fresh playlist, or is put back to sleep. In playlist mode the display also wakes up by itself and goes back to sleep by itself, so the NAS leaves it alone from 15 minutes before each change until 15 minutes after, and otherwise puts it back to sleep only when it was already awake at the previous check.
+Two minutes after an update (`SLEEP_DELAY_SEC`, time for the panel to redraw), the NAS powers the display off: with network standby off (`deep`), or on (`standby`), or it leaves sleeping to the display's own settings (`off`). It then checks that the display stopped answering, and if not, tries once more and reports it on the page.
+
+Playlist mode with deep sleep is the exception: there the display goes to sleep by itself (its own Sleep After, set in the Samsung app), and the NAS sends no power-off command. After that command the EM32DX stayed asleep but on the Wi-Fi for days (see [findings](docs/findings.md)); going to sleep by itself, it was off the Wi-Fi until the next change.
+
+Every `SLEEP_CHECK_MIN` minutes (30) the NAS also checks, without waking it, that the display is still asleep, and whether it is off the Wi-Fi: a display that is asleep but still on the Wi-Fi (a light sleep, about 1.5% battery an hour) shows in red on the page. A display found awake (someone pressed its button, it is charging) gets what is waiting for it, a photo or a fresh playlist, or is put back to sleep. In playlist mode the display also wakes up by itself and goes back to sleep by itself, so the NAS leaves it alone from 15 minutes before each change until 15 minutes after, and otherwise puts it back to sleep only when it was already awake at the previous check and is not charging.
 
 ## 5. The web page
 
 - **Preview**, **Original photos** and **Playlist** (the coming days, the one for now outlined) on the left; **Test pattern** shows the last one sent.
 - **New photo for today** (push mode: **Next photo now**) replaces the photo for now; **Send playlist** (**Send again**) sends it to the display now, if it is awake; **Check display** reads its battery and settings.
-- **After a change**: when the display came online after its last changes, with the battery. **Battery**: the latest reading and one per day. **Sleep checks**: when the display was found awake otherwise. **Recent**: what was sent, and when.
+- **After a change**: when the display came online after its last changes, with the battery. **Battery**: the latest reading and one per day. **Display**: asleep or awake, and whether a sleeping display is off the Wi-Fi. **Sleep checks**: when the display was found awake otherwise. **Recent**: what was sent, and when.
 
 The same status is available as JSON at `/api/status`, with the last requests the display made to the NAS. `UI_PASSWORD` protects the page.
 
@@ -83,7 +87,7 @@ The same status is available as JSON at `/api/status`, with the last requests th
 | `SLEEP_MODE` | standby | After each update: `deep` (network standby off), `standby` (on; Wake-on-LAN wakes it) or `off` |
 | `EMDX_MAC`, `WOL_BROADCAST` | —, 255.255.255.255 | For Wake-on-LAN (`SLEEP_MODE=standby`). Try your network's broadcast address (e.g. 192.168.1.255) if it doesn't wake |
 | `SLEEP_DELAY_SEC` | 120 | Time for the panel to redraw before the display is sent to sleep |
-| `SLEEP_CHECK_MIN` | 30 (playlist mode: 5) | How often to check that the display is asleep. `0` turns the check off |
+| `SLEEP_CHECK_MIN` | 30 | How often to check that the display is asleep, and off the Wi-Fi. `0` turns the check off |
 | `WAKE_WINDOW_MIN` | 15 | Playlist mode: how long the NAS looks for the display after each change |
 | `RUN_ON_START` | false | When the service starts: send a photo right away (push mode), or the playlist if one is due (playlist mode) |
 | `RETRIES`, `RETRY_MINUTES` | 3, 20 | Push mode: retries of an update that couldn't reach the display |
@@ -122,6 +126,7 @@ To try it without a display, leave `EMDX_HOST` empty: `docker build -t emdx-phot
 - **"It is in deep sleep, where Wake-on-LAN does not reach it"**: press the display's power button, then the button on the page again (it waits up to 30 s for the display); or leave it to the next sleep check (every `SLEEP_CHECK_MIN` minutes), which sends whatever is waiting. In playlist mode the display also comes online by itself after each change.
 - **"Fresh playlist due"** (playlist mode): the display needs a new playlist. It gets one the next time it is online, after its next change or a press on its power button. Until then it keeps playing the playlist it has.
 - **The photo didn't change** (playlist mode): press the display's power button, then **Send playlist**. That starts a fresh playlist with the photo for today, so the display and the page agree again. Keep the display's own screen protection time (Samsung E-Paper app) away from the change time.
+- **"Asleep, but still on the Wi-Fi"** (deep sleep): the display is in a light sleep and uses about 1.5% battery an hour. Your router's client list shows the same (connected for hours on end). Press its power button, then **Send playlist**, and let it go to sleep by itself; within a few minutes it should drop off the Wi-Fi. Check that its sleep mode in the Samsung E-Paper app is still *Deep sleep mode*.
 - **"Could not connect"** (push mode): the display is asleep or offline. Check `EMDX_MAC`, its battery, and run `sleep-test`; try `WOL_BROADCAST` set to your network's broadcast address.
 - **"The display did not go to sleep"**: it took the power-off command but kept answering, so it is using battery. The NAS tries again at every sleep check.
 - **Album errors**: run `check-album`. If it fails while the link opens fine in a browser, Google probably changed the page format; the frame keeps using the cached list meanwhile.

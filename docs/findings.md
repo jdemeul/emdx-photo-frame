@@ -17,9 +17,12 @@ Samsung's E-Paper app (Android 1.3.3, decompiled) sends a playlist as the same J
 | Network standby on (sleep mode), then Wake-on-LAN | Woke within seconds after 5, 15, 30 and 60 minutes, and after 5 hours asleep. Twice it didn't, after a night and after a full day on battery. |
 | Network standby off (deep sleep), then Wake-on-LAN | Woke half a minute after it fell asleep, not 7 hours later. |
 | Battery | About 1.5% an hour with network standby on (100% to 92% in 5 hours). Next to nothing in deep sleep (still 100% after a day). |
+| Power-off command (network standby off) seconds after a change, 20 October | It stopped answering MDC but stayed on the Wi-Fi: the router showed it connected for more than two days, and the battery went down about 1.7% an hour (100% to 18% by 22 October), as in a light sleep. It came online at once after the next changes (before: 10 s, to reconnect). On the nights before, it had gone to sleep by itself after an update and was off the Wi-Fi until the next change. |
 | Wake-up timer, MDC `0x25` (listed as an on-timer in some notes) | Refused. On other Samsung screens `0x25` is brightness. |
 | Screen protection time (a daily panel refresh set in the app) | Didn't bring the display onto the network (one test). |
 | Low-power Wi-Fi module (the app's remote wake-up on the EMDX-A, MDC `0xCB`) | Not present. |
+
+From the NAS this shows in how a connection attempt fails: to a display that is off the Wi-Fi, with "host unreachable" (nothing answers its address); to one in a light sleep, by timing out (17 October). The service now tells the two apart on its page.
 
 Guides for signage software describe the same behaviour: on battery the display enters deep sleep after a while and is then offline until it is woken from the Samsung app or plugged in ([NowSignage](https://knowledgebase.nowsignage.com/samsung-e-paper-setup-nowsignage-installation-guide)), and network standby "may consume additional power" ([OnSign](https://onsigntv.helpjuice.com/en_US/installing-samsung-e-paper)). Samsung quotes up to 70 days per charge in sleep mode and up to 80 in deep sleep, with one update a day ([product page](https://www.samsung.com/au/business/smart-signage/others/color-e-paper-emdx-a-lh32emdiagbxxy/)).
 

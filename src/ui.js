@@ -112,12 +112,18 @@ function sleepHtml(s) {
   if (!z) return '–';
   if (z.mode === 'off') return 'sleeps by its own settings (SLEEP_MODE=off)';
   if (z.asleep) {
+    const since = z.sleptAt ? ' since ' + fmt(z.sleptAt) : '';
+    // Asleep, yet still on the Wi-Fi in deep sleep mode (or off it in standby mode): say so.
+    if (z.mode === 'deep' && z.network === 'on') return '<span class="err">' + esc('asleep' + since + ', but still on the Wi-Fi: a light sleep, which costs about 1.5% battery an hour') + '</span>';
+    if (z.mode === 'standby' && z.network === 'off') return '<span class="err">' + esc('asleep' + since + ' and off the Wi-Fi: Wake-on-LAN no longer reaches it') + '</span>';
     const how = z.self ? ' (went to sleep by itself)' : z.confirmedAfter != null ? ' (confirmed)' : '';
+    const where = z.mode === 'deep' && z.network === 'off' ? ', off the Wi-Fi' : '';
     const next = s.playlist ? ', changes the photo by itself' : z.mode === 'deep' ? '' : ', the next update wakes it';
-    return esc((z.mode === 'deep' ? 'in deep sleep' : 'asleep') + (z.sleptAt ? ' since ' + fmt(z.sleptAt) : '') + how + next);
+    return esc((z.mode === 'deep' ? 'in deep sleep' : 'asleep') + since + how + where + next);
   }
   if (z.error) return '<span class="err">' + esc(z.error) + '</span>';
   if (z.pending && z.sleepAt) return esc('awake, goes to sleep at ' + hm(z.sleepAt));
+  if (z.own) return 'awake, goes to sleep by itself';
   return 'awake';
 }
 // Sleep checks, and when the display was found awake (after a press on its button, while

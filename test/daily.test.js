@@ -228,7 +228,8 @@ test('playlist mode: plan, send when found awake, the display moves on by itself
     const { createServer } = await import('../src/server.js');
     const cfg = loadConfig();
     Object.assign(cfg.update, { minFirstSec: 1, minTailSec: 0.2, watchEverySec: 0.5, thumbTimeoutSec: 3, quietSec: 0.5 });
-    Object.assign(cfg.sleep, { confirmSec: 2, confirmEverySec: 0.2 });
+    Object.assign(cfg.sleep, { confirmSec: 2, confirmEverySec: 0.2, ownSleepSec: 0 });
+    emdx.state.sleepsAfterUpdateMs = 1500; // (like the EM32DX: asleep a little after an update)
     Object.assign(cfg.display, { sleepWindowSec: 1, awakeWindowSec: 1 });
     const app = new FrameApp(cfg, new Store(dataDir), buildPaletteModel(cfg.image.measuredPalette, DEVICE_PALETTE));
     const server = createServer(cfg, app);
@@ -239,6 +240,7 @@ test('playlist mode: plan, send when found awake, the display moves on by itself
     const pl = () => app.state.playlist;
     const device = (dir) => fs.readFileSync(path.join(dataDir, 'playlist', dir, 'device.png'));
     const slotStart = async () => sleepMs(clock.next(Date.now()) - Date.now() + 200);
+    const powerOffs = () => emdx.events.filter((e) => e === 'cmd:11:0').length;
 
     // A photo is on the frame from before (push mode). Switching to playlist mode keeps it for now.
     await slotStart();
@@ -270,7 +272,11 @@ test('playlist mode: plan, send when found awake, the display moves on by itself
     assert.ok(first.images[4].equals(before), 'the tail repeats it');
     assert.deepEqual([emdx.state.applySleep, emdx.state.networkStandby], [false, false]); // its own sleep setting is left alone
     assert.equal(app.daily.due(), null);
-    await until(() => app.state.sleep?.asleep && !emdx.state.awake);
+    // It goes to sleep by itself (no power-off command), and the sleep check notes that.
+    assert.equal(app.sleepStatus().own, true);
+    await until(() => !emdx.state.awake);
+    assert.equal(await app.checkAsleep(), false);
+    assert.deepEqual([app.state.sleep.asleep, app.state.sleep.self, powerOffs()], [true, true, 0]);
 
     // Found awake again before the next change, with nothing due: it goes back to sleep by itself,
     // so the NAS leaves it alone; still awake at the next check, it is sent to sleep.
@@ -313,7 +319,7 @@ test('playlist mode: plan, send when found awake, the display moves on by itself
     assert.equal(b2.items[0].dir, b1.items[1].dir);
     await until(() => emdx.received.length === 2);
     assert.ok(emdx.received.at(-1).images[0].equals(device(b2.items[0].dir)));
-    await until(() => app.state.sleep?.asleep && !emdx.state.awake);
+    await until(() => !emdx.state.awake);
     assert.ok(!fs.existsSync(path.join(dataDir, 'playlist', b1.items[0].dir)), 'files no longer needed are deleted');
 
     // "New photo for today" while it sleeps: rendered, but it has to wait for the display.
@@ -346,7 +352,7 @@ test('playlist mode: plan, send when found awake, the display moves on by itself
     assert.match(await (await fetch('http://127.0.0.1:18461/')).text(), /data-view="playlist"/);
 
     // A test pattern replaces the playlist: a fresh one is due.
-    await until(() => !app.busy && app.state.sleep?.asleep);
+    await until(() => !app.busy && !emdx.state.awake);
     emdx.wake();
     await app.testPattern();
     assert.match(app.daily.due(), /test pattern replaced the playlist/);
@@ -372,6 +378,7 @@ test('playlist mode: the display comes online after each change; the NAS reads t
   const { startFakeEmdx } = await import('./helpers/fakeEmdx.js');
   const emdx = await startFakeEmdx({ pin: '626262', thumbnails: false });
   emdx.state.wakeOnChangeMs = 6000;
+  emdx.state.sleepsAfterUpdateMs = 1500;
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'frame-mornings-'));
   const photoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'frame-mornings-photos-'));
   for (let i = 0; i < 12; i++) fs.writeFileSync(path.join(photoDir, `p${String(i).padStart(2, '0')}.jpg`), await sharp(photoSvg(i)).jpeg({ quality: 85 }).toBuffer());
@@ -390,7 +397,7 @@ test('playlist mode: the display comes online after each change; the NAS reads t
     const { createServer } = await import('../src/server.js');
     const cfg = loadConfig();
     Object.assign(cfg.update, { minFirstSec: 1, minTailSec: 0.2, watchEverySec: 0.3, thumbTimeoutSec: 1, quietSec: 0.5 });
-    Object.assign(cfg.sleep, { confirmSec: 2, confirmEverySec: 0.2 });
+    Object.assign(cfg.sleep, { confirmSec: 2, confirmEverySec: 0.2, ownSleepSec: 0 });
     Object.assign(cfg.display, { sleepWindowSec: 1, awakeWindowSec: 1 });
     const app = new FrameApp(cfg, new Store(dataDir), buildPaletteModel(cfg.image.measuredPalette, DEVICE_PALETTE));
     const server = createServer(cfg, app);
@@ -412,7 +419,7 @@ test('playlist mode: the display comes online after each change; the NAS reads t
     assert.equal(await app.checkAsleep(), true);
     assert.equal(app.state.wakeEvents[0].sent, 'playlist');
     assert.equal(asks(), 0); // (no playlist on it yet: nothing to compare a thumbnail with)
-    await until(() => app.state.sleep?.asleep && !emdx.state.awake);
+    await until(() => !emdx.state.awake);
     const first = pl().batch.sentAt;
 
     // Change 1: online after the change; 2 days still to come, so no top-up. The battery is read,
@@ -438,7 +445,7 @@ test('playlist mode: the display comes online after each change; the NAS reads t
     assert.equal(app.state.wakeEvents[0].sent, 'playlist');
     assert.equal(app.state.wakeEvents[0].battery, 85);
     assert.equal(asks(), 2);
-    await until(() => app.state.sleep?.asleep && !emdx.state.awake);
+    await until(() => !emdx.state.awake);
 
     // Change 3: request 3, still no thumbnail: from now on the NAS doesn't wait for them.
     await nextChange();
@@ -455,6 +462,16 @@ test('playlist mode: the display comes online after each change; the NAS reads t
     assert.ok(status.playlist.changes.slice(0, 3).every((c) => c.online && c.battery != null), JSON.stringify(status.playlist.changes));
     assert.ok(status.check === null || status.check.wakeEvents.every((e) => e.afterChange || e.sent));
     assert.equal(status.batteryDays[0].percent, 85); // (readings within half an hour: the latest)
+    assert.equal(powerOffs(), 0, 'the display went to sleep by itself every time');
+
+    // Awake and charging: the sleep check leaves it alone, also the second time.
+    await sleepMs(Math.max(0, 600 - (Date.now() - clock.prev(Date.now()))));
+    emdx.state.pluggedIn = true;
+    emdx.wake();
+    assert.equal(await app.checkAsleep(), true);
+    assert.equal(await app.checkAsleep(), true);
+    assert.deepEqual([app.state.wakeEvents[0].leftAlone, app.state.wakeEvents[0].charging, emdx.state.awake, powerOffs()], [true, true, true, 0]);
+    emdx.state.pluggedIn = false;
 
     // After a restart the NAS forgets what it served, unless it serves the playlist on the
     // display again, under the same addresses.
