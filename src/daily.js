@@ -22,7 +22,7 @@ import crypto from 'node:crypto';
 import sharp from 'sharp';
 import { log } from './log.js';
 import { markShown } from './selector.js';
-import { pushContent, lookForDisplay } from './display.js';
+import { pushContent } from './display.js';
 import { changeClock, slotKey, dayLabel, buildBatch, positionAt } from './playlist.js';
 import { matchThumbnail } from './thumbMatch.js';
 
@@ -335,7 +335,7 @@ export class DailyPlaylist {
         // (Not while it is awake because of something the NAS did, e.g. a playlist just sent.)
         if (!app.busy && !app.sleepTimer) {
           let found = null;
-          try { found = await app.exclusive('Looking for the display after the change', () => lookForDisplay(cfg, { battery: true })); } catch { /* busy */ }
+          try { found = await app.exclusive('Looking for the display after the change', () => app.look({ battery: true })); } catch { /* busy */ }
           if (found?.awake) { rec.online = Date.now(); battery = found.battery; break; }
         }
         await pause(cfg.update.watchEverySec * 1000);
@@ -376,6 +376,16 @@ export class DailyPlaylist {
     // (With changes less than an hour apart, a quarter of the gap on either side.)
     const quiet = Math.min(this.cfg.update.quietSec * 1000, (next - prev) / 4);
     return next - now < quiet || now - prev < quiet;
+  }
+
+  // A change within the next hour (four times update.quietSec; at most half the gap between
+  // changes): no time to put a display in a light sleep into deep sleep first.
+  changeSoon(now = Date.now()) {
+    const next = this.clock.next(now);
+    const prev = this.clock.prev(now);
+    if (next == null) return false;
+    const gap = prev != null ? next - prev : Infinity;
+    return next - now < Math.min(4 * this.cfg.update.quietSec * 1000, gap / 2);
   }
 
   // After a restart: serve the playlist on the display again (the NAS's addresses for it are

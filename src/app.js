@@ -332,7 +332,7 @@ export class FrameApp {
   // a scheduled run looks once; a button on the page waits a little for a display that is just
   // waking up (someone pressed its power button). Returns connect options for pushContent().
   async deepSleepConnect(reason) {
-    if (this.cfg.sleep.mode !== 'deep' || ['awake', 'found awake', 'after a change', 'check display'].includes(reason)) return {};
+    if (this.cfg.sleep.mode !== 'deep' || ['awake', 'found awake', 'after a change', 'check display', 'light sleep'].includes(reason)) return {};
     if (!SCHEDULED.has(reason)) return { windowSec: this.cfg.display.awakeWindowSec, wol: false, quiet: true };
     if (await probeDisplay(this.cfg)) return {};
     throw Object.assign(new Error('Could not reach the display'), { unreachable: true });
@@ -465,17 +465,26 @@ export class FrameApp {
 
   // "Deep sleep now" (/api/deep-sleep): what Samsung's app does for deep sleep (deepSleepNow() in
   // display.js), then watch the display: it should stop answering within a minute or so, and
-  // then drop off the Wi-Fi. state.deepSleep says how far it got, for the page.
-  async deepSleep() {
+  // then drop off the Wi-Fi. state.deepSleep says how far it got, for the page. `why`: who asked
+  // (the button, or the NAS for a display in a light sleep); `unlessCharging`: leave a display on
+  // the charger alone. Returns the record (its `step`: how it ended).
+  async deepSleep({ why = 'button', unlessCharging = false } = {}) {
     const cfg = this.cfg;
-    const rec = { at: Date.now(), step: 'sending' };
+    const rec = { at: Date.now(), why, step: 'sending' };
     const note = (fields) => { Object.assign(rec, fields); this.store.save(); };
     this.state.deepSleep = rec;
+    let done = false;
     await this.exclusive('Deep sleep now', async () => {
       this.cancelSleep();
       try {
-        const { battery, sleepAfter } = await deepSleepNow(cfg);
+        const { battery, sleepAfter, charging } = await deepSleepNow(cfg, { unlessCharging });
         this.noteBattery(battery);
+        this.markAwake();
+        if (charging) {
+          note({ step: 'charging' });
+          done = true;
+          return;
+        }
         note({ step: 'sent', sleepAfter });
       } catch (err) {
         if (!err.unreachable) {
@@ -484,6 +493,7 @@ export class FrameApp {
         }
         // No answer, not even to Wake-on-LAN: maybe it is in deep sleep already.
         note({ step: 'not reached' });
+        done = true;
         return;
       }
       const after = await confirmAsleep(cfg, { timeoutSec: cfg.sleep.confirmSec, everySec: cfg.sleep.confirmEverySec });
@@ -494,30 +504,135 @@ export class FrameApp {
       this.state.sleep = { mode: cfg.sleep.mode, asleep: true, sleptAt: Date.now(), confirmedAfter: after };
       note({ step: 'asleep', asleepAfter: after });
     });
-    // Then: off the Wi-Fi? One short knock now and then (sleep.offWifiChecksSec apart).
+    if (done) return rec;
+    const end = await this.watchWifi({ untilAsleep: false, onCheck: (network) => note({ checkedAt: Date.now(), network }) });
+    note({ step: end.result, ...(end.result === 'off the Wi-Fi' ? { offAfter: Math.round((end.at - rec.at) / 1000) } : {}),
+      ...(end.result === 'awake again' ? { awakeAfter: Math.round((end.at - rec.at) / 1000) } : {}) });
+    if (end.result === 'off the Wi-Fi') log.info(`Deep sleep: the display is off the Wi-Fi, ${rec.offAfter} s after the command.`);
+    if (end.result === 'still on the Wi-Fi') log.warn('Deep sleep: the display is asleep but still on the Wi-Fi (a light sleep).');
+    return rec;
+  }
+
+  // Is the display off the Wi-Fi yet? One short knock now and then (sleep.offWifiChecksSec
+  // apart). `untilAsleep`: it may still be awake at first (after an update it goes to sleep by
+  // itself); otherwise answering means it woke up again. Returns { result, at }: 'off the Wi-Fi',
+  // 'still on the Wi-Fi', 'awake again', 'still awake' or 'asleep (Wi-Fi unknown)'.
+  async watchWifi({ untilAsleep, onCheck = () => {} }) {
     let network = null;
-    for (const sec of cfg.sleep.offWifiChecksSec) {
+    let awake = false;
+    for (const sec of this.cfg.sleep.offWifiChecksSec) {
       await new Promise((r) => setTimeout(r, sec * 1000));
       let found = null;
       try {
-        found = await this.exclusive('Is the display off the Wi-Fi?', () => lookForDisplay(cfg));
+        found = await this.exclusive('Is the display off the Wi-Fi?', () => this.look());
       } catch { continue; } // (busy)
-      if (found.awake) {
-        note({ step: 'awake again', awakeAfter: Math.round((Date.now() - rec.at) / 1000) });
+      awake = found.awake;
+      if (awake) {
         this.markAwake();
-        return;
+        if (!untilAsleep) return { result: 'awake again', at: Date.now() };
+        continue;
       }
+      const z = this.state.sleep;
+      if (z && !z.asleep && z.mode === this.cfg.sleep.mode) this.state.sleep = { mode: z.mode, asleep: true, sleptAt: Date.now(), self: true };
       network = found.network ?? network;
       if (this.state.sleep?.asleep && found.network) this.state.sleep.network = found.network;
-      if (network === 'off') {
-        note({ step: 'off the Wi-Fi', offAfter: Math.round((Date.now() - rec.at) / 1000) });
-        log.info(`Deep sleep now: the display is off the Wi-Fi, ${rec.offAfter} s after the command.`);
+      onCheck(network);
+      if (network === 'off') return { result: 'off the Wi-Fi', at: Date.now() };
+    }
+    const result = awake ? 'still awake' : network === 'on' ? 'still on the Wi-Fi' : 'asleep (Wi-Fi unknown)';
+    return { result, at: Date.now() };
+  }
+
+  // A probe (see lookForDisplay()).
+  look(opts) {
+    return lookForDisplay(this.cfg, opts);
+  }
+
+  // ---------- light sleep ----------
+  // With SLEEP_MODE=deep, a display that doesn't answer but is still on the Wi-Fi at
+  // sleep.lightSleepChecks sleep checks in a row is in a light sleep: an EM32DX stayed like that
+  // for days, at about 1.5% battery an hour. Returns true when the NAS should step in.
+  lightSleepSeen(network) {
+    if (this.cfg.sleep.mode !== 'deep') return false;
+    const st = this.state;
+    let ls = st.lightSleep;
+    const now = Date.now();
+    if (network === 'off') {
+      if (ls && !ls.endedAt && ls.strikes) {
+        ls.endedAt = now;
+        if (ls.tries.length) log.info('The display is off the Wi-Fi again: in deep sleep.');
+      }
+      return false;
+    }
+    if (network !== 'on') return false;
+    if (!ls || ls.endedAt || (ls.gaveUp && now - ls.gaveUp > 20 * 3600000) || (ls.charging && now - ls.charging > 6 * 3600000)) {
+      ls = st.lightSleep = { since: now, strikes: 0, tries: [] };
+    }
+    ls.strikes++;
+    ls.lastSeen = now;
+    return ls.strikes >= this.cfg.sleep.lightSleepChecks && !ls.gaveUp && !ls.charging;
+  }
+
+  // Put a display in a light sleep into deep sleep: wake it (Wake-on-LAN reaches it then) and send
+  // what the Samsung app sends for deep sleep; if it is still on the Wi-Fi after that, send it
+  // the playlist (or the photo) again: after an update it has gone into deep sleep by itself. If
+  // that doesn't help either, the page asks for a hand (a press on its power button, a restart).
+  // A display on the charger is left alone.
+  async fixLightSleep() {
+    const ls = this.state.lightSleep;
+    if (ls.tries.length >= 3) { // (e.g. Wake-on-LAN didn't reach it, again and again)
+      ls.gaveUp = Date.now();
+      this.store.save();
+      return;
+    }
+    this.fixing = true;
+    try {
+      log.warn('Sleep check: the display has stayed on the Wi-Fi while asleep (a light sleep); putting it into deep sleep.');
+      let first;
+      try {
+        first = await this.deepSleep({ why: 'light sleep', unlessCharging: true });
+      } catch (err) {
+        first = { at: Date.now(), step: `failed: ${err.message}` };
+      }
+      ls.tries.push({ at: first.at, how: 'deep sleep command', result: first.step });
+      this.store.save();
+      if (first.step === 'charging') {
+        ls.charging = Date.now();
+        log.info('The display is on the charger: leaving it alone.');
         return;
       }
-      note({ checkedAt: Date.now(), network });
+      if (first.step === 'off the Wi-Fi' || first.step === 'not reached') {
+        if (first.step === 'off the Wi-Fi') {
+          ls.endedAt = Date.now();
+          log.info('The display is off the Wi-Fi: in deep sleep.');
+        }
+        return;
+      }
+      const second = { at: Date.now(), how: this.daily ? 'playlist sent again' : 'photo sent again', result: 'sending' };
+      ls.tries.push(second);
+      this.store.save();
+      try {
+        if (this.daily) await this.run('Sending the playlist', () => this.daily.send('light sleep'));
+        else await this.run('Sending again', () => this.push(this.state.current, { reason: 'light sleep' }));
+      } catch (err) {
+        second.result = `not sent: ${err.message}`;
+      }
+      if (second.result === 'sending') {
+        const end = await this.watchWifi({ untilAsleep: true });
+        second.result = end.result;
+        if (end.result === 'off the Wi-Fi') {
+          ls.endedAt = Date.now();
+          log.info('The display is off the Wi-Fi after the update: in deep sleep.');
+        }
+      }
+      if (!ls.endedAt) {
+        ls.gaveUp = Date.now();
+        log.warn('The display is still in a light sleep: press its power button and leave it alone; if it stays on the Wi-Fi, restart it.');
+      }
+    } finally {
+      this.fixing = false;
+      this.store.save();
     }
-    note({ step: network === 'on' ? 'still on the Wi-Fi' : 'asleep (Wi-Fi unknown)' });
-    if (network === 'on') log.warn('Deep sleep now: the display is asleep but still on the Wi-Fi (a light sleep).');
   }
 
   // "Sleep now" (/api/sleep): put the display to sleep without waiting for SLEEP_DELAY_SEC.
@@ -560,10 +675,10 @@ export class FrameApp {
   }
 
   async checkAsleep() {
-    if (this.busy || this.sleepTimer || this.retryTimer || this.daily?.nearChange()) return null;
+    if (this.busy || this.fixing || this.sleepTimer || this.retryTimer || this.daily?.nearChange()) return null;
     const own = this.state.sleep?.own && !this.state.sleep.asleep ? this.state.sleep : null;
     if (own && Date.now() - own.at < this.cfg.sleep.ownSleepSec * 1000) return null; // (give it time to go to sleep)
-    const { awake, battery, network } = await this.exclusive('Checking that the display is asleep', () => lookForDisplay(this.cfg, { battery: true }));
+    const { awake, battery, network } = await this.exclusive('Checking that the display is asleep', () => this.look({ battery: true }));
     const st = this.state;
     const prev = st.lastCheck;
     st.lastCheck = { at: Date.now(), awake, network: awake ? 'on' : network };
@@ -573,7 +688,10 @@ export class FrameApp {
       const z = st.sleep;
       if (z && !z.asleep && z.mode === this.cfg.sleep.mode) st.sleep = { mode: z.mode, asleep: true, sleptAt: Date.now(), self: true };
       if (st.sleep?.asleep && network) st.sleep.network = network;
+      // (Not when a change is due within the hour: the display wakes up for it anyway.)
+      const act = this.lightSleepSeen(network) && !this.daily?.changeSoon();
       this.store.save();
+      if (act) await this.fixLightSleep();
       return false;
     }
     const event = this.noteWake();
@@ -769,6 +887,7 @@ export class FrameApp {
       dither: this.cfg.image.dither,
       sleep: this.cfg.display.host ? this.sleepStatus() : null,
       deepSleep: st.deepSleep || null,
+      lightSleep: st.lightSleep || null,
       displayCheck: st.displayCheck || null,
       check: this.cfg.display.host && this.cfg.sleep.mode !== 'off' && this.cfg.sleep.checkMin
         ? { everyMin: this.cfg.sleep.checkMin, last: st.lastCheck || null, wakeEvents: (st.wakeEvents || []).filter((e) => !e.afterChange).slice(0, 10) }

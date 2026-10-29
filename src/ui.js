@@ -104,6 +104,7 @@ function batteryHtml(s) {
   const b = s.battery;
   if (!b) return '–';
   let h = esc(b.batteryPercent + '%' + (b.pluggedIn ? ' (charging)' : '') + ' · ' + fmt(b.at));
+  if (b.batteryPercent < 20 && !b.pluggedIn) h += ' · <span class="err">low: charge the display</span>';
   const days = s.batteryDays || [];
   if (days.length > 1) h += '<br><span class="muted">' + esc('Per day: ' + days.map((d) => d.day + ' ' + d.percent + '%' + (d.charging ? ' (charging)' : '')).join(' · ')) + '</span>';
   return h;
@@ -127,10 +128,28 @@ function sleepHtml(s) {
   if (z.own) return 'awake, goes to sleep by itself';
   return 'awake';
 }
+// A light sleep the NAS noticed (asleep, but on the Wi-Fi at several checks in a row), and what
+// it did about it. A finished one shows for a day.
+function lightSleepHtml(ls) {
+  if (!ls || !ls.strikes) return '';
+  const end = ls.endedAt || ls.lastSeen;
+  if (ls.endedAt && Date.now() - ls.endedAt > 86400000) return '';
+  const tries = (ls.tries || []).map((t) => hm(t.at) + ' ' + t.how + ': ' + t.result).join('; ');
+  let text = 'On the Wi-Fi while asleep (a light sleep) ' + fmt(ls.since) + ' to ' + (ls.endedAt ? hm(end) : 'now');
+  if (tries) text += '. ' + tries;
+  let bad = !ls.endedAt;
+  if (ls.endedAt) text += '. Off the Wi-Fi again ' + fmt(ls.endedAt) + '.';
+  else if (ls.charging) { text += '. On the charger, so left alone.'; bad = false; }
+  else if (ls.gaveUp) text += '. The NAS could not get it into deep sleep: press its power button and leave it alone; if it stays on the Wi-Fi, restart it (hold the power button until the screen goes white, then switch it on).';
+  else if (!tries) text += ' (' + ls.strikes + (ls.strikes === 1 ? ' check' : ' checks') + '): the NAS puts it into deep sleep if it stays that way.';
+  return '<br><span class="' + (bad ? 'err' : 'muted') + '">' + esc(text) + '</span>';
+}
 // The last "Deep sleep now", step by step.
 function deepSleepHtml(d) {
   if (!d) return '';
-  const head = 'Deep sleep now ' + fmt(d.at) + ': ';
+  // (One the NAS sent for a light sleep shows there once it is over.)
+  if (d.why === 'light sleep' && !['sending', 'sent', 'asleep'].includes(d.step)) return '';
+  const head = (d.why === 'light sleep' ? 'Deep sleep (the NAS, for a light sleep) ' : 'Deep sleep now ') + fmt(d.at) + ': ';
   const asleep = d.asleepAfter != null ? 'asleep after ' + d.asleepAfter + ' s' : '';
   let text;
   let bad = false;
@@ -142,6 +161,7 @@ function deepSleepHtml(d) {
   else if (d.step === 'asleep (Wi-Fi unknown)') text = asleep + '; whether it left the Wi-Fi is unknown';
   else if (d.step === 'awake again') text = asleep + '; awake again after ' + d.awakeAfter + ' s';
   else if (d.step === 'not reached') text = 'no answer, not even to Wake-on-LAN (in deep sleep already?)';
+  else if (d.step === 'charging') text = 'on the charger, so left alone';
   else if (d.step === 'still awake') { text = 'it took the command but stayed awake'; bad = true; }
   else { text = d.error || d.step; bad = true; }
   return '<br><span class="' + (bad ? 'err' : 'muted') + '">' + esc(head + text) + '</span>';
@@ -180,6 +200,7 @@ function changesHtml(pl) {
     const bat = c.battery != null ? ', battery ' + c.battery + '%' : '';
     if (c.online) return esc(fmt(c.at) + ': online ' + Math.round((c.online - c.at) / 1000) + ' s after the change' + bat);
     if (c.until > Date.now()) return esc(fmt(c.at) + ': looking for the display until ' + hm(c.until) + '…');
+    if (c === pl.changes[0]) return '<span class="err">' + esc(fmt(c.at) + ': the display did not come online, so it may not have changed the photo (empty battery? stuck?). Press its power button; if the frame doesn’t show today’s photo then, press Send playlist.') + '</span>';
     return esc(fmt(c.at) + ': the display did not come online');
   });
   return rows.length ? rows.join('<br>') : '–';
@@ -223,7 +244,7 @@ function render(s) {
       ['Next update', fmt(s.nextRun)],
     ]),
     ['Battery', batteryHtml(s)],
-    ['Display', sleepHtml(s) + deepSleepHtml(s.deepSleep)],
+    ['Display', sleepHtml(s) + lightSleepHtml(s.lightSleep) + deepSleepHtml(s.deepSleep)],
     ['Sleep checks', watchHtml(s.check)],
     ['Display check', checkText(s)],
     ['This round', s.cycle ? esc(s.cycle.shown + ' of ' + s.cycle.total + ' photos ' + (pl ? 'shown or planned' : 'shown') + ' (round ' + s.cycle.n + ')') : '–'],

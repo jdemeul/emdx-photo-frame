@@ -40,11 +40,14 @@ export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage =
   // ignoresPowerOff: how many power-off commands it acknowledges but then stays awake
   // (Infinity: all of them). wakeOnChangeMs: after a playlist change it comes online for that
   // long; sleepsAfterUpdateMs: it goes to sleep by itself that long after downloading content;
-  // lightSleep: asleep but still on the Wi-Fi, so a connection attempt hangs instead of failing.
+  // lightSleep: asleep but still on the Wi-Fi, so a connection attempt hangs instead of failing,
+  // and Wake-on-LAN wakes it whatever network standby says (as an EM32DX did); offNetwork: off
+  // the Wi-Fi (tests map this to "host unreachable"); deepAfterUpdate: going to sleep after an
+  // update takes it off the Wi-Fi.
   const state = {
     awake: true, networkStandby: true, hearsWol: true, ignoresPowerOff: 0, pluggedIn: false,
     sleepAfter: [0x07], applySleep: false, playing: null, thumbnailsPosted: 0, wakeOnChangeMs: 0, sleepsAfterUpdateMs: 0,
-    lightSleep: false,
+    lightSleep: false, offNetwork: false, deepAfterUpdate: false,
   };
   const held = new Set();
   let updateTimer = null;
@@ -145,7 +148,11 @@ export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage =
           state.playing = { content, images, durations: items.map((c) => c.duration), startedAt: Date.now() };
           if (state.sleepsAfterUpdateMs) {
             clearTimeout(updateTimer);
-            updateTimer = setTimeout(() => { state.awake = false; events.push('slept-by-itself'); }, state.sleepsAfterUpdateMs);
+            updateTimer = setTimeout(() => {
+              state.awake = false;
+              if (state.deepAfterUpdate) Object.assign(state, { lightSleep: false, offNetwork: true });
+              events.push('slept-by-itself');
+            }, state.sleepsAfterUpdateMs);
           }
         } catch (err) {
           events.push(`fetch-error:${err.message}`);
@@ -177,7 +184,7 @@ export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage =
   const wol = dgram.createSocket('udp4');
   wol.on('message', (msg) => {
     if (!msg.equals(magic)) return events.push('wol-other');
-    const heard = state.networkStandby && state.hearsWol;
+    const heard = !state.offNetwork && (state.networkStandby || state.lightSleep) && state.hearsWol;
     events.push(heard ? 'wol' : 'wol-unheard');
     if (heard) state.awake = true;
   });
@@ -191,7 +198,7 @@ export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage =
     received,
     state,
     showing,
-    wake() { state.awake = true; },
+    wake() { Object.assign(state, { awake: true, offNetwork: false }); },
     close: () => new Promise((r) => { clearInterval(changeWatch); clearTimeout(dozeTimer); clearTimeout(updateTimer); for (const s of held) s.destroy(); wol.close(); server.close(r); }),
   };
 }

@@ -515,3 +515,92 @@ test('playlist mode: the display comes online after each change; the NAS reads t
     for (const k of ['PHOTO_DIR', 'UPDATE_MODE', 'PLAYLIST_DAYS', 'PLAYLIST_TOPUP_DAYS', 'SCHEDULE', 'PANEL_WIDTH', 'PANEL_HEIGHT', 'WAKE_WINDOW_MIN', 'SLEEP_CHECK_MIN']) delete process.env[k];
   }
 });
+
+test('deep sleep mode: a display that stays on the Wi-Fi while asleep is put into deep sleep by the NAS; if it can\'t be, the page says so; on the charger it is left alone', { skip: !hasOpenssl && 'openssl not available', timeout: 180000 }, async () => {
+  const { startFakeEmdx } = await import('./helpers/fakeEmdx.js');
+  const emdx = await startFakeEmdx({ pin: '636363', thumbnails: false });
+  emdx.state.sleepsAfterUpdateMs = 300;
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'frame-light-'));
+  const photoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'frame-light-photos-'));
+  for (let i = 0; i < 8; i++) fs.writeFileSync(path.join(photoDir, `p${i}.jpg`), await sharp(photoSvg(i)).jpeg({ quality: 85 }).toBuffer());
+  Object.assign(process.env, {
+    DATA_DIR: dataDir, ALBUM_URLS: '', PHOTO_DIR: photoDir, EMDX_HOST: '127.0.0.1', EMDX_PORT: String(emdx.port), EMDX_PIN: '636363',
+    SERVER_HOST: '127.0.0.1', HTTP_PORT: '18463', PANEL_WIDTH: '640', PANEL_HEIGHT: '360', ORIENTATION: 'portrait',
+    FETCH_TIMEOUT_SEC: '20', CONNECT_ATTEMPTS: '2', EMDX_MAC: emdx.mac, WOL_BROADCAST: '127.0.0.1', WOL_PORT: String(emdx.wolPort),
+    WAKE_WAIT_SEC: '0.1', SLEEP_MODE: 'deep', SLEEP_DELAY_SEC: '1', SLEEP_CHECK_MIN: '0',
+    UPDATE_MODE: 'playlist', PLAYLIST_DAYS: '3', SCHEDULE: '0 6 * * *', TZ,
+  });
+  try {
+    const { loadConfig, DEVICE_PALETTE } = await import('../src/config.js');
+    const { Store } = await import('../src/state.js');
+    const { buildPaletteModel } = await import('../src/color.js');
+    const { FrameApp } = await import('../src/app.js');
+    const { createServer } = await import('../src/server.js');
+    const cfg = loadConfig();
+    Object.assign(cfg.update, { minFirstSec: 1, minTailSec: 0.2, quietSec: 0.5 });
+    Object.assign(cfg.sleep, { confirmSec: 2, confirmEverySec: 0.2, ownSleepSec: 0, offWifiChecksSec: [0.3, 0.3, 0.3, 0.3] });
+    Object.assign(cfg.display, { sleepWindowSec: 1, awakeWindowSec: 1, probeTimeoutSec: 0.3 });
+    const app = new FrameApp(cfg, new Store(dataDir), buildPaletteModel(cfg.image.measuredPalette, DEVICE_PALETTE));
+    const server = createServer(cfg, app);
+    app.server = server;
+    await server.listen();
+    cleanups.push(async () => { app.cancelSleep(); await server.close(); await emdx.close(); });
+    // (A display off the Wi-Fi makes a connection attempt fail with "host unreachable", which
+    // can't be had on this machine: the fake's offNetwork stands in for it.)
+    const look = app.look.bind(app);
+    app.look = (opts) => (!emdx.state.awake && emdx.state.offNetwork ? Promise.resolve({ awake: false, battery: null, network: 'off' }) : look(opts));
+    const ls = () => app.state.lightSleep;
+    const powerOffs = () => emdx.events.filter((e) => e === 'cmd:11:0').length;
+    const intoLightSleep = () => Object.assign(emdx.state, { awake: false, lightSleep: true, offNetwork: false });
+
+    // The playlist goes out, and this display then goes into a light sleep: asleep, but on the Wi-Fi.
+    await app.daily.startup();
+    emdx.state.lightSleep = true;
+    assert.equal(await app.checkAsleep(), true);
+    await until(() => emdx.received.length === 1 && !emdx.state.awake);
+
+    // One sleep check that finds it on the Wi-Fi: noted, nothing done yet.
+    assert.equal(await app.checkAsleep(), false);
+    assert.deepEqual([ls().strikes, ls().tries.length, app.state.sleep.network], [1, 0, 'on']);
+
+    // The second: the NAS wakes it (Wake-on-LAN reaches it now) and sends what the Samsung app
+    // sends for deep sleep. This display stays on the Wi-Fi even so; then the playlist goes
+    // out again, after which it goes into deep sleep by itself.
+    emdx.state.deepAfterUpdate = true;
+    assert.equal(await app.checkAsleep(), false);
+    assert.deepEqual(ls().tries.map((t) => [t.how, t.result]), [['deep sleep command', 'still on the Wi-Fi'], ['playlist sent again', 'off the Wi-Fi']]);
+    assert.ok(ls().endedAt);
+    assert.equal(emdx.received.length, 2);
+    assert.equal(app.state.deepSleep.why, 'light sleep');
+    assert.equal(await app.checkAsleep(), false); // off the Wi-Fi: all quiet
+    assert.equal(app.state.sleep.network, 'off');
+
+    // Another light sleep, which neither helps against: the page asks for a hand, and the NAS
+    // doesn't keep trying.
+    emdx.state.deepAfterUpdate = false;
+    intoLightSleep();
+    await app.checkAsleep();
+    await app.checkAsleep();
+    assert.ok(ls().gaveUp);
+    assert.deepEqual(ls().tries.map((t) => t.result), ['still on the Wi-Fi', 'still on the Wi-Fi']);
+    const offs = powerOffs();
+    const sent = emdx.received.length;
+    await app.checkAsleep();
+    assert.deepEqual([powerOffs(), emdx.received.length], [offs, sent]);
+    const status = await (await fetch('http://127.0.0.1:18463/api/status')).json();
+    assert.ok(status.lightSleep.gaveUp);
+
+    // Once it is off the Wi-Fi the episode is over. On the charger, a light sleep is left alone.
+    emdx.state.offNetwork = true;
+    await app.checkAsleep();
+    assert.ok(ls().endedAt);
+    intoLightSleep();
+    emdx.state.pluggedIn = true;
+    await app.checkAsleep();
+    await app.checkAsleep();
+    assert.ok(ls().charging);
+    assert.deepEqual([ls().tries.map((t) => t.result), powerOffs()], [['charging'], offs]);
+  } finally {
+    for (const k of ['PHOTO_DIR', 'UPDATE_MODE', 'PLAYLIST_DAYS', 'SCHEDULE', 'PANEL_WIDTH', 'PANEL_HEIGHT', 'SLEEP_CHECK_MIN']) delete process.env[k];
+  }
+});

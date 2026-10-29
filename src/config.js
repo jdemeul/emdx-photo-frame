@@ -214,6 +214,9 @@ export function loadConfig() {
       ownSleepSec: 15 * 60,
       // "Deep sleep now": once asleep, look whether it is off the Wi-Fi after these pauses (s).
       offWifiChecksSec: [15, 15, 30, 60, 120, 240],
+      // SLEEP_MODE=deep: asleep but still on the Wi-Fi at this many sleep checks in a row is a
+      // light sleep, and the NAS puts the display into deep sleep.
+      lightSleepChecks: 2,
       // Playlist mode: how long the NAS looks for the display after each change.
       wakeWindowMin: num('WAKE_WINDOW_MIN', 15),
       confirmSec: 150, // after a sleep command, how long to wait for it to stop answering

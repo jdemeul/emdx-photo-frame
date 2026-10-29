@@ -302,8 +302,8 @@ export async function putToSleep(cfg, { networkStandby = true } = {}) {
 // Sleep After as it was: 10 min if it was off, as deep sleep mode needs it), then the command of
 // its Sleep button ("the device will enter deep sleep mode"), 0x11 00. The app has no other
 // command for deep sleep. Wakes a display in a light sleep with Wake-on-LAN first.
-// Returns { battery, sleepAfter }.
-export async function deepSleepNow(cfg) {
+// `unlessCharging`: send nothing if it is on the charger. Returns { battery, sleepAfter, charging }.
+export async function deepSleepNow(cfg, { unlessCharging = false } = {}) {
   const device = await connect(cfg, { quiet: true });
   let battery = null;
   let sleepAfter = null;
@@ -313,6 +313,7 @@ export async function deepSleepNow(cfg) {
     } catch (err) {
       log.debug(`No battery info: ${err.message}`);
     }
+    if (unlessCharging && battery?.pluggedIn) return { battery, sleepAfter, charging: true };
     await sleep(300);
     await cmd(device, CMD_NETWORK_STANDBY, [0x01], 'Turning network standby on');
     await sleep(300);
@@ -333,7 +334,7 @@ export async function deepSleepNow(cfg) {
     await close(device);
   }
   log.info(`Deep sleep now sent (network standby off, Sleep After ${sleepAfter}).`);
-  return { battery, sleepAfter };
+  return { battery, sleepAfter, charging: false };
 }
 
 // After a sleep command: did it really go to sleep? Probe without Wake-on-LAN (which would
