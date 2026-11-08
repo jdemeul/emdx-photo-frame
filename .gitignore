@@ -1,4 +1,7 @@
 node_modules/
+# Settings with the display's PIN and the page password (and old copies of them).
 .env
+.env.*
+!.env.example
 # Runtime state and photos from local test runs (docker run -v "$PWD/data:/data").
 data/

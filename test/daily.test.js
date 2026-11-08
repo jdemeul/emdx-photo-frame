@@ -724,7 +724,11 @@ test('a missed change: the NAS looks for the display every few seconds and sends
     const soon = hhmm(Date.now() + 40 * 60000);
     app.noteCleaning({ hour: soon[0], minute: soon[1] });
     assert.deepEqual([app.nearCleaning(), app.cleaningSoon()], [false, true]);
-    // A display that doesn't say: CLEANING_TIME stands in.
+    // A read that fails keeps the time the display gave before.
+    app.noteCleaning({ error: 'NAK' });
+    assert.deepEqual([app.cleaning().hour, app.cleaning().minute, app.cleaning().source], [...soon, 'display']);
+    // A display that never says: CLEANING_TIME stands in.
+    delete app.state.cleaning;
     app.noteCleaning({ error: 'NAK' });
     assert.equal(app.cleaning(), null);
     cfg.display.cleaningTime = { hour: nowHm[0], minute: nowHm[1] };

@@ -155,7 +155,7 @@ export async function lookForDisplay(cfg, { battery: readBattery = false, cleani
   const device = new Device({ host: d.host, port: d.port, pin: d.pin });
   try {
     try {
-      await withTimeout(device.connect(), (d.probeTimeoutSec ?? 6) * 1000, 'Probe');
+      await withTimeout(device.connect(), (d.probeTimeoutSec ?? 10) * 1000, 'Probe');
       guard(device);
     } catch (err) {
       return { awake: false, battery: null, network: networkState(err) };
@@ -266,8 +266,10 @@ export async function pushContent(cfg, server, content, { networkStandby = null,
   const what = push.count === 1 ? 'the image' : `all ${push.count} images`;
   let battery = null;
   let waitedSec = null;
+  let ackTimedOut = null;
   try {
     for (let attempt = 1; attempt <= d.pushAttempts; attempt++) {
+      ackTimedOut = null;
       const device = await connect(cfg, attempt === 1 ? connectOpts : {});
       if (attempt === 1) waitedSec = device.waitedSec ?? null;
       try {
@@ -286,12 +288,21 @@ export async function pushContent(cfg, server, content, { networkStandby = null,
           await sleep(300);
         }
         log.info(`Asking the display to download ${push.contentUrl}`);
-        await withTimeout(device.setContentDownload({ url: push.contentUrl }), 15000, 'Sending the content URL');
+        try {
+          await withTimeout(device.setContentDownload({ url: push.contentUrl }), (d.contentAckSec ?? 15) * 1000, 'Sending the content URL');
+        } catch (err) {
+          // No answer in time (8 Nov 2026): it may have taken the URL all the same, and its
+          // downloads tell. Anything else (a refusal, a dropped connection) is an error.
+          if (!err.timedOut) throw err;
+          log.warn(`${err.message}; waiting to see whether the display downloads it anyway.`);
+          ackTimedOut = err;
+        }
       } finally {
         await close(device);
       }
       // Waits until every image is fetched, or until no new one came for FETCH_TIMEOUT_SEC.
       const got = await push.waitForImages(d.fetchTimeoutSec * 1000);
+      if (got === push.count && ackTimedOut) log.info('The display downloaded it after all.');
       if (got === push.count) {
         log.info(`The display downloaded ${what}; it will refresh in a moment.`);
         return { battery, waitedSec, content: push.saved() };
@@ -304,6 +315,7 @@ export async function pushContent(cfg, server, content, { networkStandby = null,
   } finally {
     push.done();
   }
+  if (ackTimedOut) throw new Error(`${ackTimedOut.message}, and the display downloaded nothing.`);
   throw new Error(
     `The display accepted the command but never downloaded ${push.imageUrl}. `
       + 'Check that it can reach this NAS on that address (SERVER_HOST, HTTP_PORT, NAS firewall).',

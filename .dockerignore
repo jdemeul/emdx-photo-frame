@@ -5,3 +5,5 @@ test
 .git
 *.md
 docs
+.env.*
+!.env.example

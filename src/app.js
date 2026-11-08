@@ -20,6 +20,9 @@ const SCHEDULED = new Set(['schedule', 'retry', 'start']);
 // After this many requests without a single thumbnail, stop waiting for them: the firmware
 // doesn't send any (the EM32DX's doesn't). Check display still asks, without waiting.
 const THUMB_TRIES = 3;
+// How long an action waits for a quick look at the display to finish: a look can take its
+// connection timeout, a battery and a cleaning-time read, and the disconnect (~30 s at worst).
+const PROBE_WAIT_MS = 40000;
 const pause = (ms) => new Promise((r) => setTimeout(r, ms));
 
 export class FrameApp {
@@ -47,10 +50,10 @@ export class FrameApp {
 
   // One thing at a time: the display takes one connection at a time, and the album and the
   // renders are shared. `probe`: a quick look at the display (sleep checks), which anything else
-  // waits for (a few seconds at most) instead of failing as busy.
+  // waits for (seconds) instead of failing as busy.
   async exclusive(what, fn, { probe = false } = {}) {
     if (this.busy?.probe && !probe) {
-      for (const end = Date.now() + 10000; this.busy?.probe && Date.now() < end;) await pause(200);
+      for (const end = Date.now() + PROBE_WAIT_MS; this.busy?.probe && Date.now() < end;) await pause(200);
     }
     if (this.busy) {
       const err = new Error(`Busy: ${this.busy.what}`);
@@ -156,6 +159,9 @@ export class FrameApp {
         say('Downloading');
         inputs = await this.download(plan);
       } catch (err) {
+        // A network or Google outage isn't the photo's fault: stop here and try again at the next
+        // chance (benching photo after photo for a week would empty a small album).
+        if (!err.photoProblem) throw new Error(`Could not download the photo: ${err.message}`);
         log.warn(`Skipping ${err.itemId} for a week: ${err.message}`);
         st.excluded[err.itemId] = { reason: 'download failed', until: Date.now() + 7 * DAY };
         sync();
@@ -226,6 +232,7 @@ export class FrameApp {
         inputs.push(it.source === 'folder' ? fs.readFileSync(it.path) : await downloadImage(sizedUrl(it, w, h)));
       } catch (err) {
         err.itemId = it.id;
+        if (it.source === 'folder') err.photoProblem = true; // (gone or unreadable)
         throw err;
       }
     }
@@ -479,9 +486,9 @@ export class FrameApp {
     const cfg = this.cfg;
     const rec = { at: Date.now(), why, step: 'sending' };
     const note = (fields) => { Object.assign(rec, fields); this.store.save(); };
-    this.state.deepSleep = rec;
     let done = false;
     await this.exclusive('Deep sleep now', async () => {
+      this.state.deepSleep = rec; // (not before: a busy refusal would leave "sending" on the page)
       this.cancelSleep();
       try {
         const { battery, sleepAfter, charging } = await deepSleepNow(cfg, { unlessCharging });
@@ -562,27 +569,35 @@ export class FrameApp {
   // hung halfway through it, the panel solid yellow (24 Oct). The NAS keeps its hands off the
   // display around the cleaning, as around a change. Its time comes from the display (read once
   // a day when the NAS talks to it anyway), else from CLEANING_TIME.
+  // (A time the display gave earlier still counts when a later read fails: it is the display's
+  // own setting, and a better guess than none.)
   cleaning() {
     const r = this.state.cleaning;
-    if (r && !r.error && r.hour != null) return { hour: r.hour, minute: r.minute, source: 'display', readAt: r.readAt };
+    if (r?.hour != null) return { hour: r.hour, minute: r.minute, source: 'display', readAt: r.goodAt ?? r.readAt };
     const c = this.cfg.display.cleaningTime;
     return c ? { ...c, source: 'setting' } : null;
   }
 
-  // Read the cleaning time from the display at the next chance? (Once a day.)
+  // Read the cleaning time from the display at the next chance? Once a day; after a read that
+  // failed, again within the hour.
   cleaningDue() {
     const r = this.state.cleaning;
-    return !!this.cfg.display.host && (!r?.readAt || Date.now() - r.readAt > 20 * 3600000);
+    const every = r?.error ? 3600000 : 20 * 3600000;
+    return !!this.cfg.display.host && (!r?.readAt || Date.now() - r.readAt > every);
   }
 
   noteCleaning(c) {
     if (!c) return;
     const prev = this.state.cleaning;
-    this.state.cleaning = { ...c, readAt: Date.now() };
+    const now = Date.now();
     if (c.error) {
-      if (!prev?.error) log.info(`The display didn't say when it cleans its panel (${c.error})${this.cfg.display.cleaningTime ? '; going by CLEANING_TIME' : ''}.`);
-    } else if (prev?.hour !== c.hour || prev?.minute !== c.minute) {
-      log.info(`The display cleans its panel daily at ${cleaningText(c)}; the NAS leaves it alone around then.`);
+      const known = prev?.hour != null ? { hour: prev.hour, minute: prev.minute, goodAt: prev.goodAt ?? prev.readAt } : {};
+      this.state.cleaning = { ...known, error: c.error, readAt: now };
+      const going = known.hour != null ? `; going by the time it gave before (${cleaningText(known)})` : this.cfg.display.cleaningTime ? '; going by CLEANING_TIME' : '';
+      if (!prev?.error) log.info(`The display didn't say when it cleans its panel (${c.error})${going}.`);
+    } else {
+      this.state.cleaning = { ...c, readAt: now, goodAt: now };
+      if (prev?.hour !== c.hour || prev?.minute !== c.minute) log.info(`The display cleans its panel daily at ${cleaningText(c)}; the NAS leaves it alone around then.`);
     }
     this.store.save();
   }
@@ -617,7 +632,7 @@ export class FrameApp {
     const clock = this.cleaningClock();
     const [before, afterSec] = this.cfg.update.cleaningQuietSec;
     const next = clock.next(Date.now());
-    return { time: cleaningText(c), source: c.source, readAt: r?.readAt ?? null, next, quietFrom: next - before * 1000, quietUntil: next + afterSec * 1000, ...(r?.error ? { error: r.error } : {}) };
+    return { time: cleaningText(c), source: c.source, readAt: c.source === 'display' ? c.readAt : r?.readAt ?? null, next, quietFrom: next - before * 1000, quietUntil: next + afterSec * 1000, ...(r?.error ? { error: r.error } : {}) };
   }
 
   // ---------- light sleep ----------
@@ -688,6 +703,10 @@ export class FrameApp {
         else await this.run('Sending again', () => this.push(this.state.current, { reason: 'light sleep' }));
       } catch (err) {
         second.result = `not sent: ${err.message}`;
+        if (err.busy) { // (something else was talking to it: no reason to give up for the day)
+          ls.tries.pop();
+          return;
+        }
       }
       if (second.result === 'sending') {
         const end = await this.watchWifi({ untilAsleep: true });
@@ -828,7 +847,10 @@ export class FrameApp {
         } catch (err) {
           log.warn(`Sleep check: could not send the playlist: ${err.message}`);
           event.error = err.message;
-          if (err.busy || err.unreachable || this.sleepTimer) return true; // (a failed send already scheduled the sleep)
+          // Leave it be: with SLEEP_MODE=standby the failed send already scheduled the sleep
+          // (run() → afterFailure()); in playlist mode with deep sleep it goes to sleep by
+          // itself, and a power-off command now would leave it in a light sleep (findings.md).
+          return true;
         }
         if (sent) {
           event.sent = 'playlist'; // it goes back to sleep after the update, as always
@@ -838,13 +860,13 @@ export class FrameApp {
         const { checkMin } = this.cfg.sleep;
         const stillAwake = prev?.awake && !(st.sleep?.sleptAt > prev.at) && (!checkMin || event.at - prev.at <= 2 * checkMin * 60000);
         const charging = !!battery?.pluggedIn;
-        if ((!stillAwake || charging) && !event.error) {
+        if (!stillAwake || charging) {
           log.info(charging ? 'Sleep check: the display is awake and charging; leaving it alone.'
             : 'Sleep check: the display is awake and its playlist is up to date; it goes back to sleep by itself (if it is still awake at the next check, the NAS sends it to sleep).');
           event.leftAlone = true;
           return true;
         }
-        if (!event.error) log.info('Sleep check: the display is still awake and its playlist is up to date; putting it back to sleep.');
+        log.info('Sleep check: the display is still awake and its playlist is up to date; putting it back to sleep.');
       } else if (this.photoWaiting()) {
         log.info('Sleep check: the display is awake and a photo is waiting; sending it.');
         await this.run('Sending the waiting photo', () => this.push(this.state.current, { reason: 'awake' }));
@@ -867,6 +889,10 @@ export class FrameApp {
     const event = { at: Date.now(), wasAsleep: this.believedAsleep(), ...extra };
     this.state.wakeEvents = [event, ...(this.state.wakeEvents || [])].slice(0, 30);
     this.markAwake();
+    // Awake is not a light sleep: strikes from before it don't count towards the next one (one
+    // the NAS already tried to fix stays, with what it tried, for the page).
+    const ls = this.state.lightSleep;
+    if (ls && !ls.endedAt && !ls.tries?.length) this.state.lightSleep = null;
     this.store.save();
     return event;
   }
@@ -964,7 +990,10 @@ export class FrameApp {
     this.thumbWaiters.add(deliver);
     const timer = setTimeout(() => { this.thumbWaiters.delete(deliver); deliver(null); }, timeoutSec * 1000);
     try {
-      await withDisplay(this.cfg, { quiet: true }, (device) => requestThumbnail(device, this.server.thumbnailUrl));
+      // One attempt, no Wake-on-LAN: this is for a display that is awake anyway; one that has
+      // gone back to sleep is left asleep (and not knocked on for minutes).
+      const opts = { quiet: true, wol: false, windowSec: this.cfg.display.probeTimeoutSec ?? 10 };
+      await withDisplay(this.cfg, opts, (device) => requestThumbnail(device, this.server.thumbnailUrl));
       this.thumbCount().asked++; // (counted once the display has taken the request)
       const th = await got;
       if (!th && this.thumbnailsWork() === false) log.info(`No thumbnail after ${THUMB_TRIES} requests: this display doesn't send them; not asking any more.`);

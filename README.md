@@ -83,7 +83,7 @@ The same status is available as JSON at `/api/status`, with the last requests th
 | `PHOTO_DIR` | — | Extra source: a NAS folder mounted at `/photos` (see `docker-compose.yml`) |
 | `EMDX_HOST`, `EMDX_PIN` | — | The display's address and MDC PIN. Without `EMDX_HOST` nothing is sent (a dry run, to preview the album) |
 | `SERVER_HOST`, `HTTP_PORT` | guessed, 8321 | The address the display downloads from, and the port of the web page |
-| `THUMBNAIL_PORT` | 6868 | Where the display sends thumbnails of its screen (only that, no page). `0`: ask for them at `HTTP_PORT` |
+| `THUMBNAIL_PORT` | 6868 | Where the display sends thumbnails of its screen (only that, no page). `0`: ask for them at `HTTP_PORT`. With `EMDX_HOST` an IP address, only that address may send them |
 | `PANEL` / `ORIENTATION` / `ROTATE` | EM32DX / landscape / 0 | EM13DX also known; or set `PANEL_WIDTH`/`PANEL_HEIGHT` |
 | `UPDATE_MODE` | push | `playlist` (the display changes the photos itself) or `push` (the NAS sends each photo) |
 | `SCHEDULE`, `TZ` | `0 6 * * *`, Europe/Brussels | When the photo changes (cron syntax) |

@@ -38,13 +38,20 @@ function str(name, def = undefined) {
   return String(v).trim();
 }
 
-function num(name, def) {
+// A number; `min`/`max`/`int` bound it (timers and ports: a negative interval would make Node
+// fire it every millisecond, knocking on the display nonstop).
+function num(name, def, { min = -Infinity, max = Infinity, int = false } = {}) {
   const v = str(name);
   if (v === undefined) return def;
   const n = Number(v);
   if (!Number.isFinite(n)) throw new Error(`${name} must be a number (got "${v}")`);
+  if (n < min || n > max || (int && !Number.isInteger(n))) {
+    const range = max === Infinity ? `at least ${min}` : `from ${min} to ${max}`;
+    throw new Error(`${name} must be ${int ? 'a whole number' : 'a number'} ${range} (got "${v}")`);
+  }
   return n;
 }
+const PORT = { min: 1, max: 65535, int: true };
 
 function bool(name, def) {
   const v = str(name);
@@ -96,8 +103,8 @@ export function guessLocalIp(displayHost) {
 export function loadConfig() {
   const panelName = (str('PANEL', 'EM32DX') || '').toUpperCase();
   const preset = PANELS[panelName];
-  let nativeW = num('PANEL_WIDTH', preset?.width);
-  let nativeH = num('PANEL_HEIGHT', preset?.height);
+  let nativeW = num('PANEL_WIDTH', preset?.width, { min: 1, int: true });
+  let nativeH = num('PANEL_HEIGHT', preset?.height, { min: 1, int: true });
   if (!nativeW || !nativeH) {
     throw new Error(`Unknown PANEL "${panelName}". Use ${Object.keys(PANELS).join(' or ')}, or set PANEL_WIDTH and PANEL_HEIGHT.`);
   }
@@ -120,7 +127,7 @@ export function loadConfig() {
   if (mac && mac.replace(/[^0-9a-f]/gi, '').length !== 12) {
     throw new Error(`EMDX_MAC must be a MAC address like 00:11:22:33:44:55 (got "${mac}")`);
   }
-  const httpPort = num('HTTP_PORT', 8321);
+  const httpPort = num('HTTP_PORT', 8321, PORT);
 
   // Default: let the display do the final dithering. On the EM32DX its own algorithm
   // beat the NAS ditherer side by side (deeper colours, quieter dark tones).
@@ -158,19 +165,24 @@ export function loadConfig() {
 
     display: {
       host: displayHost,
-      port: num('EMDX_PORT', 1515),
+      port: num('EMDX_PORT', 1515, PORT),
       pin: str('EMDX_PIN', '000000'),
       mac,
       wolBroadcast: str('WOL_BROADCAST', '255.255.255.255'),
-      wolPort: num('WOL_PORT', 9),
-      wakeWaitSec: num('WAKE_WAIT_SEC', 4),
-      connectAttempts: num('CONNECT_ATTEMPTS', 6),
-      fetchTimeoutSec: num('FETCH_TIMEOUT_SEC', 180),
-      pushAttempts: num('PUSH_ATTEMPTS', 2),
+      wolPort: num('WOL_PORT', 9, PORT),
+      wakeWaitSec: num('WAKE_WAIT_SEC', 4, { min: 0 }),
+      connectAttempts: num('CONNECT_ATTEMPTS', 6, { min: 1, int: true }),
+      fetchTimeoutSec: num('FETCH_TIMEOUT_SEC', 180, { min: 1 }),
+      pushAttempts: num('PUSH_ATTEMPTS', 2, { min: 1, int: true }),
       // Deep sleep: how long a button on the page waits for a display that is just waking up.
       awakeWindowSec: 30,
       // How long the NAS keeps trying to reach the display to send it to sleep.
       sleepWindowSec: 60,
+      // A quick look (no Wake-on-LAN): how long to wait for the connection. Longer than the ~8 s
+      // Linux takes to report "host unreachable" for an address it had seen recently (stale ARP
+      // entry: 5 s delay + 3 probes), else a display off the Wi-Fi times out and passes for one
+      // still on it.
+      probeTimeoutSec: 10,
       // The daily panel cleaning ("screen protection" in the Samsung app). The NAS reads its time
       // from the display; CLEANING_TIME (hh:mm) stands in when the display doesn't say.
       cleaningTime,
@@ -184,7 +196,7 @@ export function loadConfig() {
       // Where the display POSTs thumbnails of its screen. Samsung's app asks for them at
       // http://<phone>:6868/device-thumbnail (its own web server), and the EM32DX never sent one
       // to any other address, so the NAS listens on that port too. 0: ask at HTTP_PORT instead.
-      thumbnailPort: num('THUMBNAIL_PORT', 6868),
+      thumbnailPort: num('THUMBNAIL_PORT', 6868, { min: 0, max: 65535, int: true }),
     },
 
     schedule: str('SCHEDULE', '0 6 * * *'),
@@ -212,8 +224,8 @@ export function loadConfig() {
       thumbRecheckSec: 90,
     },
     runOnStart: bool('RUN_ON_START', false),
-    retryMinutes: num('RETRY_MINUTES', 20),
-    retries: num('RETRIES', 3),
+    retryMinutes: num('RETRY_MINUTES', 20, { min: 1 }),
+    retries: num('RETRIES', 3, { min: 0, int: true }),
 
     // What the display does once a photo (or playlist) is up.
     //   standby - power off with its Wi-Fi listener (network standby) on, so the next update
@@ -224,10 +236,10 @@ export function loadConfig() {
     //   off     - leave it to the display's own settings (e.g. when it is on mains power)
     sleep: {
       mode: oneOf('SLEEP_MODE', 'standby', ['standby', 'deep', 'off']),
-      delaySec: num('SLEEP_DELAY_SEC', 120), // let the panel finish redrawing first
+      delaySec: num('SLEEP_DELAY_SEC', 120, { min: 0 }), // let the panel finish redrawing first
       // Every this many minutes, check that the display is really asleep, and whether it is
       // off the Wi-Fi (0 = never). Every check knocks on the display's door, so not too often.
-      checkMin: num('SLEEP_CHECK_MIN', 30),
+      checkMin: num('SLEEP_CHECK_MIN', 30, { min: 0 }),
       // Playlist mode with deep sleep: how long the display gets to go to sleep by itself after
       // an update before the sleep check looks at it (its own Sleep After is 10 min or so).
       ownSleepSec: 15 * 60,
@@ -237,12 +249,12 @@ export function loadConfig() {
       // light sleep, and the NAS puts the display into deep sleep.
       lightSleepChecks: 2,
       // Playlist mode: how long the NAS looks for the display after each change.
-      wakeWindowMin: num('WAKE_WINDOW_MIN', 15),
+      wakeWindowMin: num('WAKE_WINDOW_MIN', 15, { min: 0.01 }),
       // Playlist mode: after a change the display missed (it didn't come online), look for it
       // this often (s; no Wake-on-LAN), to send it a fresh playlist as soon as it is back, e.g.
       // after a press on its power button (it then stays awake for its Sleep After, 10 min).
       // 0 = only at the regular sleep checks.
-      missedCheckSec: num('MISSED_CHECK_SEC', 60),
+      missedCheckSec: num('MISSED_CHECK_SEC', 60, { min: 0 }),
       confirmSec: 150, // after a sleep command, how long to wait for it to stop answering
       confirmEverySec: 15,
     },
@@ -258,9 +270,9 @@ export function loadConfig() {
     layout: {
       odd: oneOf('ODD_PHOTOS', 'pair', ['pair', 'crop', 'fit']),
       // A photo counts as "odd" when filling the whole frame would crop away more than this fraction.
-      oddThreshold: num('ODD_THRESHOLD', 0.35),
-      gap: num('PAIR_GAP', 20),
-      margin: num('FIT_MARGIN', 48),
+      oddThreshold: num('ODD_THRESHOLD', 0.35, { min: 0, max: 1 }),
+      gap: num('PAIR_GAP', 20, { min: 0, int: true }),
+      margin: num('FIT_MARGIN', 48, { min: 0, int: true }),
     },
 
     image: {
@@ -268,9 +280,9 @@ export function loadConfig() {
       method: oneOf('DITHER_METHOD', 'bluenoise', ['bluenoise', 'diffusion']),
       kernel: oneOf('DITHER_KERNEL', 'floyd-steinberg', ['floyd-steinberg', 'stucki', 'jarvis', 'sierra', 'atkinson']),
       // The display boosts colour itself, so start gentler when it does the dithering.
-      saturation: num('SATURATION', dither === 'device' ? 1.0 : 1.3),
+      saturation: num('SATURATION', dither === 'device' ? 1.0 : 1.3, { min: 0 }),
       contrast: num('CONTRAST', dither === 'device' ? 0.1 : 0.25),
-      gamma: num('GAMMA', 1.0),
+      gamma: num('GAMMA', 1.0, { min: 0.1, max: 10 }),
       autoLevels: bool('AUTO_LEVELS', true),
       sharpen: num('SHARPEN', 0.8),
       measuredPalette: parsePalette(str('PALETTE')),

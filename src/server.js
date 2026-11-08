@@ -1,5 +1,6 @@
 // HTTP server: (1) what the display downloads, (2) a small status page with buttons.
 import http from 'node:http';
+import net from 'node:net';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import { log, stamp } from './log.js';
@@ -128,12 +129,28 @@ export function createServer(cfg, app) {
     });
   }
 
+  // What only the display may POST (thumbnails, progress): with EMDX_HOST an IP address, from that
+  // address only, so that nothing else on the network can pass for the display's screen. (A
+  // host name isn't resolved here: then anyone may.)
+  const displayIp = net.isIP(cfg.display.host || '') ? cfg.display.host : null;
+  function refuseStranger(req, res, note) {
+    const from = (req.socket.remoteAddress || '').replace(/^::ffff:/, '');
+    if (!displayIp || from === displayIp) return false;
+    note.result = 'refused: not from the display';
+    log.warn(`Refused a ${req.method} to ${req.url.slice(0, 80)} from ${from}: only the display (${displayIp}) may send that.`);
+    req.resume(); // (drain the body)
+    res.writeHead(403, { 'Content-Type': 'text/plain' }).end('Only the display may send this');
+    return true;
+  }
+
   // The display may POST a thumbnail of its screen (multipart: device_id, content_id,
   // content_name, content_type, content_player_type, schedule_downloaded_timestamp,
   // thumbnail_timestamp and an image file) after MDC 0xC7/0x54 with this URL. (The EM32DX
   // never has; Samsung's app gets them at /device-thumbnail.)
   async function receiveThumbnail(req, res, note) {
+    if (refuseStranger(req, res, note)) return;
     let body = null;
+    let th;
     try {
       body = await readBody(req);
       note.bytes = body.length;
@@ -149,16 +166,24 @@ export function createServer(cfg, app) {
       note.result = image ? `thumbnail ${(image.buf.length / 1024).toFixed(0)} kB` : 'no image in it';
       log.info(`Display sent a thumbnail (${image ? `${(image.buf.length / 1024).toFixed(0)} kB` : 'no image'}; ${Object.entries(fields).map(([k, v]) => `${k}=${v}`).join(', ')})`);
       res.writeHead(200, { 'Content-Type': 'text/plain' }).end('OK');
-      app.onThumbnail?.({ at: Date.now(), from: req.socket.remoteAddress, fields, image });
+      th = { at: Date.now(), from: req.socket.remoteAddress, fields, image };
     } catch (err) {
       note.result = `unreadable: ${err.message}`;
       log.warn(`Could not read a thumbnail from the display (${req.headers['content-type'] || 'no content type'}, ${body?.length ?? '?'} bytes): ${err.message}`);
-      res.writeHead(err.status || 200, { 'Content-Type': 'text/plain' }).end(err.status ? undefined : 'OK');
+      if (!res.headersSent) res.writeHead(err.status || 200, { 'Content-Type': 'text/plain' }).end(err.status ? undefined : 'OK');
+      return;
+    }
+    // (After the answer: a problem handling it is ours, not the display's.)
+    try {
+      app.onThumbnail?.(th);
+    } catch (err) {
+      log.warn(`Could not handle the thumbnail: ${err.message}`);
     }
   }
 
   // Samsung's app also takes download progress reports from the display; log any we get.
   async function receiveProgress(req, res, note) {
+    if (refuseStranger(req, res, note)) return;
     try {
       const text = (await readBody(req)).toString('utf8').slice(0, 2000);
       note.result = text.slice(0, 160);
@@ -303,7 +328,8 @@ export function createServer(cfg, app) {
       let sameHost = true;
       try { sameHost = !origin || new URL(origin).host === req.headers.host; } catch { sameHost = false; }
       if (!sameHost) return json(res, 403, { error: 'Cross-origin request refused' });
-      if (app.busy) return json(res, 409, { error: `Busy: ${app.busy.what}` });
+      // (A quick look at the display doesn't count: the action waits for it, see exclusive().)
+      if (app.busy && !app.busy.probe) return json(res, 409, { error: `Busy: ${app.busy.what}` });
       if (p === '/api/display-info') {
         // Wakes the display and reads it; answers when done.
         app.displayInfo().then((info) => json(res, 200, info), (err) => json(res, 502, { error: err.message }));

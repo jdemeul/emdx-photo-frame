@@ -353,8 +353,10 @@ export class DailyPlaylist {
   }
 
   // ---------- the daily rhythm ----------
-  // Cron, at each change: note the display's new photo, prepare the photo for the new last day,
-  // then look for the display for a while (does it come online after a change?).
+  // Cron, at each change: note the display's new photo, look for the display for a while (does
+  // it come online after the change?), then read the album anew and prepare the photo for the
+  // new last day. Looking comes first: the display is online for a short while after a change,
+  // and reading the album and rendering can take minutes when Google is slow.
   async scheduled(reason) {
     const app = this.app;
     if (reason === 'start') return this.startup({ send: true });
@@ -381,15 +383,19 @@ export class DailyPlaylist {
           log.info('Playlist: a change time, but the display has no playlist yet.');
         }
         app.store.save();
-        await this.ensurePlan({ fresh: true });
       });
     } catch (err) {
       log.warn(`Playlist: ${err.message}`);
     }
-    if (this.cfg.display.host) {
-      if (this.cfg.sleep.mode === 'standby') await this.sendIfDue('schedule'); // Wake-on-LAN can reach it
-      else await this.watchAfterChange();
+    const watch = this.cfg.display.host && this.cfg.sleep.mode !== 'standby';
+    if (watch) await this.watchAfterChange();
+    await this.whenIdle();
+    try {
+      await app.exclusive('Preparing the coming photos', () => this.ensurePlan({ fresh: true }));
+    } catch (err) {
+      log.warn(`Playlist: ${err.message}`);
     }
+    if (this.cfg.display.host && !watch) await this.sendIfDue('schedule'); // (standby: Wake-on-LAN can reach it)
   }
 
   async whenIdle(maxMs = 10 * 60000) {

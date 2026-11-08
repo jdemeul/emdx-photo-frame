@@ -247,12 +247,16 @@ export function sizedUrl(item, minW, minH) {
   return `${item.url}=w${w}-h${h}-no`;
 }
 
+// `photoProblem` on the error: the trouble is this photo (gone, not an image), not the network
+// or Google being down (timeouts, 5xx, 408/429), which says nothing about the photo.
 export async function downloadImage(url) {
   return withRetries(async () => {
     const res = await http(url, {}, 60000);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    if (!res.ok) {
+      throw Object.assign(new Error(`HTTP ${res.status}`), { photoProblem: res.status >= 400 && res.status < 500 && ![408, 429].includes(res.status) });
+    }
     const type = res.headers.get('content-type') || '';
-    if (!type.startsWith('image/')) throw new Error(`Not an image (${type})`);
+    if (!type.startsWith('image/')) throw Object.assign(new Error(`Not an image (${type})`), { photoProblem: true });
     return Buffer.from(await res.arrayBuffer());
   }, 'Downloading photo');
 }

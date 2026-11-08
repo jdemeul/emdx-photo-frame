@@ -13,7 +13,8 @@
 // `state.battery` changes the battery level; `state.cleaning` [hour, minute] is its daily panel
 // cleaning time (0x1B/0xB0; null: it refuses the read); `state.thumbnailShows` (an index) makes
 // its thumbnails show that image of the playlist instead of the one it plays (a display that
-// came online without changing).
+// came online without changing); `state.ackContent` false makes it take a content URL without
+// answering (and download it anyway).
 import dgram from 'node:dgram';
 import net from 'node:net';
 import tls from 'node:tls';
@@ -51,6 +52,7 @@ export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage =
     awake: true, networkStandby: true, hearsWol: true, ignoresPowerOff: 0, pluggedIn: false,
     sleepAfter: [0x07], applySleep: false, playing: null, thumbnailsPosted: 0, wakeOnChangeMs: 0, sleepsAfterUpdateMs: 0,
     lightSleep: false, offNetwork: false, deepAfterUpdate: false, cleaning: [2, 0], thumbnailShows: null,
+    ackContent: true, // false: takes a content URL without answering, and downloads it all the same
   };
   const held = new Set();
   let updateTimer = null;
@@ -141,7 +143,7 @@ export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage =
       }
       if (cmd === 0xc7) {
         const url = payload.subarray(3, 3 + payload[2]).toString();
-        reply(sock, id, cmd, []);
+        if (state.ackContent) reply(sock, id, cmd, []);
         if (!fetchImage) return;
         try {
           const content = JSON.parse((await (await fetch(url)).text()).replaceAll('\\/', '/'));
