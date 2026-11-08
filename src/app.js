@@ -923,7 +923,7 @@ export class FrameApp {
     const info = await this.exclusive('Checking the display', async () => {
       const thumbnailUrl = this.thumbnailsWork() === false ? null : this.server?.thumbnailUrl;
       const read = await readDisplayInfo(this.cfg, { thumbnailUrl });
-      if (read.thumbnail === 'asked') this.state.thumbs.asked++;
+      if (read.thumbnail === 'asked') this.thumbCount().asked++;
       this.markAwake();
       this.scheduleSleep();
       this.noteBattery(read.battery);
@@ -937,10 +937,23 @@ export class FrameApp {
   }
 
   // ---------- thumbnails of the screen ----------
-  // Does this display send thumbnails of its screen (MDC 0xC7/0x54)? null: not known yet.
+  // Does this display send thumbnails of its screen (MDC 0xC7/0x54)? null: not known yet. The
+  // count starts over when the NAS asks at a new address (the EM32DX never sent one to port
+  // 8321; Samsung's app asks at port 6868, 8 Nov 2026).
   thumbnailsWork() {
-    const t = this.state.thumbs;
+    const t = this.thumbCount();
     return t.received > 0 ? true : t.asked >= THUMB_TRIES ? false : null;
+  }
+
+  thumbCount() {
+    const t = this.state.thumbs;
+    const url = this.server?.thumbnailUrl;
+    if (url && t.url !== url) {
+      if (t.url || t.asked) log.info(`Asking for thumbnails at ${url} from now on (the count of unanswered requests starts over).`);
+      Object.assign(t, { url, asked: 0, received: 0 });
+      this.store.save();
+    }
+    return t;
   }
 
   // Ask the display for a thumbnail and wait for it; null if none came (or none ever comes).
@@ -952,7 +965,7 @@ export class FrameApp {
     const timer = setTimeout(() => { this.thumbWaiters.delete(deliver); deliver(null); }, timeoutSec * 1000);
     try {
       await withDisplay(this.cfg, { quiet: true }, (device) => requestThumbnail(device, this.server.thumbnailUrl));
-      this.state.thumbs.asked++; // (counted once the display has taken the request)
+      this.thumbCount().asked++; // (counted once the display has taken the request)
       const th = await got;
       if (!th && this.thumbnailsWork() === false) log.info(`No thumbnail after ${THUMB_TRIES} requests: this display doesn't send them; not asking any more.`);
       return th;
@@ -967,7 +980,7 @@ export class FrameApp {
   // and in playlist mode matched against the photos.
   onThumbnail(th) {
     const st = this.state;
-    st.thumbs.received++;
+    this.thumbCount().received++;
     if (th.image?.buf?.length) {
       const ext = /png/i.test(th.image.type || '') || /\.png$/i.test(th.image.name || '') ? 'png' : 'jpg';
       const dir = this.store.path('thumbnails');

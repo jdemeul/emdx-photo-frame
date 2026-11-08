@@ -15,7 +15,12 @@ export function createServer(cfg, app) {
   // The last requests from the display (and to the endpoints it uses), in /api/status.
   const traffic = [];
   const baseUrl = `http://${cfg.server.publicHost}:${cfg.server.port}`;
-  const thumbnailUrl = `${baseUrl}/emdx/device-thumbnail`;
+  // Thumbnails: the address Samsung's app gives (its own web server on port 6868, path
+  // /device-thumbnail), on a second listener; or, with THUMBNAIL_PORT=0 or if that port can't be
+  // opened, the main port.
+  const thumbPort = cfg.server.thumbnailPort && cfg.server.thumbnailPort !== cfg.server.port ? cfg.server.thumbnailPort : 0;
+  const mainThumbnailUrl = `${baseUrl}/emdx/device-thumbnail`;
+  let thumbnailUrl = thumbPort ? `http://${cfg.server.publicHost}:${thumbPort}/device-thumbnail` : mainThumbnailUrl;
 
   // Register content for the display to download: one image, or a playlist of images that
   // the display plays by itself ({ items: [{ buf or file, ext, durationMs }], contentType:
@@ -189,21 +194,35 @@ export function createServer(cfg, app) {
     return a.length === b.length && crypto.timingSafeEqual(a, b);
   }
 
-  const server = http.createServer((req, res) => {
-    const url = new URL(req.url, 'http://x');
-    const p = url.pathname;
-
-    // Note what the display asks for, and anything sent to the endpoints it uses.
+  // Note what the display asks for, and anything sent to the endpoints it uses.
+  function noteRequest(req, res, p, port = null) {
     const fromDisplay = (req.socket.remoteAddress || '').replace(/^::ffff:/, '') === cfg.display.host;
     const displayPath = p.startsWith('/emdx/') || p.endsWith('/device-thumbnail') || p.endsWith('/content-transfer-progress');
-    const note = { at: Date.now(), method: req.method, path: req.url.slice(0, 160), from: fromDisplay ? 'display' : (req.socket.remoteAddress || '').replace(/^::ffff:/, '') };
-    if (fromDisplay || (displayPath && req.method === 'POST')) {
+    const note = { at: Date.now(), method: req.method, path: req.url.slice(0, 160), from: fromDisplay ? 'display' : (req.socket.remoteAddress || '').replace(/^::ffff:/, ''), ...(port ? { port } : {}) };
+    if (fromDisplay || (displayPath && req.method === 'POST') || port) {
       if (req.headers['content-type']) note.type = req.headers['content-type'].slice(0, 100);
       if (req.headers['user-agent']) note.agent = req.headers['user-agent'].slice(0, 80);
       traffic.unshift(note);
       traffic.length = Math.min(traffic.length, 40);
       res.on('finish', () => { note.status = res.statusCode; });
     }
+    return { note, fromDisplay };
+  }
+
+  // The thumbnail port: only what the display sends there (no page, no files).
+  const side = thumbPort ? http.createServer((req, res) => {
+    const p = new URL(req.url, 'http://x').pathname;
+    const { note, fromDisplay } = noteRequest(req, res, p, thumbPort);
+    if (p.endsWith('/device-thumbnail') && req.method === 'POST') return receiveThumbnail(req, res, note);
+    if (p.endsWith('/content-transfer-progress') && req.method === 'POST') return receiveProgress(req, res, note);
+    if (fromDisplay) log.info(`Display requested ${req.method} ${req.url} on port ${thumbPort}`);
+    res.writeHead(404).end();
+  }) : null;
+
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, 'http://x');
+    const p = url.pathname;
+    const { note, fromDisplay } = noteRequest(req, res, p);
 
     // ---- endpoints the display uses (no auth: the display can't do it) ----
     const m = /^\/emdx\/([0-9A-F-]{36})\/([^/]+)$/.exec(p);
@@ -298,7 +317,7 @@ export function createServer(cfg, app) {
 
   return {
     baseUrl,
-    thumbnailUrl,
+    get thumbnailUrl() { return thumbnailUrl; },
     registerContent,
     registerPush,
     restoreContent,
@@ -310,13 +329,28 @@ export function createServer(cfg, app) {
           log.info(`HTTP server on port ${cfg.server.port}; the display will download from ${baseUrl}`);
           resolve();
         });
-      });
+      }).then(() => side && new Promise((resolve) => {
+        const failed = (err) => {
+          log.warn(`Could not listen on port ${thumbPort} for thumbnails (${err.code || err.message}); asking for them on port ${cfg.server.port} instead.`);
+          thumbnailUrl = mainThumbnailUrl;
+          resolve();
+        };
+        side.once('error', failed);
+        side.listen(thumbPort, '0.0.0.0', () => {
+          side.off('error', failed);
+          side.on('error', (err) => log.warn(`Thumbnail port: ${err.message}`));
+          log.info(`Listening on port ${thumbPort} for thumbnails of the screen (${thumbnailUrl})`);
+          resolve();
+        });
+      }));
     },
     close() {
-      return new Promise((resolve) => {
-        server.close(() => resolve());
-        server.closeAllConnections?.();
+      const closing = (s) => new Promise((resolve) => {
+        if (!s?.listening) return resolve();
+        s.close(() => resolve());
+        s.closeAllConnections?.();
       });
+      return Promise.all([closing(server), closing(side)]).then(() => {});
     },
   };
 }

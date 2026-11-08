@@ -250,6 +250,7 @@ export class DailyPlaylist {
     this.st.missed = {
       key: rec.key, at: rec.at, since: prev?.since ?? rec.at, count: (prev?.count ?? 0) + 1,
       stillShows: prev ? prev.stillShows ?? null : this.before ?? null, // (what was on the frame before the first missed change)
+      ...(rec.seen ? { seen: rec.seen } : {}), // (it came online, but its thumbnail showed another photo)
     };
     this.app.store.save();
     const every = this.cfg.sleep.missedCheckSec;
@@ -264,13 +265,42 @@ export class DailyPlaylist {
   verdict(rec) {
     const h = this.app.state.history.find((e) => e.change === rec.key && e.what);
     if (!h) return;
-    if (rec.online) {
-      h.kind = `${h.what}, changed by the display (it came online ${Math.max(0, Math.round((rec.online - rec.at) / 1000))} s after the change)${h.loop || ''}`;
+    const s = rec.seen;
+    if (rec.online && s?.sure && !s.changed) {
+      h.missed = true;
+      h.kind = `${h.what}: not changed (the display came online, but its screen shows ${s.label}'s photo)${h.loop || ''}`;
+    } else if (rec.online) {
+      h.kind = `${h.what}, changed by the display (${s?.changed ? `its screen shows it; ` : ''}it came online ${Math.max(0, Math.round((rec.online - rec.at) / 1000))} s after the change)${h.loop || ''}`;
     } else {
       h.missed = true;
       h.kind = `${h.what}: probably not changed (the display did not come online after the change)${h.loop || ''}`;
     }
     this.app.store.save();
+  }
+
+  // After a change the display came online for: ask what it shows (if it sends thumbnails). A
+  // thumbnail of another photo may come a little early (it draws for about a minute): ask again
+  // thumbRecheckSec later. Notes rec.seen { key, label, expected, sure, changed }.
+  async checkChange(rec) {
+    if (this.app.thumbnailsWork() === false) return null;
+    let e = await this.observe('after a change');
+    if (e?.seen && e.seen !== e.expected) {
+      log.info(`Playlist: asking again in ${this.cfg.update.thumbRecheckSec} s (it may still be drawing the new photo).`);
+      await pause(this.cfg.update.thumbRecheckSec * 1000);
+      const again = await this.observe('after a change, again').catch(() => null);
+      if (again?.seen) e = again;
+    }
+    if (!e?.seen) return null;
+    rec.seen = { key: e.seen, label: this.slotLabel(e.seen), expected: e.expected, sure: !!e.sure, changed: e.seen === e.expected };
+    this.app.store.save();
+    if (!rec.seen.changed && rec.seen.sure) log.warn(`Playlist: the display came online after the change but still shows ${rec.seen.label}'s photo.`);
+    return rec.seen;
+  }
+
+  // "Sun 8 Nov" for a slot key of this playlist (or the key itself).
+  slotLabel(key) {
+    const s = [...(this.st.batch?.items || []), ...this.st.slots].find((x) => x.key === key);
+    return s ? this.label(s.at) : key;
   }
 
   missedOpen() {
@@ -406,8 +436,8 @@ export class DailyPlaylist {
       this.watch = null;
     }
     app.store.save();
-    this.verdict(rec);
     if (!rec.online) {
+      this.verdict(rec);
       log.info(`Playlist: the display did not come online within ${cfg.sleep.wakeWindowMin} min of the change.`);
       this.noteMissed(rec);
       return;
@@ -417,8 +447,13 @@ export class DailyPlaylist {
     log.info(`Playlist: the display came online ${Math.round((rec.online - start) / 1000)} s after the change`
       + `${battery?.batteryPercent != null ? ` (battery ${battery.batteryPercent}%)` : ''}.`);
     try {
+      // Did it really change? Its thumbnail tells (if it sends them); coming online alone is a
+      // good sign, not proof (21 Oct 2026 it came online and kept the photo before).
+      await this.checkChange(rec).catch((err) => log.debug(`No thumbnail: ${err.message}`));
+      this.verdict(rec);
+      if (rec.seen && !rec.seen.changed && rec.seen.sure) this.noteMissed(rec);
       let sent = false;
-      try { sent = await this.onAwake('after a change'); } catch (err) { log.warn(`Playlist: ${err.message}`); }
+      try { sent = await this.onAwake('after a change', { observed: true }); } catch (err) { log.warn(`Playlist: ${err.message}`); }
       if (sent) event.sent = 'playlist';
       else log.info('Playlist: nothing to send; the display goes back to sleep by itself.');
     } finally {
@@ -463,8 +498,8 @@ export class DailyPlaylist {
 
   // The display answers (button, charger, or by itself after a change): note what it shows,
   // and send a fresh playlist if one is due. Returns true if it sent one.
-  async onAwake(how) {
-    await this.observe(how).catch((err) => log.debug(`No thumbnail: ${err.message}`));
+  async onAwake(how, { observed = false } = {}) {
+    if (!observed) await this.observe(how).catch((err) => log.debug(`No thumbnail: ${err.message}`));
     const why = this.due();
     if (!why) return false;
     log.info(`Playlist: the display is awake (${how}); sending a fresh playlist (${why}).`);

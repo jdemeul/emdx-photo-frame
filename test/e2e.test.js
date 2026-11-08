@@ -29,6 +29,7 @@ before(async () => {
     EMDX_PIN: '424242',
     SERVER_HOST: '127.0.0.1',
     HTTP_PORT: '18321',
+    THUMBNAIL_PORT: '18331',
     ORIENTATION: 'portrait',
     DITHER: 'local', // this test checks the NAS ditherer's palette-only output
     FETCH_TIMEOUT_SEC: '20',

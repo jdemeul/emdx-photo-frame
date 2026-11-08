@@ -38,7 +38,7 @@ The likely reading: after a cleaning at night the display sometimes goes back to
 
 ## Other MDC behaviour
 
-- **Thumbnails of the screen** (MDC `0xC7`/`0x54` + a URL, as the app asks for them): the display accepts the request but has never sent one, on any path of the NAS's server. The service stops waiting for them after three tries.
+- **Thumbnails of the screen** (MDC `0xC7`/`0x54` + a URL, as the app asks for them): the display accepts the request but has never sent one, on any path of the NAS's server at port 8321. Samsung's app (1.3.3) asks with `http://<phone>:6868/device-thumbnail` (its own web server, plain HTTP) after reading the battery; the display then POSTs a multipart form (the image, `device_id`, `content_id`, `content_name`, content and player type, download and thumbnail timestamps). For a playlist `content_id`/`content_name` are the playlist's, not the photo's, so only the image tells which photo it shows. Since 8 November 2026 the service listens on port 6868 too and asks there (untested on the panel yet); it stops asking after three unanswered tries at the same address.
 - **Download progress**: the display POSTs JSON reports to `/content-transfer-progress` on the host and port it downloads from.
 - **"Apply sleep mode after content update"** (`0xC7`/`0x53` type `0x01`) and **Sleep After** (`0xC6`/`0x81`) can be read and set. This service leaves both as set in the app.
 - **Deep sleep has no command of its own.** The Samsung app's *Sleep* button ("the device will enter deep sleep mode") sends `0x11 00`, the same power-off this service uses; choosing *Deep sleep mode* sends network standby off (`0xB5 00`) and Sleep After. How deeply the display sleeps is up to its network standby setting.

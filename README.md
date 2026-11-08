@@ -28,7 +28,7 @@ On the display (Samsung E-Paper app), set **Screen Orientation** to match how it
 1. Copy this folder to the NAS, e.g. `/volume1/docker/emdx-photo-frame` (File Station, a mapped drive, or `git clone`).
 2. In that folder, copy `.env.example` to `.env` and fill in `ALBUM_URLS`, `EMDX_HOST`, `EMDX_PIN` and `SERVER_HOST`.
 3. DSM → **Container Manager** → **Project** → **Create**. Choose the folder; it picks up `docker-compose.yml`. Let it build and start; the first build takes a few minutes. (Over SSH instead: `cd /volume1/docker/emdx-photo-frame && sudo docker compose up -d --build`.)
-4. If the DSM firewall is on, allow TCP **8321** from your LAN. The display downloads the photos from that port.
+4. If the DSM firewall is on, allow TCP **8321** and **6868** from your LAN. The display downloads the photos from 8321, and sends thumbnails of its screen to 6868 (the port Samsung's app uses).
 
 The container uses host networking and restarts automatically. Its state (which photos were shown, the planned photos, history) lives in a Docker volume, `frame-data`, so updating by copying a new version of the folder over the old one keeps it. To start over, stop the project and delete the volume over SSH (`sudo docker volume ls` shows its name, ending in `frame-data`; `sudo docker volume rm <name>` removes it).
 
@@ -48,7 +48,8 @@ Use it with `SLEEP_MODE=deep`.
 
 - The NAS renders the photos for the coming `PLAYLIST_DAYS` (default 7, up to 60) and sends them as the display's own playlist: the photo for now until the next `SCHEDULE` time, then one photo per change. The display changes the photo by itself and sleeps in between, with its Wi-Fi off.
 - After each change the EM32DX comes online briefly. The NAS looks for it then (for up to `WAKE_WINDOW_MIN`) and reads its battery. Once fewer than `PLAYLIST_TOPUP_DAYS` (7) days are left on it, the NAS sends a fresh playlist; otherwise it leaves the display alone, and the display goes back to sleep by itself. No button presses needed.
-- If the display doesn't come online after a change, it has probably slept through it (or hung in its panel cleaning) and still shows the photo before. The NAS then looks for it every `MISSED_CHECK_SEC` (60) seconds, without waking it, and sends a fresh playlist as soon as it answers, so a press on its power button is all it takes.
+- **Did it change?** The NAS can't see the panel. After a change it asks the display for a thumbnail of its screen (as Samsung's app does) and compares it with the photos; if it still shows the photo before, it asks again a minute and a half later. A change counts as made when the thumbnail shows the new photo, or, if the display sends no thumbnails, when it came online after the change. The page says which.
+- If the display doesn't come online after a change, or its thumbnail still shows the photo before, it has probably slept through it (or hung in its panel cleaning) and still shows the photo before. The NAS then looks for it every `MISSED_CHECK_SEC` (60) seconds, without waking it, and sends a fresh playlist as soon as it answers, so a press on its power button is all it takes.
 - **Panel cleaning:** the display cleans its panel once a day (the *screen protection* time in the Samsung E-Paper app; it can be moved, not switched off). Set it to just before the change, e.g. 05:50 for a 06:00 change: with it at night, an EM32DX on battery slept through most morning changes. The NAS reads the time from the display (or `CLEANING_TIME`) and leaves the display alone from 15 minutes before the cleaning until 30 minutes after.
 - A fresh playlist starts with the photo already on the frame, so nothing changes on screen. If none arrives in time, the display starts its playlist over, still at the change times. Changes follow `SCHEDULE` in your time zone, also across daylight-saving switches.
 - **How long a playlist?** Each photo goes to the display as a full-colour PNG of typically 2–4 MB, so 30 days come to roughly 60–130 MB; the display has 8 GB of storage. What costs battery is the download (Wi-Fi on for as long as it takes), not changing the photo. A long playlist that is only topped up in its last week therefore means a few big downloads instead of many. The page lists the battery for every day.
@@ -82,6 +83,7 @@ The same status is available as JSON at `/api/status`, with the last requests th
 | `PHOTO_DIR` | — | Extra source: a NAS folder mounted at `/photos` (see `docker-compose.yml`) |
 | `EMDX_HOST`, `EMDX_PIN` | — | The display's address and MDC PIN. Without `EMDX_HOST` nothing is sent (a dry run, to preview the album) |
 | `SERVER_HOST`, `HTTP_PORT` | guessed, 8321 | The address the display downloads from, and the port of the web page |
+| `THUMBNAIL_PORT` | 6868 | Where the display sends thumbnails of its screen (only that, no page). `0`: ask for them at `HTTP_PORT` |
 | `PANEL` / `ORIENTATION` / `ROTATE` | EM32DX / landscape / 0 | EM13DX also known; or set `PANEL_WIDTH`/`PANEL_HEIGHT` |
 | `UPDATE_MODE` | push | `playlist` (the display changes the photos itself) or `push` (the NAS sends each photo) |
 | `SCHEDULE`, `TZ` | `0 6 * * *`, Europe/Brussels | When the photo changes (cron syntax) |

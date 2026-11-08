@@ -11,7 +11,9 @@
 // with `thumbnails` false it takes the request and sends nothing, like the EM32DX. It keeps
 // Sleep After (0xC6/0x81) and "apply sleep mode after content update" (0xC7/0x53 type 0x01).
 // `state.battery` changes the battery level; `state.cleaning` [hour, minute] is its daily panel
-// cleaning time (0x1B/0xB0; null: it refuses the read).
+// cleaning time (0x1B/0xB0; null: it refuses the read); `state.thumbnailShows` (an index) makes
+// its thumbnails show that image of the playlist instead of the one it plays (a display that
+// came online without changing).
 import dgram from 'node:dgram';
 import net from 'node:net';
 import tls from 'node:tls';
@@ -48,7 +50,7 @@ export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage =
   const state = {
     awake: true, networkStandby: true, hearsWol: true, ignoresPowerOff: 0, pluggedIn: false,
     sleepAfter: [0x07], applySleep: false, playing: null, thumbnailsPosted: 0, wakeOnChangeMs: 0, sleepsAfterUpdateMs: 0,
-    lightSleep: false, offNetwork: false, deepAfterUpdate: false, cleaning: [2, 0],
+    lightSleep: false, offNetwork: false, deepAfterUpdate: false, cleaning: [2, 0], thumbnailShows: null,
   };
   const held = new Set();
   let updateTimer = null;
@@ -73,7 +75,7 @@ export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage =
     form.append('content_player_type', 'MobileCMS');
     form.append('schedule_downloaded_timestamp', String(now?.startedAt || 0));
     form.append('thumbnail_timestamp', String(Date.now()));
-    if (now) form.append('file', new Blob([now.images[now.index]], { type: 'image/png' }), 'thumbnail.png');
+    if (now) form.append('file', new Blob([now.images[state.thumbnailShows ?? now.index]], { type: 'image/png' }), 'thumbnail.png');
     try {
       await fetch(url, { method: 'POST', body: form });
       state.thumbnailsPosted++;

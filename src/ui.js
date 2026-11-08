@@ -248,8 +248,11 @@ function render(s) {
   const ch = pl && pl.changes && pl.changes[0];
   const miss = pl && pl.missed && !pl.missed.resolvedAt ? pl.missed : null;
   if (miss && c && c.byDisplay && !tpShowing) {
-    const was = miss.stillShows && miss.stillShows.dates ? miss.stillShows.dates.map(day).join(' + ') : 'the photo before';
-    onFrame = 'probably still ' + esc(was) + ' <span class="err">' + esc('(it missed the change of ' + fmt(miss.since) + (miss.count > 1 ? ' and ' + (miss.count - 1) + ' more' : '') + '; ' + c.items.map((it) => day(it.takenAt)).join(' + ') + ' is due, sent as soon as it is back)') + '</span>';
+    const was = miss.seen ? slotName(pl, miss.seen.key) + '’s photo (its screen says so)'
+      : 'probably still ' + (miss.stillShows && miss.stillShows.dates ? miss.stillShows.dates.map(day).join(' + ') : 'the photo before');
+    onFrame = esc(was) + ' <span class="err">' + esc('(it missed the change of ' + fmt(miss.since) + (miss.count > 1 ? ' and ' + (miss.count - 1) + ' more' : '') + '; ' + c.items.map((it) => day(it.takenAt)).join(' + ') + ' is due, sent as soon as it is back)') + '</span>';
+  } else if (ch && c && c.byDisplay && ch.seen && ch.seen.changed && !tpShowing) {
+    onFrame += ' <span class="muted">(confirmed: its screen showed it after the change)</span>';
   } else if (ch && c && c.byDisplay && !ch.online && Date.now() < ch.until) {
     onFrame += ' <span class="muted">(not confirmed yet: the NAS is looking for the display)</span>';
   }
