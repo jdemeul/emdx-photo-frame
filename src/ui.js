@@ -244,6 +244,15 @@ function render(s) {
   let onFrame = tpShowing ? 'the test pattern (until the next ' + (pl ? 'playlist' : 'update') + ')'
     : c ? c.items.map((it) => day(it.takenAt)).join(' + ') + (c.dryRun ? ' <span class="muted">(dry run: EMDX_HOST not set)</span>' : c.pushed ? '' : ' <span class="err">(not on the display yet)</span>') : '–';
   if (pl && c && c.since && !tpShowing && c.pushed) onFrame += esc(' · since ' + fmt(c.since) + (c.byDisplay ? ', changed by the display' : ''));
+  // The NAS can't see the panel: after a change it only knows whether the display came online.
+  const ch = pl && pl.changes && pl.changes[0];
+  const miss = pl && pl.missed && !pl.missed.resolvedAt ? pl.missed : null;
+  if (miss && c && c.byDisplay && !tpShowing) {
+    const was = miss.stillShows && miss.stillShows.dates ? miss.stillShows.dates.map(day).join(' + ') : 'the photo before';
+    onFrame = 'probably still ' + esc(was) + ' <span class="err">' + esc('(it missed the change of ' + fmt(miss.since) + (miss.count > 1 ? ' and ' + (miss.count - 1) + ' more' : '') + '; ' + c.items.map((it) => day(it.takenAt)).join(' + ') + ' is due, sent as soon as it is back)') + '</span>';
+  } else if (ch && c && c.byDisplay && !ch.online && Date.now() < ch.until) {
+    onFrame += ' <span class="muted">(not confirmed yet: the NAS is looking for the display)</span>';
+  }
   const seen = pl ? seenHtml(pl) : '';
   const rows = [
     ['On the frame', onFrame],
@@ -269,7 +278,7 @@ function render(s) {
   $('#info').innerHTML = rows.map(([k, v]) => '<dt>' + k + '</dt><dd>' + v + '</dd>').join('');
   const dup = s.lastError && s.sleep && s.sleep.error === s.lastError.message; // already shown under Display
   $('#error').textContent = s.lastError && !dup ? 'Last problem (' + fmt(s.lastError.at) + '): ' + s.lastError.message : '';
-  $('#history').innerHTML = (s.history || []).slice(0, 8).map((h) => '<dt>' + fmt(h.at) + '</dt><dd>' + (h.ok ? esc(h.kind) + (h.dates && h.dates.length ? ' · ' + h.dates.map(day).join(' + ') : '') + (h.battery != null ? ' · battery ' + h.battery + '%' : '') + (h.waited ? ' · waited ' + h.waited + ' s for the display' : '') : '<span class="err">' + esc(h.error) + '</span>') + '</dd>').join('');
+  $('#history').innerHTML = (s.history || []).slice(0, 8).map((h) => '<dt>' + fmt(h.at) + '</dt><dd>' + (h.ok ? (h.missed ? '<span class="err">' + esc(h.kind) + '</span>' : esc(h.kind)) + (h.dates && h.dates.length ? ' · ' + h.dates.map(day).join(' + ') : '') + (h.battery != null ? ' · battery ' + h.battery + '%' : '') + (h.waited ? ' · waited ' + h.waited + ' s for the display' : '') : '<span class="err">' + esc(h.error) + '</span>') + '</dd>').join('');
   renderView(s);
 }
 async function refresh() {

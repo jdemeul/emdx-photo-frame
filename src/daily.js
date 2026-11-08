@@ -247,12 +247,30 @@ export class DailyPlaylist {
   // the NAS finds it awake (it looks every MISSED_CHECK_SEC until then).
   noteMissed(rec) {
     const prev = this.missedOpen();
-    this.st.missed = { key: rec.key, at: rec.at, since: prev?.since ?? rec.at, count: (prev?.count ?? 0) + 1 };
+    this.st.missed = {
+      key: rec.key, at: rec.at, since: prev?.since ?? rec.at, count: (prev?.count ?? 0) + 1,
+      stillShows: prev ? prev.stillShows ?? null : this.before ?? null, // (what was on the frame before the first missed change)
+    };
     this.app.store.save();
     const every = this.cfg.sleep.missedCheckSec;
     log.warn(`Playlist: the display missed the change${prev ? ` (${this.st.missed.count} in a row)` : ''}. A fresh playlist goes out as soon as it is back`
       + (every ? ` (the NAS looks for it every ${every} s; a press on its power button brings it back).` : ' (press its power button).'));
     this.app.startMissedWatch();
+  }
+
+  // The change's entry in the Recent list: made (the display came online after it) or probably
+  // missed (it didn't). A display that comes online without changing (21 Oct 2026: the NAS sent
+  // it to sleep mid-change) still counts as made: only a thumbnail of its screen would tell.
+  verdict(rec) {
+    const h = this.app.state.history.find((e) => e.change === rec.key && e.what);
+    if (!h) return;
+    if (rec.online) {
+      h.kind = `${h.what}, changed by the display (it came online ${Math.max(0, Math.round((rec.online - rec.at) / 1000))} s after the change)${h.loop || ''}`;
+    } else {
+      h.missed = true;
+      h.kind = `${h.what}: probably not changed (the display did not come online after the change)${h.loop || ''}`;
+    }
+    this.app.store.save();
   }
 
   missedOpen() {
@@ -314,12 +332,21 @@ export class DailyPlaylist {
     try {
       await app.exclusive('Playlist: the display moves on', async () => {
         if (this.st.replaced) log.info(`Playlist: a change time, but ${this.st.replaced.what} replaced the playlist; it comes back when the NAS next finds the display awake.`);
+        const before = app.state.current;
+        this.before = before?.items ? { kind: before.kind, dates: before.items.map((i) => i.takenAt ?? null) } : null;
         const cur = this.advance();
         if (cur) {
           const loop = cur.loop ? ` (repeating: playlist round ${cur.loop + 1})` : '';
           const taken = (cur.items || []).map((i) => (i.takenAt ? new Date(i.takenAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric', timeZone: this.cfg.timezone }) : 'date unknown'));
           log.info(`Playlist: the display should now show ${this.label(this.clock.prev(Date.now()))}'s photo (${cur.kind}${taken.length ? `, taken ${taken.join(' + ')}` : ''})${loop}.`);
-          app.addHistory({ ok: true, kind: `${cur.kind}, changed by the display (expected)${loop}`, ids: cur.ids, dates: cur.items.map((i) => i.takenAt) });
+          // The NAS can't see the panel. Coming online right after the change is the only sign
+          // that the display made it, so in deep sleep the entry says "due" until the NAS has
+          // looked for it (watchAfterChange()), and then whether it came online.
+          const watched = this.cfg.display.host && this.cfg.sleep.mode !== 'standby';
+          app.addHistory({
+            ok: true, kind: `${cur.kind}, ${watched ? 'due to change by itself (does the display come online?)' : 'changed by the display (expected)'}${loop}`,
+            ids: cur.ids, dates: cur.items.map((i) => i.takenAt), ...(watched ? { change: slotKey(this.clock.prev(Date.now()) ?? Date.now(), this.cfg.timezone), what: cur.kind, loop } : {}),
+          });
         } else if (!this.st.batch) {
           log.info('Playlist: a change time, but the display has no playlist yet.');
         }
@@ -379,6 +406,7 @@ export class DailyPlaylist {
       this.watch = null;
     }
     app.store.save();
+    this.verdict(rec);
     if (!rec.online) {
       log.info(`Playlist: the display did not come online within ${cfg.sleep.wakeWindowMin} min of the change.`);
       this.noteMissed(rec);

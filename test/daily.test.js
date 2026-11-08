@@ -299,8 +299,14 @@ test('playlist mode: plan, send when found awake, the display moves on by itself
     const [b1] = [pl().batch];
     assert.equal(app.state.current.slotDir, b1.items[1].dir);
     assert.equal(app.state.current.byDisplay, true);
-    assert.match(app.state.history.find((h) => h.ok).kind, /changed by the display \(expected\)/);
+    // The NAS can't see the panel: it books the change as due, and since the display didn't come
+    // online after it, as probably not made; the page says the frame probably still shows the
+    // photo before.
+    const entry = app.state.history.find((h) => h.change);
+    assert.deepEqual([entry.missed, entry.what], [true, app.state.current.kind]);
+    assert.match(entry.kind, /probably not changed \(the display did not come online/);
     assert.equal(pl().changes[0].online, null);
+    assert.deepEqual(pl().missed.stillShows.dates, b1.items[0].items.map((i) => i.takenAt ?? null));
     assert.equal(pl().slots.length, 4);
     assert.ok(fs.existsSync(path.join(dataDir, 'playlist', b1.items[0].dir)), 'files of the playlist on the display are kept');
     // It didn't come online after the change, so the NAS counts it as missed: a fresh playlist is
@@ -434,6 +440,7 @@ test('playlist mode: the display comes online after each change; the NAS reads t
     await nextChange();
     const c1 = pl().changes[0];
     assert.ok(c1.online, 'came online after the change');
+    assert.match(app.state.history.find((h) => h.change === c1.key).kind, /, changed by the display \(it came online \d+ s after the change\)/);
     assert.equal(c1.battery, 86);
     assert.equal(app.state.wakeEvents[0].afterChange, true);
     assert.equal(app.state.wakeEvents[0].battery, 86);
