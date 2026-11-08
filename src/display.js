@@ -180,8 +180,9 @@ export async function lookForDisplay(cfg, { battery: readBattery = false, cleani
 }
 
 // The daily panel cleaning (the Samsung app's "screen protection" time: the panel cycles through
-// its colours to clear ghosting). The app sets it with 0x1B/0xB0 0x80 0x02 hh mm and reads it back
-// as 0x81 len hh mm day month (the next run). Returns { hour, minute, day, month } (day and month
+// its colours to clear ghosting). The app sets it with 0x1B/0xB0 0x80 0x02 hh mm. Read back, the
+// EM32DX answers with both blocks: B0 | 80 02 hh mm (the setting) | 81 04 hh mm day month (the
+// next run), e.g. b0 80 02 05 32 81 04 05 32 09 0b: daily at 05:50, next 9 November. Returns { hour, minute, day, month } (day and month
 // when the display says), or { error } when it doesn't answer or the answer makes no sense.
 export async function readCleaning(device) {
   try {
@@ -193,13 +194,22 @@ export async function readCleaning(device) {
   }
 }
 
-// The answer to a 0x1B/0xB0 read (with or without the sub-command in front, and with or
-// without the 0x81 len header), or null.
+// The answer to a 0x1B/0xB0 read: type-length-value blocks after the sub-command (0x80: the
+// setting hh mm; 0x81: the next run hh mm day month; the next run wins), or bare hh mm [day
+// month]. null if it makes no sense.
 export function parseCleaning(bytes) {
   let b = [...(bytes || [])];
   if (b[0] === 0xb0) b = b.slice(1);
-  if (b[0] === 0x81 && b.length >= 4 && b[1] >= 2 && b[1] <= b.length - 2) b = b.slice(2, 2 + b[1]);
-  const [hour, minute, day, month] = b;
+  const blocks = {};
+  for (let i = 0; i + 1 < b.length && (b[i] === 0x80 || b[i] === 0x81);) {
+    const len = b[i + 1];
+    if (len < 2 || i + 2 + len > b.length) break;
+    blocks[b[i]] = b.slice(i + 2, i + 2 + len);
+    i += 2 + len;
+  }
+  const v = blocks[0x81] || blocks[0x80] || (b[0] === 0x80 || b[0] === 0x81 ? null : b);
+  if (!v) return null;
+  const [hour, minute, day, month] = v;
   if (!(hour < 24 && minute < 60)) return null;
   const c = { hour, minute };
   if (day >= 1 && day <= 31 && month >= 1 && month <= 12) Object.assign(c, { day, month });
@@ -401,6 +411,7 @@ export function formatSleepAfter(bytes) {
 export async function requestThumbnail(device, url) {
   if (url.length > 250) throw new Error('Thumbnail URL is too long for MDC');
   await cmd(device, CMD_CONTENT, [0x54, ...Buffer.from(url)], 'Asking for a thumbnail');
+  log.info(`Asked the display for a thumbnail of its screen (to be sent to ${url}).`);
 }
 
 // "Check display": name, firmware, battery and settings. `thumbnailUrl`: also ask the display

@@ -28,10 +28,14 @@ test('a display that doesn\'t answer is off the network when nothing answers its
 
 test('the panel cleaning time as the display reads it back, with or without the headers', async () => {
   const { parseCleaning, cleaningText } = await import('../src/display.js');
+  // What Jonas's EM32DX answered on 8 Nov 2026 (set to 05:50 in the app):
+  assert.deepEqual(parseCleaning(Buffer.from([0xb0, 0x80, 0x02, 0x05, 0x32, 0x81, 0x04, 0x05, 0x32, 0x09, 0x0b])), { hour: 5, minute: 50, day: 9, month: 11 });
+  assert.deepEqual(parseCleaning([0xb0, 0x80, 0x02, 2, 0]), { hour: 2, minute: 0 });
   assert.deepEqual(parseCleaning(Buffer.from([0xb0, 0x81, 0x04, 5, 50, 9, 11])), { hour: 5, minute: 50, day: 9, month: 11 });
   assert.deepEqual(parseCleaning([0x81, 0x02, 2, 0]), { hour: 2, minute: 0 });
   assert.deepEqual(parseCleaning([0xb0, 14, 5]), { hour: 14, minute: 5 });
   assert.equal(parseCleaning([0xb0, 0x81]), null);
+  assert.equal(parseCleaning([0xb0, 0x80, 0x09, 5, 50]), null);
   assert.equal(parseCleaning([0xb0, 25, 0]), null);
   assert.equal(parseCleaning([]), null);
   assert.equal(cleaningText({ hour: 5, minute: 5 }), '05:05');

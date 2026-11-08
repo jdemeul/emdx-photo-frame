@@ -213,6 +213,7 @@ function changesHtml(pl) {
     if (c.until > Date.now()) return esc(fmt(c.at) + ': looking for the display until ' + hm(c.until) + '…');
     const m = pl.missed && pl.missed.key === c.key ? pl.missed : null;
     if (m && m.resolvedAt) return esc(fmt(c.at) + ': the display did not come online; back ' + fmt(m.resolvedAt) + ' (' + m.how + ')');
+    if (c === pl.changes[0] && pl.batch && pl.batch.sentAt > c.until) return esc(fmt(c.at) + ': the display did not come online; a fresh playlist went out ' + fmt(pl.batch.sentAt));
     if (c === pl.changes[0]) return '<span class="err">' + esc(fmt(c.at) + ': the display did not come online, so it probably didn’t change the photo (asleep through it? stuck in its panel cleaning?). Press its power button: the NAS looks for it every minute and sends it a fresh playlist by itself.') + '</span>';
     return esc(fmt(c.at) + ': the display did not come online');
   });
