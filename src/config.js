@@ -193,10 +193,6 @@ export function loadConfig() {
       // Address the display uses to download the image from this container.
       publicHost: str('SERVER_HOST') || guessLocalIp(displayHost),
       uiPassword: str('UI_PASSWORD'),
-      // Where the display POSTs thumbnails of its screen. Samsung's app asks for them at
-      // http://<phone>:6868/device-thumbnail (its own web server), and the EM32DX never sent one
-      // to any other address, so the NAS listens on that port too. 0: ask at HTTP_PORT instead.
-      thumbnailPort: num('THUMBNAIL_PORT', 6868, { min: 0, max: 65535, int: true }),
     },
 
     schedule: str('SCHEDULE', '0 6 * * *'),
@@ -218,10 +214,6 @@ export function loadConfig() {
       // ... and from this long before its daily panel cleaning until this long after it starts
       // (how long the cleaning takes is unknown; the router once saw the display online for 5 min).
       cleaningQuietSec: [15 * 60, 30 * 60],
-      thumbTimeoutSec: 10, // when the NAS asks the display what it shows
-      // After a change, a thumbnail that still shows the photo before: ask again this much later
-      // (the panel takes about a minute to draw) before calling the change missed.
-      thumbRecheckSec: 90,
     },
     runOnStart: bool('RUN_ON_START', false),
     retryMinutes: num('RETRY_MINUTES', 20, { min: 1 }),

@@ -4,7 +4,7 @@
 // HTTP server, and the display downloads it and the images in it. Sleep uses 0x11 (power off)
 // and 0xB5 (network standby, the Wi-Fi listener that Wake-on-LAN needs). The other commands here
 // come from Samsung's Android app (decompiled): 0xC7/0x53 type 0x01 "apply sleep mode after
-// content update", 0xC7/0x54 a thumbnail of the screen, 0xC6/0x81 "Sleep After", 0xCB optional
+// content update", 0xC6/0x81 "Sleep After", 0xCB optional
 // features, 0x1B/0xB0 the time of the daily panel cleaning ("screen protection"). What the
 // EM32DX does with them: docs/findings.md.
 import dgram from 'node:dgram';
@@ -15,7 +15,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const CMD_POWER = 0x11;
 const CMD_NETWORK_STANDBY = 0xb5;
-const CMD_CONTENT = 0xc7; // sub 0x53: content download (type 0x80) / apply sleep after update (type 0x01); 0x54: thumbnail
+const CMD_CONTENT = 0xc7; // sub 0x53: content download (type 0x80) / apply sleep after update (type 0x01)
 const CMD_SLEEP_AFTER = 0xc6; // sub 0x81
 const CMD_FEATURES = 0xcb;
 const CMD_PANEL = 0x1b; // sub 0x73: battery (the library reads it); 0xB0: panel cleaning time
@@ -419,16 +419,8 @@ export function formatSleepAfter(bytes) {
   return SLEEP_AFTER_TEXT[bytes[0]] ?? `code ${bytes[0]}`;
 }
 
-// Ask the display to POST a thumbnail of what it shows to `url` (0xC7/0x54 + URL).
-export async function requestThumbnail(device, url) {
-  if (url.length > 250) throw new Error('Thumbnail URL is too long for MDC');
-  await cmd(device, CMD_CONTENT, [0x54, ...Buffer.from(url)], 'Asking for a thumbnail');
-  log.info(`Asked the display for a thumbnail of its screen (to be sent to ${url}).`);
-}
-
-// "Check display": name, firmware, battery and settings. `thumbnailUrl`: also ask the display
-// to POST a thumbnail of its screen there.
-export async function readDisplayInfo(cfg, { thumbnailUrl = null } = {}) {
+// "Check display": name, firmware, battery and settings.
+export async function readDisplayInfo(cfg) {
   const device = await connect(cfg);
   try {
     const info = {};
@@ -447,7 +439,6 @@ export async function readDisplayInfo(cfg, { thumbnailUrl = null } = {}) {
       // Bit 0 of the second byte: a low-power (2.4 GHz) Wi-Fi module for remote wake-up (EMDX-A).
       ['lowPowerWifi', async () => { const r = await cmd(device, CMD_FEATURES, [], 'Reading features'); return r.length > 1 ? ((r[1] & 1) ? 'yes' : 'no') : `unknown [${hex(r)}]`; }],
       ['cleaning', () => readCleaning(device)],
-      ...(thumbnailUrl ? [['thumbnail', async () => { await requestThumbnail(device, thumbnailUrl); return 'asked'; }]] : []),
     ]) {
       try {
         info[key] = await withTimeout(fn(), 6000, key);

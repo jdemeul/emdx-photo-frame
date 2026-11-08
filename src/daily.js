@@ -18,7 +18,6 @@
 //   missed   the last change the display missed (didn't come online after): { key, at, since,
 //            count, retryAt, resolvedAt, how }; until resolved, a fresh playlist is due and the
 //            NAS looks for the display every MISSED_CHECK_SEC
-//   seen     what thumbnails of the screen showed, matched against the photos
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -27,7 +26,6 @@ import { log } from './log.js';
 import { markShown } from './selector.js';
 import { pushContent } from './display.js';
 import { changeClock, slotKey, dayLabel, buildBatch, positionAt } from './playlist.js';
-import { matchThumbnail } from './thumbMatch.js';
 
 const FILES = ['device.png', 'preview.png', 'preview.jpg', 'thumb.jpg', 'source-1.jpg', 'source-2.jpg'];
 const pause = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -44,7 +42,7 @@ export class DailyPlaylist {
     p.batch ||= null;
     p.pending ||= null;
     p.changes ||= [];
-    p.seen ||= [];
+    delete p.seen; // (screen thumbnails, until 8 Nov 2026)
     p.missed ||= null;
     // Changes more than a day apart, or several a day: say the time too.
     const [a, b] = this.clock.upcoming(2, Date.now());
@@ -250,7 +248,6 @@ export class DailyPlaylist {
     this.st.missed = {
       key: rec.key, at: rec.at, since: prev?.since ?? rec.at, count: (prev?.count ?? 0) + 1,
       stillShows: prev ? prev.stillShows ?? null : this.before ?? null, // (what was on the frame before the first missed change)
-      ...(rec.seen ? { seen: rec.seen } : {}), // (it came online, but its thumbnail showed another photo)
     };
     this.app.store.save();
     const every = this.cfg.sleep.missedCheckSec;
@@ -261,46 +258,19 @@ export class DailyPlaylist {
 
   // The change's entry in the Recent list: made (the display came online after it) or probably
   // missed (it didn't). A display that comes online without changing (21 Oct 2026: the NAS sent
-  // it to sleep mid-change) still counts as made: only a thumbnail of its screen would tell.
+  // it to sleep mid-change) still counts as made: the NAS can't see the panel. (The EM32DX only
+  // sends thumbnails of its screen over HTTPS, to a server whose certificate it was given: see
+  // docs/findings.md.)
   verdict(rec) {
     const h = this.app.state.history.find((e) => e.change === rec.key && e.what);
     if (!h) return;
-    const s = rec.seen;
-    if (rec.online && s?.sure && !s.changed) {
-      h.missed = true;
-      h.kind = `${h.what}: not changed (the display came online, but its screen shows ${s.label}'s photo)${h.loop || ''}`;
-    } else if (rec.online) {
-      h.kind = `${h.what}, changed by the display (${s?.changed ? `its screen shows it; ` : ''}it came online ${Math.max(0, Math.round((rec.online - rec.at) / 1000))} s after the change)${h.loop || ''}`;
+    if (rec.online) {
+      h.kind = `${h.what}, changed by the display (it came online ${Math.max(0, Math.round((rec.online - rec.at) / 1000))} s after the change)${h.loop || ''}`;
     } else {
       h.missed = true;
       h.kind = `${h.what}: probably not changed (the display did not come online after the change)${h.loop || ''}`;
     }
     this.app.store.save();
-  }
-
-  // After a change the display came online for: ask what it shows (if it sends thumbnails). A
-  // thumbnail of another photo may come a little early (it draws for about a minute): ask again
-  // thumbRecheckSec later. Notes rec.seen { key, label, expected, sure, changed }.
-  async checkChange(rec) {
-    if (this.app.thumbnailsWork() === false) return null;
-    let e = await this.observe('after a change');
-    if (e?.seen && e.seen !== e.expected) {
-      log.info(`Playlist: asking again in ${this.cfg.update.thumbRecheckSec} s (it may still be drawing the new photo).`);
-      await pause(this.cfg.update.thumbRecheckSec * 1000);
-      const again = await this.observe('after a change, again').catch(() => null);
-      if (again?.seen) e = again;
-    }
-    if (!e?.seen) return null;
-    rec.seen = { key: e.seen, label: this.slotLabel(e.seen), expected: e.expected, sure: !!e.sure, changed: e.seen === e.expected };
-    this.app.store.save();
-    if (!rec.seen.changed && rec.seen.sure) log.warn(`Playlist: the display came online after the change but still shows ${rec.seen.label}'s photo.`);
-    return rec.seen;
-  }
-
-  // "Sun 8 Nov" for a slot key of this playlist (or the key itself).
-  slotLabel(key) {
-    const s = [...(this.st.batch?.items || []), ...this.st.slots].find((x) => x.key === key);
-    return s ? this.label(s.at) : key;
   }
 
   missedOpen() {
@@ -453,13 +423,11 @@ export class DailyPlaylist {
     log.info(`Playlist: the display came online ${Math.round((rec.online - start) / 1000)} s after the change`
       + `${battery?.batteryPercent != null ? ` (battery ${battery.batteryPercent}%)` : ''}.`);
     try {
-      // Did it really change? Its thumbnail tells (if it sends them); coming online alone is a
-      // good sign, not proof (21 Oct 2026 it came online and kept the photo before).
-      await this.checkChange(rec).catch((err) => log.debug(`No thumbnail: ${err.message}`));
+      // Coming online is a good sign the photo changed, not proof (21 Oct 2026 it came online and
+      // kept the photo before).
       this.verdict(rec);
-      if (rec.seen && !rec.seen.changed && rec.seen.sure) this.noteMissed(rec);
       let sent = false;
-      try { sent = await this.onAwake('after a change', { observed: true }); } catch (err) { log.warn(`Playlist: ${err.message}`); }
+      try { sent = await this.onAwake('after a change'); } catch (err) { log.warn(`Playlist: ${err.message}`); }
       if (sent) event.sent = 'playlist';
       else log.info('Playlist: nothing to send; the display goes back to sleep by itself.');
     } finally {
@@ -502,56 +470,14 @@ export class DailyPlaylist {
     log.debug(`Playlist: serving the playlist on the display again (${n} of ${c.files.length} images).`);
   }
 
-  // The display answers (button, charger, or by itself after a change): note what it shows,
-  // and send a fresh playlist if one is due. Returns true if it sent one.
-  async onAwake(how, { observed = false } = {}) {
-    if (!observed) await this.observe(how).catch((err) => log.debug(`No thumbnail: ${err.message}`));
+  // The display answers (button, charger, or by itself after a change): send a fresh playlist if
+  // one is due. Returns true if it sent one.
+  async onAwake(how) {
     const why = this.due();
     if (!why) return false;
     log.info(`Playlist: the display is awake (${how}); sending a fresh playlist (${why}).`);
     await this.app.run('Sending the playlist', () => this.send(how));
     return true;
-  }
-
-  // Ask for a thumbnail of the screen and match it against the photos (if the display sends
-  // thumbnails at all).
-  async observe(how) {
-    const app = this.app;
-    if (!app.server || !this.st.batch || app.thumbnailsWork() === false) return null;
-    const th = await app.exclusive('Asking the display what it shows', () => app.askThumbnail(this.cfg.update.thumbTimeoutSec));
-    return this.noteThumbnail(th, how);
-  }
-
-  async noteThumbnail(th, how) {
-    const b = this.st.batch;
-    const at = th?.at ?? Date.now();
-    const expected = b ? positionAt(b, at).item : null;
-    // The display starts counting once it has the playlist (and has drawn the first photo: about
-    // a minute on the EM32DX), so right after a change it may still show the photo before.
-    const lagging = b ? positionAt(b, at - (b.sentAt - b.builtAt) - 120000).item : null;
-    const entry = { at, how, expected: expected?.key ?? null, seen: null };
-    if (th?.image?.buf?.length && b) {
-      const cands = new Map();
-      for (const s of [...b.items, ...this.st.slots]) {
-        const small = this.file(s, 'thumb.jpg');
-        cands.set(s.dir, { key: s.key, file: fs.existsSync(small) ? small : this.file(s, 'preview.jpg') });
-      }
-      const m = await matchThumbnail(th.image.buf, [...cands.values()]);
-      if (m) Object.assign(entry, { seen: m.key, score: m.score, sure: m.sure, file: th.file ?? null });
-      entry.ok = !!m && (m.key === entry.expected || m.key === lagging?.key);
-    } else {
-      entry.note = th ? 'thumbnail without an image' : 'no thumbnail came back';
-    }
-    this.st.seen = [entry, ...this.st.seen].slice(0, 10);
-    this.app.store.save();
-    if (entry.seen) {
-      const name = (key) => { const s = [...(b?.items || []), ...this.st.slots].find((x) => x.key === key); return s ? this.label(s.at) : key; };
-      const ok = entry.seen === entry.expected ? ', as expected' : entry.ok ? ', the one before the last change (it changes a little after the change time)' : `; expected ${name(entry.expected)}'s`;
-      log.info(`Playlist: the display shows ${entry.sure ? '' : 'probably '}${name(entry.seen)}'s photo (match ${entry.score})${ok}.`);
-    } else {
-      log.debug(`Playlist: ${entry.note}`);
-    }
-    return entry;
   }
 
   // ---------- buttons ----------
@@ -623,7 +549,6 @@ export class DailyPlaylist {
         const wake = (this.app.state.wakeEvents || []).find((e) => e.afterChange && e.at >= c.at && e.at <= c.until);
         return { ...c, battery: c.battery ?? wake?.battery ?? null };
       }),
-      seen: this.st.seen.slice(0, 5),
       missed: this.st.missed,
       daysLeft: b ? this.daysLeft(now) : null,
       topUpDays: this.cfg.update.topUpDays,

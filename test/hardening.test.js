@@ -17,7 +17,6 @@ let hasOpenssl = true;
 try { execFileSync('openssl', ['version'], { stdio: 'ignore' }); } catch { hasOpenssl = false; }
 const cleanups = [];
 after(async () => { for (const f of cleanups.reverse()) await f(); });
-const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 const tmp = (name) => fs.mkdtempSync(path.join(os.tmpdir(), `frame-${name}-`));
 
 function withEnv(vars, fn) {
@@ -42,7 +41,7 @@ test('timers and ports refuse values that would make the service knock on the di
   assert.throws(() => withEnv({ RETRIES: '1.5' }, loadConfig), /RETRIES must be a whole number/);
   assert.throws(() => withEnv({ HTTP_PORT: '70000' }, loadConfig), /HTTP_PORT must be a whole number from 1 to 65535/);
   assert.throws(() => withEnv({ GAMMA: '0' }, loadConfig), /GAMMA/);
-  assert.equal(withEnv({ SLEEP_CHECK_MIN: '0', THUMBNAIL_PORT: '0' }, loadConfig).sleep.checkMin, 0);
+  assert.equal(withEnv({ SLEEP_CHECK_MIN: '0' }, loadConfig).sleep.checkMin, 0);
   // A quick look waits longer than Linux takes to say "host unreachable" for a stale ARP entry.
   assert.ok(withEnv({}, loadConfig).display.probeTimeoutSec >= 9);
 });
@@ -120,17 +119,10 @@ async function startServer(env, app) {
   return `http://127.0.0.1:${cfg.server.port}`;
 }
 
-function thumbnailForm() {
-  const form = new FormData();
-  form.append('device_id', 'X');
-  form.append('file', new Blob([Buffer.from('not really a png')], { type: 'image/png' }), 'thumbnail.png');
-  return form;
-}
-
 test('a button pressed during a quick look at the display waits for it instead of failing as busy', async () => {
   const pressed = [];
   const app = { busy: { what: 'Looking for the display after the change', probe: true }, resend: async () => { pressed.push('resend'); } };
-  const base = await startServer({ HTTP_PORT: '18501', THUMBNAIL_PORT: '0', EMDX_HOST: '' }, app);
+  const base = await startServer({ HTTP_PORT: '18501', EMDX_HOST: '' }, app);
   const r = await fetch(`${base}/api/resend`, { method: 'POST' });
   assert.equal(r.status, 202);
   assert.deepEqual(pressed, ['resend']);
@@ -138,31 +130,13 @@ test('a button pressed during a quick look at the display waits for it instead o
   assert.equal((await fetch(`${base}/api/resend`, { method: 'POST' })).status, 409);
 });
 
-test('only the display may send thumbnails; one the NAS fails to handle still gets its answer', async () => {
-  const got = [];
-  const app = { busy: null, onThumbnail: (th) => got.push(th) };
-  const base = await startServer({ HTTP_PORT: '18502', THUMBNAIL_PORT: '0', EMDX_HOST: '192.0.2.77' }, app);
-  const r = await fetch(`${base}/emdx/device-thumbnail`, { method: 'POST', body: thumbnailForm() });
-  assert.equal(r.status, 403);
+test('only the display may send download progress reports', async () => {
+  const base = await startServer({ HTTP_PORT: '18502', EMDX_HOST: '192.0.2.77' }, { busy: null });
   assert.equal((await fetch(`${base}/content-transfer-progress`, { method: 'POST', body: '{}' })).status, 403);
-  assert.equal(got.length, 0);
-
-  // From the display (here: EMDX_HOST is this machine). A handler that throws is logged, not a crash.
-  const unhandled = [];
-  const onUnhandled = (err) => unhandled.push(err);
-  process.on('unhandledRejection', onUnhandled);
-  try {
-    const app2 = { busy: null, onThumbnail: (th) => { got.push(th); throw new Error('disk full'); } };
-    const base2 = await startServer({ HTTP_PORT: '18503', THUMBNAIL_PORT: '0', EMDX_HOST: '127.0.0.1' }, app2);
-    const r2 = await fetch(`${base2}/emdx/device-thumbnail`, { method: 'POST', body: thumbnailForm() });
-    assert.equal(r2.status, 200);
-    await sleepMs(50);
-    assert.equal(got.length, 1);
-    assert.equal(got[0].image.type, 'image/png');
-    assert.deepEqual(unhandled, []);
-  } finally {
-    process.off('unhandledRejection', onUnhandled);
-  }
+  const base2 = await startServer({ HTTP_PORT: '18503', EMDX_HOST: '127.0.0.1' }, { busy: null }); // (EMDX_HOST: this machine)
+  const r = await fetch(`${base2}/content-transfer-progress`, { method: 'POST', body: '{"progress":50}' });
+  assert.equal(r.status, 200);
+  assert.deepEqual(await r.json(), { progress: 50 });
 });
 
 // ---------- the display ----------
@@ -173,7 +147,7 @@ test('a display that takes the content URL without answering in time, and downlo
   emdx.state.ackContent = false;
   const cfg = withEnv({
     EMDX_HOST: '127.0.0.1', EMDX_PORT: String(emdx.port), EMDX_PIN: '717171', SERVER_HOST: '127.0.0.1', HTTP_PORT: '18504',
-    THUMBNAIL_PORT: '0', FETCH_TIMEOUT_SEC: '5', CONNECT_ATTEMPTS: '1', EMDX_MAC: null,
+    FETCH_TIMEOUT_SEC: '5', CONNECT_ATTEMPTS: '1', EMDX_MAC: null,
   }, loadConfig);
   cfg.display.contentAckSec = 0.5;
   const server = createServer(cfg, { busy: null });
@@ -191,28 +165,6 @@ test('a display that takes the content URL without answering in time, and downlo
   cfg.display.fetchTimeoutSec = 0.5;
   cfg.display.pushAttempts = 1;
   await assert.rejects(pushContent(cfg, server, { items: [{ buf: png, ext: 'png' }] }), /timed out .*downloaded nothing/);
-});
-
-test('asking for a thumbnail does not wake a sleeping display with Wake-on-LAN, nor knock for minutes', { skip: !hasOpenssl && 'openssl not available', timeout: 60000 }, async () => {
-  const { startFakeEmdx } = await import('./helpers/fakeEmdx.js');
-  const emdx = await startFakeEmdx({ pin: '727272' });
-  cleanups.push(() => emdx.close());
-  const cfg = withEnv({
-    EMDX_HOST: '127.0.0.1', EMDX_PORT: String(emdx.port), EMDX_PIN: '727272', SERVER_HOST: '127.0.0.1', HTTP_PORT: '18505',
-    THUMBNAIL_PORT: '0', EMDX_MAC: emdx.mac, WOL_BROADCAST: '127.0.0.1', WOL_PORT: String(emdx.wolPort), WAKE_WAIT_SEC: '0.1',
-  }, loadConfig);
-  cfg.display.probeTimeoutSec = 1;
-  const app = bareApp(cfg, { thumbs: { asked: 0, received: 0 } });
-  app.thumbWaiters = new Set();
-  app.server = createServer(cfg, app);
-  await app.server.listen();
-  cleanups.push(() => app.server.close());
-  emdx.state.awake = false; // asleep, network standby on: Wake-on-LAN would wake it
-  const start = Date.now();
-  await assert.rejects(app.askThumbnail(1), /Could not connect/);
-  assert.ok(Date.now() - start < 20000, `took ${Date.now() - start} ms`);
-  assert.deepEqual(emdx.events.filter((e) => e.startsWith('wol')), []);
-  assert.equal(emdx.state.awake, false);
 });
 
 test('a display found awake whose fresh playlist fails is left to go to sleep by itself, not powered off (playlist mode, deep sleep)', async () => {

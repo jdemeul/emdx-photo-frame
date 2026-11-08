@@ -7,13 +7,10 @@
 // A playlist (several images) is played by itself like the EM32DX does: each image for its
 // own duration, counted from the download, starting over after the last one (also while
 // asleep). With `state.wakeOnChangeMs`, it comes online for that long after each change, as the
-// EM32DX does briefly. On 0xC7/0x54 + URL it POSTs a thumbnail (the image it shows) to that URL;
-// with `thumbnails` false it takes the request and sends nothing, like the EM32DX. It keeps
-// Sleep After (0xC6/0x81) and "apply sleep mode after content update" (0xC7/0x53 type 0x01).
+// EM32DX does briefly. It takes a thumbnail request (0xC7/0x54 + URL) and sends nothing, like the
+// EM32DX with an http:// URL. It keeps Sleep After (0xC6/0x81) and "apply sleep mode after content update" (0xC7/0x53 type 0x01).
 // `state.battery` changes the battery level; `state.cleaning` [hour, minute] is its daily panel
-// cleaning time (0x1B/0xB0; null: it refuses the read); `state.thumbnailShows` (an index) makes
-// its thumbnails show that image of the playlist instead of the one it plays (a display that
-// came online without changing); `state.ackContent` false makes it take a content URL without
+// cleaning time (0x1B/0xB0; null: it refuses the read); `state.ackContent` false makes it take a content URL without
 // answering (and download it anyway).
 import dgram from 'node:dgram';
 import net from 'node:net';
@@ -35,7 +32,7 @@ function reply(sock, displayId, cmd, payload = [], ack = true) {
   sock.write(Buffer.from([0xaa, ...body, checksum]));
 }
 
-export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage = true, mac = '02:00:00:00:00:01', thumbnails = true } = {}) {
+export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage = true, mac = '02:00:00:00:00:01' } = {}) {
   const { key, cert } = makeCert();
   // Events look like 'auth', 'cmd:1b', 'cmd:b5:1' (hex command, decimal payload), 'wol'.
   const events = [];
@@ -50,8 +47,8 @@ export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage =
   // update takes it off the Wi-Fi.
   const state = {
     awake: true, networkStandby: true, hearsWol: true, ignoresPowerOff: 0, pluggedIn: false,
-    sleepAfter: [0x07], applySleep: false, playing: null, thumbnailsPosted: 0, wakeOnChangeMs: 0, sleepsAfterUpdateMs: 0,
-    lightSleep: false, offNetwork: false, deepAfterUpdate: false, cleaning: [2, 0], thumbnailShows: null,
+    sleepAfter: [0x07], applySleep: false, playing: null, wakeOnChangeMs: 0, sleepsAfterUpdateMs: 0,
+    lightSleep: false, offNetwork: false, deepAfterUpdate: false, cleaning: [2, 0],
     ackContent: true, // false: takes a content URL without answering, and downloads it all the same
   };
   const held = new Set();
@@ -67,25 +64,6 @@ export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage =
     while (x >= ds[index]) x -= ds[index++];
     return { index, ...p };
   };
-  async function postThumbnail(url) {
-    const now = showing();
-    const form = new FormData();
-    form.append('device_id', 'FAKE0001');
-    form.append('content_id', now?.content.id || 'null');
-    form.append('content_name', now?.content.name || 'null');
-    form.append('content_type', now?.content.content_type || 'null');
-    form.append('content_player_type', 'MobileCMS');
-    form.append('schedule_downloaded_timestamp', String(now?.startedAt || 0));
-    form.append('thumbnail_timestamp', String(Date.now()));
-    if (now) form.append('file', new Blob([now.images[state.thumbnailShows ?? now.index]], { type: 'image/png' }), 'thumbnail.png');
-    try {
-      await fetch(url, { method: 'POST', body: form });
-      state.thumbnailsPosted++;
-      events.push('thumbnail');
-    } catch (err) {
-      events.push(`thumbnail-error:${err.message}`);
-    }
-  }
   const server = net.createServer((raw) => {
     raw.on('error', () => {});
     if (!state.awake) { // asleep: nothing answers
@@ -121,12 +99,7 @@ export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage =
         if (len > 2 && payload[1] === 0x01) state.applySleep = payload[2] === 0x01;
         return reply(sock, id, cmd, [0x53, 0x01, state.applySleep ? 0x01 : 0x00]);
       }
-      if (cmd === 0xc7 && sub === 0x54) { // (like the EM32DX: takes the request, and with thumbnails off sends nothing)
-        const url = payload.subarray(1).toString();
-        reply(sock, id, cmd, [0x54]);
-        if (thumbnails) setTimeout(() => postThumbnail(url), 20);
-        return;
-      }
+      if (cmd === 0xc7 && sub === 0x54) return reply(sock, id, cmd, [0x54]); // (a thumbnail request: like the EM32DX, it sends nothing)
       if (cmd === 0x1b && payload[0] === 0xb0) {
         if (!state.cleaning) return reply(sock, id, cmd, [0xb0], false);
         const d = new Date(Date.now() + 86400000);

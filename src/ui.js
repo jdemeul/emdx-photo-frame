@@ -188,8 +188,7 @@ function checkText(s) {
   return esc(fmt(c.at) + ' · ' + c.name + ', firmware ' + c.software + ' · Network Standby ' + c.networkStandby
     + (c.sleepAfter ? ' · Sleep After ' + c.sleepAfter : '') + (c.applySleep ? ' · sleep after content update ' + c.applySleep : '')
     + (c.lowPowerWifi ? ' · low-power Wi-Fi module ' + c.lowPowerWifi : '')
-    + (c.cleaning && c.cleaning.hour != null ? ' · panel cleaning ' + String(c.cleaning.hour).padStart(2, '0') + ':' + String(c.cleaning.minute).padStart(2, '0') : '')
-    + (s.thumbnails === false ? ' · sends no thumbnails' : ''));
+    + (c.cleaning && c.cleaning.hour != null ? ' · panel cleaning ' + String(c.cleaning.hour).padStart(2, '0') + ':' + String(c.cleaning.minute).padStart(2, '0') : ''));
 }
 // The display's daily panel cleaning, and the hands-off window the NAS keeps around it.
 function cleaningHtml(cl) {
@@ -219,14 +218,6 @@ function changesHtml(pl) {
   });
   return rows.length ? rows.join('<br>') : '–';
 }
-function slotName(pl, key) {
-  const x = pl.slots.find((y) => y.key === key);
-  return x ? x.label : key;
-}
-function seenHtml(pl) {
-  return (pl.seen || []).filter((e) => e.seen).slice(0, 3).map((e) => esc(fmt(e.at) + ' (' + e.how + '): ' + (e.sure ? '' : 'probably ') + slotName(pl, e.seen) + '’s photo')
-    + (e.ok ? ', as expected' : ' <span class="err">' + esc('(expected ' + slotName(pl, e.expected) + '’s)') + '</span>')).join('<br>');
-}
 function render(s) {
   last = s;
   $('#state').textContent = s.busy ? s.busy.what + '…' : 'idle';
@@ -249,15 +240,11 @@ function render(s) {
   const ch = pl && pl.changes && pl.changes[0];
   const miss = pl && pl.missed && !pl.missed.resolvedAt ? pl.missed : null;
   if (miss && c && c.byDisplay && !tpShowing) {
-    const was = miss.seen ? slotName(pl, miss.seen.key) + '’s photo (its screen says so)'
-      : 'probably still ' + (miss.stillShows && miss.stillShows.dates ? miss.stillShows.dates.map(day).join(' + ') : 'the photo before');
+    const was = 'probably still ' + (miss.stillShows && miss.stillShows.dates ? miss.stillShows.dates.map(day).join(' + ') : 'the photo before');
     onFrame = esc(was) + ' <span class="err">' + esc('(it missed the change of ' + fmt(miss.since) + (miss.count > 1 ? ' and ' + (miss.count - 1) + ' more' : '') + '; ' + c.items.map((it) => day(it.takenAt)).join(' + ') + ' is due, sent as soon as it is back)') + '</span>';
-  } else if (ch && c && c.byDisplay && ch.seen && ch.seen.changed && !tpShowing) {
-    onFrame += ' <span class="muted">(confirmed: its screen showed it after the change)</span>';
   } else if (ch && c && c.byDisplay && !ch.online && Date.now() < ch.until) {
     onFrame += ' <span class="muted">(not confirmed yet: the NAS is looking for the display)</span>';
   }
-  const seen = pl ? seenHtml(pl) : '';
   const rows = [
     ['On the frame', onFrame],
     ['Layout', c ? esc(c.kind) : '–'],
@@ -265,7 +252,6 @@ function render(s) {
       ['Playlist', playlistHtml(pl)],
       ['Next change', fmt(pl.nextChange)],
       ['After a change', changesHtml(pl)],
-      ...(seen ? [['Seen on the display', seen]] : []),
     ] : [
       ['Sent', c && c.pushedAt ? fmt(c.pushedAt) : '–'],
       ['Next update', fmt(s.nextRun)],
@@ -278,7 +264,6 @@ function render(s) {
     ['This round', s.cycle ? esc(s.cycle.shown + ' of ' + s.cycle.total + ' photos ' + (pl ? 'shown or planned' : 'shown') + ' (round ' + s.cycle.n + ')') : '–'],
     ['Album', s.library ? esc(s.library.titles.join(', ') + ' · ' + s.library.count + ' photos · read ' ) + fmt(s.library.fetchedAt) : '–'],
   ];
-  if (s.thumbnail && s.thumbnail.file) rows.push(['Screen', '<a href="/img/thumbnails/' + s.thumbnail.file + '?' + s.thumbnail.at + '" target="_blank">thumbnail the display sent ' + esc(fmt(s.thumbnail.at)) + '</a>']);
   $('#info').innerHTML = rows.map(([k, v]) => '<dt>' + k + '</dt><dd>' + v + '</dd>').join('');
   const dup = s.lastError && s.sleep && s.sleep.error === s.lastError.message; // already shown under Display
   $('#error').textContent = s.lastError && !dup ? 'Last problem (' + fmt(s.lastError.at) + '): ' + s.lastError.message : '';

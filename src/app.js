@@ -9,7 +9,7 @@ import { fetchAlbum, fetchItemInfo, sizedUrl, downloadImage } from './sources/go
 import { scanFolder } from './sources/folder.js';
 import { syncBag, planNext, markShown } from './selector.js';
 import { composeCanvas, renderCanvas, planCells } from './render.js';
-import { pushToDisplay, putToSleep, readDisplayInfo, confirmAsleep, probeDisplay, lookForDisplay, deepSleepNow, withDisplay, requestThumbnail, cleaningText } from './display.js';
+import { pushToDisplay, putToSleep, readDisplayInfo, confirmAsleep, probeDisplay, lookForDisplay, deepSleepNow, cleaningText } from './display.js';
 import { changeClock } from './playlist.js';
 import { renderTestPattern } from './testPattern.js';
 import { DailyPlaylist } from './daily.js';
@@ -17,9 +17,6 @@ import { DailyPlaylist } from './daily.js';
 const DAY = 24 * 3600 * 1000;
 // Runs that retry when the display can't be reached (manual ones report back instead).
 const SCHEDULED = new Set(['schedule', 'retry', 'start']);
-// After this many requests without a single thumbnail, stop waiting for them: the firmware
-// doesn't send any (the EM32DX's doesn't). Check display still asks, without waiting.
-const THUMB_TRIES = 3;
 // How long an action waits for a quick look at the display to finish: a look can take its
 // connection timeout, a battery and a cleaning-time read, and the disconnect (~30 s at worst).
 const PROBE_WAIT_MS = 40000;
@@ -38,7 +35,6 @@ export class FrameApp {
     this.sleepTimer = null;
     this.watchTimer = null;
     this.missedTimer = null;
-    this.thumbWaiters = new Set(); // callers waiting for the display's next thumbnail
     upgradeState(this.state);
     store.save();
     this.daily = cfg.update.mode === 'playlist' ? new DailyPlaylist(this) : null;
@@ -941,15 +937,12 @@ export class FrameApp {
     });
   }
 
-  // "Check display": read its name, firmware, battery and settings, and ask for a thumbnail of
-  // its screen (unless it never sends one). This wakes it (Wake-on-LAN), so it goes back to sleep
-  // afterwards. In playlist mode, a display that is awake for this gets a fresh playlist if one
+  // "Check display": read its name, firmware, battery and settings. This wakes it (Wake-on-LAN),
+  // so it goes back to sleep afterwards. In playlist mode, a display that is awake for this gets a fresh playlist if one
   // is due.
   async displayInfo() {
     const info = await this.exclusive('Checking the display', async () => {
-      const thumbnailUrl = this.thumbnailsWork() === false ? null : this.server?.thumbnailUrl;
-      const read = await readDisplayInfo(this.cfg, { thumbnailUrl });
-      if (read.thumbnail === 'asked') this.thumbCount().asked++;
+      const read = await readDisplayInfo(this.cfg);
       this.markAwake();
       this.scheduleSleep();
       this.noteBattery(read.battery);
@@ -960,70 +953,6 @@ export class FrameApp {
     });
     if (this.daily) this.daily.sendIfDue('check display').catch((err) => log.warn(`Playlist: ${err.message}`));
     return info;
-  }
-
-  // ---------- thumbnails of the screen ----------
-  // Does this display send thumbnails of its screen (MDC 0xC7/0x54)? null: not known yet. The
-  // count starts over when the NAS asks at a new address (the EM32DX never sent one to port
-  // 8321; Samsung's app asks at port 6868, 8 Nov 2026).
-  thumbnailsWork() {
-    const t = this.thumbCount();
-    return t.received > 0 ? true : t.asked >= THUMB_TRIES ? false : null;
-  }
-
-  thumbCount() {
-    const t = this.state.thumbs;
-    const url = this.server?.thumbnailUrl;
-    if (url && t.url !== url) {
-      if (t.url || t.asked) log.info(`Asking for thumbnails at ${url} from now on (the count of unanswered requests starts over).`);
-      Object.assign(t, { url, asked: 0, received: 0 });
-      this.store.save();
-    }
-    return t;
-  }
-
-  // Ask the display for a thumbnail and wait for it; null if none came (or none ever comes).
-  async askThumbnail(timeoutSec = 10) {
-    if (!this.server || this.thumbnailsWork() === false) return null;
-    let deliver;
-    const got = new Promise((resolve) => { deliver = resolve; });
-    this.thumbWaiters.add(deliver);
-    const timer = setTimeout(() => { this.thumbWaiters.delete(deliver); deliver(null); }, timeoutSec * 1000);
-    try {
-      // One attempt, no Wake-on-LAN: this is for a display that is awake anyway; one that has
-      // gone back to sleep is left asleep (and not knocked on for minutes).
-      const opts = { quiet: true, wol: false, windowSec: this.cfg.display.probeTimeoutSec ?? 10 };
-      await withDisplay(this.cfg, opts, (device) => requestThumbnail(device, this.server.thumbnailUrl));
-      this.thumbCount().asked++; // (counted once the display has taken the request)
-      const th = await got;
-      if (!th && this.thumbnailsWork() === false) log.info(`No thumbnail after ${THUMB_TRIES} requests: this display doesn't send them; not asking any more.`);
-      return th;
-    } finally {
-      clearTimeout(timer);
-      this.thumbWaiters.delete(deliver);
-      this.store.save();
-    }
-  }
-
-  // A thumbnail the display POSTed: kept as thumbnails/latest.*, handed to whoever asked for it,
-  // and in playlist mode matched against the photos.
-  onThumbnail(th) {
-    const st = this.state;
-    this.thumbCount().received++;
-    if (th.image?.buf?.length) {
-      const ext = /png/i.test(th.image.type || '') || /\.png$/i.test(th.image.name || '') ? 'png' : 'jpg';
-      const dir = this.store.path('thumbnails');
-      fs.mkdirSync(dir, { recursive: true });
-      th.file = `latest.${ext}`;
-      fs.writeFileSync(`${dir}/${th.file}`, th.image.buf);
-      fs.rmSync(`${dir}/latest.${ext === 'png' ? 'jpg' : 'png'}`, { force: true });
-    }
-    st.thumbnail = { at: th.at, fields: th.fields, file: th.file || null };
-    this.store.save();
-    const waiters = [...this.thumbWaiters];
-    this.thumbWaiters.clear();
-    for (const w of waiters) w(th);
-    if (!waiters.length && this.daily) this.daily.noteThumbnail(th, 'check display').catch((err) => log.warn(`Playlist: ${err.message}`));
   }
 
   // ---------- history and status ----------
@@ -1060,8 +989,6 @@ export class FrameApp {
       check: this.cfg.display.host && this.cfg.sleep.mode !== 'off' && this.cfg.sleep.checkMin
         ? { everyMin: this.cfg.sleep.checkMin, last: st.lastCheck || null, wakeEvents: (st.wakeEvents || []).filter((e) => !e.afterChange).slice(0, 10), missedEverySec: this.missedTimer ? this.cfg.sleep.missedCheckSec : null }
         : null,
-      thumbnails: this.thumbnailsWork(),
-      thumbnail: st.thumbnail || null,
       displayTraffic: this.server?.recentTraffic?.().slice(0, 20) ?? [],
     };
   }
@@ -1094,9 +1021,8 @@ export function batteryDays(logEntries, timezone, days = 7) {
 }
 
 // State written by earlier versions: drop what the playlist test left (saying so if it was cut
-// short and left the display's settings changed), count its unanswered thumbnail requests (so the
-// NAS doesn't keep waiting for thumbnails that never come), label old wake-ups, and start the
-// battery log from the readings in the history.
+// short and left the display's settings changed), drop what screen thumbnails left (until 8 Nov
+// 2026), label old wake-ups, and start the battery log from the readings in the history.
 export function upgradeState(st) {
   st.excluded ||= {};
   st.history ||= [];
@@ -1112,11 +1038,6 @@ export function upgradeState(st) {
     const playlist = st.history.some((h) => h.ok && /^playlist sent/.test(h.kind || '') && h.at >= e.at && h.at - e.at < 10 * 60000);
     e.sent = playlist ? 'playlist' : 'photo';
   }
-  if (!st.thumbs) {
-    const misses = (st.playlistTest?.observations || []).filter((o) => o.error).length
-      + (st.playlist?.seen || []).filter((e) => e.note === 'no thumbnail came back').length;
-    st.thumbs = st.thumbnail ? { asked: 0, received: 1 } : { asked: misses, received: 0 };
-  }
   if (!st.batteryLog) {
     st.batteryLog = [];
     const readings = [
@@ -1125,5 +1046,8 @@ export function upgradeState(st) {
     ].sort((a, b) => a.at - b.at);
     for (const r of readings) addBatteryReading(st.batteryLog, r);
   }
-  for (const key of ['playlistTest', 'pendingRestore', 'thumbnailFailures']) delete st[key];
+  for (const key of ['playlistTest', 'pendingRestore', 'thumbnailFailures', 'thumbs', 'thumbnail']) delete st[key];
+  if (st.playlist) delete st.playlist.seen;
+  if (st.playlist?.missed) delete st.playlist.missed.seen;
+  if (st.displayCheck) delete st.displayCheck.thumbnail;
 }

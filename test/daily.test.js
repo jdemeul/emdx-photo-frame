@@ -1,5 +1,5 @@
-// UPDATE_MODE=playlist: the timing of a batch (across clock changes, repeating), matching
-// thumbnails to photos, and a few days in fast motion against the fake display.
+// UPDATE_MODE=playlist: the timing of a batch (across clock changes, repeating), and a few days
+// in fast motion against the fake display.
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -8,7 +8,6 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import sharp from 'sharp';
 import { changeClock, slotKey, dayLabel, buildBatch, positionAt } from '../src/playlist.js';
-import { matchThumbnail } from '../src/thumbMatch.js';
 
 const TZ = 'Europe/Brussels';
 const H = 3600000;
@@ -70,11 +69,14 @@ test('the battery log gives one reading per day, the first of the day, newest da
   assert.deepEqual(batteryDays([], TZ), []);
 });
 
-test('state from the version with the playlist test: settings it left changed are flagged, old wake-ups labelled, thumbnails and battery carried over', async () => {
+test('state from the version with the playlist test: settings it left changed are flagged, old wake-ups labelled, battery carried over, screen thumbnails dropped', async () => {
   const { upgradeState } = await import('../src/app.js');
   const t0 = at('2026-10-18T04:00:00Z');
   const st = {
-    playlist: { pending: null, seen: [{ note: 'no thumbnail came back' }] },
+    playlist: { pending: null, seen: [{ note: 'no thumbnail came back' }], missed: { key: 'k', seen: { changed: false } } },
+    thumbs: { asked: 3, received: 0 },
+    thumbnail: { at: 1, file: 'latest.png' },
+    displayCheck: { name: 'EMDX', thumbnail: 'asked' },
     playlistTest: { done: false, saved: { sleepAfter: 0x0a, applySleep: 1 }, observations: [{ error: 'timeout' }, { ok: true }, { error: 'timeout' }] },
     thumbnailFailures: 2,
     history: [
@@ -91,7 +93,7 @@ test('state from the version with the playlist test: settings it left changed ar
   assert.match(st.lastError.message, /playlist test was cut short and left the display's Sleep After/);
   assert.equal(st.playlist.pending, 'the playlist test replaced the playlist');
   assert.deepEqual(st.wakeEvents.map((e) => e.sent), ['photo', undefined, 'playlist']);
-  assert.deepEqual(st.thumbs, { asked: 3, received: 0 });
+  assert.deepEqual([st.thumbs, st.thumbnail, st.playlist.seen, st.playlist.missed.seen, st.displayCheck.thumbnail], [undefined, undefined, undefined, undefined, undefined]);
   assert.deepEqual(st.batteryLog.map((r) => r.percent), [96]); // within half an hour: the latest
   assert.deepEqual([st.playlistTest, st.pendingRestore, st.thumbnailFailures], [undefined, undefined, undefined]);
   // Already upgraded state is left alone.
@@ -171,28 +173,6 @@ function photoSvg(i, w = 300, h = 500) {
   </svg>`);
 }
 
-test('a thumbnail of the screen is matched to the right photo, also turned, small and dithered to six inks', async () => {
-  const files = [];
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'thumbmatch-'));
-  for (let i = 0; i < 6; i++) {
-    const f = path.join(dir, `p${i}.jpg`);
-    fs.writeFileSync(f, await sharp(photoSvg(i)).jpeg({ quality: 85 }).toBuffer());
-    files.push({ key: `k${i}`, file: f });
-  }
-  const shown = await sharp(files[3].file).toBuffer();
-  const thumbs = [
-    await sharp(shown).resize(90, 150).jpeg({ quality: 60 }).toBuffer(),
-    await sharp(shown).rotate(90).resize(160).png().toBuffer(), // in the panel's landscape orientation
-    await sharp(shown).resize(120, 200).png({ palette: true, colors: 6, dither: 1 }).toBuffer(), // dithered
-  ];
-  for (const t of thumbs) {
-    const m = await matchThumbnail(t, files);
-    assert.equal(m.key, 'k3');
-    assert.ok(m.sure, JSON.stringify(m));
-  }
-  assert.equal(await matchThumbnail(thumbs[0], [{ key: 'x', file: path.join(dir, 'missing.jpg') }]), null);
-});
-
 // ---------- a few "days" of 12 seconds against the fake display ----------
 let hasOpenssl = true;
 try { execFileSync('openssl', ['version'], { stdio: 'ignore' }); } catch { hasOpenssl = false; }
@@ -215,7 +195,7 @@ test('playlist mode: plan, send when found awake, the display moves on by itself
   for (let i = 0; i < 12; i++) fs.writeFileSync(path.join(photoDir, `p${String(i).padStart(2, '0')}.jpg`), await sharp(photoSvg(i)).jpeg({ quality: 85 }).toBuffer());
   Object.assign(process.env, {
     DATA_DIR: dataDir, ALBUM_URLS: '', PHOTO_DIR: photoDir, EMDX_HOST: '127.0.0.1', EMDX_PORT: String(emdx.port), EMDX_PIN: '616161',
-    SERVER_HOST: '127.0.0.1', HTTP_PORT: '18461', THUMBNAIL_PORT: '18471', PANEL_WIDTH: '640', PANEL_HEIGHT: '360', ORIENTATION: 'portrait',
+    SERVER_HOST: '127.0.0.1', HTTP_PORT: '18461', PANEL_WIDTH: '640', PANEL_HEIGHT: '360', ORIENTATION: 'portrait',
     FETCH_TIMEOUT_SEC: '20', CONNECT_ATTEMPTS: '2', EMDX_MAC: emdx.mac, WOL_BROADCAST: '127.0.0.1', WOL_PORT: String(emdx.wolPort),
     WAKE_WAIT_SEC: '0.1', SLEEP_MODE: 'deep', SLEEP_DELAY_SEC: '1', WAKE_WINDOW_MIN: '0.05', SLEEP_CHECK_MIN: '0',
     UPDATE_MODE: 'playlist', PLAYLIST_DAYS: '3', SCHEDULE: '*/12 * * * * *', TZ,
@@ -227,7 +207,7 @@ test('playlist mode: plan, send when found awake, the display moves on by itself
     const { FrameApp } = await import('../src/app.js');
     const { createServer } = await import('../src/server.js');
     const cfg = loadConfig();
-    Object.assign(cfg.update, { minFirstSec: 1, minTailSec: 0.2, watchEverySec: 0.5, thumbTimeoutSec: 3, quietSec: 0.5 });
+    Object.assign(cfg.update, { minFirstSec: 1, minTailSec: 0.2, watchEverySec: 0.5, quietSec: 0.5 });
     Object.assign(cfg.sleep, { confirmSec: 2, confirmEverySec: 0.2, ownSleepSec: 0 });
     emdx.state.sleepsAfterUpdateMs = 1500; // (like the EM32DX: asleep a little after an update)
     Object.assign(cfg.display, { sleepWindowSec: 1, awakeWindowSec: 1 });
@@ -284,7 +264,6 @@ test('playlist mode: plan, send when found awake, the display moves on by itself
     assert.equal(await app.checkAsleep(), true);
     assert.equal(app.state.wakeEvents[0].leftAlone, true);
     assert.equal(emdx.state.awake, true);
-    assert.equal(pl().seen[0].seen, pl().seen[0].expected);
     assert.equal(await app.checkAsleep(), true);
     assert.equal(app.state.wakeEvents[0].putBack, true);
     assert.equal(emdx.state.awake, false);
@@ -316,14 +295,9 @@ test('playlist mode: plan, send when found awake, the display moves on by itself
     pl().missed = null;
     assert.equal(app.daily.due(), 'only 2 days of photos left on the display');
 
-    // Someone presses its button: the NAS asks what it shows (the right photo), then tops it up,
-    // starting with the photo it shows now.
+    // Someone presses its button: the NAS tops it up, starting with the photo it shows now.
     emdx.wake();
     assert.equal(await app.checkAsleep(), true);
-    const seen = pl().seen[0];
-    assert.equal(seen.how, 'found awake');
-    assert.equal(seen.seen, seen.expected);
-    assert.ok(seen.sure, JSON.stringify(seen));
     assert.equal(app.state.wakeEvents[0].sent, 'playlist');
     const b2 = pl().batch;
     assert.ok(b2.sentAt > b1.sentAt);
@@ -385,9 +359,9 @@ test('playlist mode: plan, send when found awake, the display moves on by itself
   }
 });
 
-test('playlist mode: the display comes online after each change; the NAS reads the battery and leaves it alone, tops it up when it runs short, stops asking for thumbnails that never come, and serves the playlist again after a restart', { skip: !hasOpenssl && 'openssl not available', timeout: 180000 }, async () => {
+test('playlist mode: the display comes online after each change; the NAS reads the battery and leaves it alone, tops it up when it runs short, and serves the playlist again after a restart', { skip: !hasOpenssl && 'openssl not available', timeout: 180000 }, async () => {
   const { startFakeEmdx } = await import('./helpers/fakeEmdx.js');
-  const emdx = await startFakeEmdx({ pin: '626262', thumbnails: false });
+  const emdx = await startFakeEmdx({ pin: '626262' });
   emdx.state.wakeOnChangeMs = 6000;
   emdx.state.sleepsAfterUpdateMs = 1500;
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'frame-mornings-'));
@@ -395,7 +369,7 @@ test('playlist mode: the display comes online after each change; the NAS reads t
   for (let i = 0; i < 12; i++) fs.writeFileSync(path.join(photoDir, `p${String(i).padStart(2, '0')}.jpg`), await sharp(photoSvg(i)).jpeg({ quality: 85 }).toBuffer());
   Object.assign(process.env, {
     DATA_DIR: dataDir, ALBUM_URLS: '', PHOTO_DIR: photoDir, EMDX_HOST: '127.0.0.1', EMDX_PORT: String(emdx.port), EMDX_PIN: '626262',
-    SERVER_HOST: '127.0.0.1', HTTP_PORT: '18462', THUMBNAIL_PORT: '18472', PANEL_WIDTH: '640', PANEL_HEIGHT: '360', ORIENTATION: 'portrait',
+    SERVER_HOST: '127.0.0.1', HTTP_PORT: '18462', PANEL_WIDTH: '640', PANEL_HEIGHT: '360', ORIENTATION: 'portrait',
     FETCH_TIMEOUT_SEC: '20', CONNECT_ATTEMPTS: '2', EMDX_MAC: emdx.mac, WOL_BROADCAST: '127.0.0.1', WOL_PORT: String(emdx.wolPort),
     WAKE_WAIT_SEC: '0.1', SLEEP_MODE: 'deep', SLEEP_DELAY_SEC: '1', WAKE_WINDOW_MIN: '0.1', SLEEP_CHECK_MIN: '0',
     UPDATE_MODE: 'playlist', PLAYLIST_DAYS: '3', PLAYLIST_TOPUP_DAYS: '2', SCHEDULE: '*/10 * * * * *', TZ,
@@ -407,7 +381,7 @@ test('playlist mode: the display comes online after each change; the NAS reads t
     const { FrameApp } = await import('../src/app.js');
     const { createServer } = await import('../src/server.js');
     const cfg = loadConfig();
-    Object.assign(cfg.update, { minFirstSec: 1, minTailSec: 0.2, watchEverySec: 0.3, thumbTimeoutSec: 1, quietSec: 0.5 });
+    Object.assign(cfg.update, { minFirstSec: 1, minTailSec: 0.2, watchEverySec: 0.3, quietSec: 0.5 });
     Object.assign(cfg.sleep, { confirmSec: 2, confirmEverySec: 0.2, ownSleepSec: 0 });
     Object.assign(cfg.display, { sleepWindowSec: 1, awakeWindowSec: 1 });
     const app = new FrameApp(cfg, new Store(dataDir), buildPaletteModel(cfg.image.measuredPalette, DEVICE_PALETTE));
@@ -424,12 +398,11 @@ test('playlist mode: the display comes online after each change; the NAS reads t
       await app.scheduled('schedule');
     };
 
-    // The first playlist, sent when found awake (one thumbnail request, unanswered).
+    // The first playlist, sent when found awake.
     await sleepMs(clock.next(Date.now()) - Date.now() + 600);
     await app.daily.startup();
     assert.equal(await app.checkAsleep(), true);
     assert.equal(app.state.wakeEvents[0].sent, 'playlist');
-    assert.equal(asks(), 0); // (no playlist on it yet: nothing to compare a thumbnail with)
     await until(() => !emdx.state.awake);
     const first = pl().batch.sentAt;
 
@@ -446,31 +419,25 @@ test('playlist mode: the display comes online after each change; the NAS reads t
     assert.equal(app.state.wakeEvents[0].battery, 86);
     assert.equal(pl().batch.sentAt, first);
     assert.equal(app.state.batteryLog.at(-1).percent, 86);
-    assert.equal(asks(), 1);
     await until(() => !emdx.state.awake);
     assert.equal(powerOffs(), offs);
 
-    // Change 2: only 1 day left, so it gets a fresh playlist. (Thumbnail request 2.)
+    // Change 2: only 1 day left, so it gets a fresh playlist.
     emdx.state.battery = 85;
     await nextChange();
     assert.ok(pl().batch.sentAt > first);
     assert.equal(app.state.wakeEvents[0].sent, 'playlist');
     assert.equal(app.state.wakeEvents[0].battery, 85);
-    assert.equal(asks(), 2);
     await until(() => !emdx.state.awake);
 
-    // Change 3: request 3, still no thumbnail: from now on the NAS doesn't wait for them.
+    // Changes 3 and 4.
     await nextChange();
-    assert.equal(asks(), 3);
-    assert.equal(app.thumbnailsWork(), false);
     await until(() => !emdx.state.awake);
     await nextChange();
-    assert.equal(asks(), 3);
     assert.ok(pl().changes[0].online);
 
     // The status shows the mornings: battery per change, and the after-change wakes as such.
     const status = await (await fetch('http://127.0.0.1:18462/api/status')).json();
-    assert.equal(status.thumbnails, false);
     assert.ok(status.playlist.changes.slice(0, 3).every((c) => c.online && c.battery != null), JSON.stringify(status.playlist.changes));
     assert.ok(status.check === null || status.check.wakeEvents.every((e) => e.afterChange || e.sent));
     assert.equal(status.batteryDays[0].percent, 85); // (readings within half an hour: the latest)
@@ -484,10 +451,10 @@ test('playlist mode: the display comes online after each change; the NAS reads t
     assert.equal(await app.checkAsleep(), true);
     assert.deepEqual([app.state.wakeEvents[0].leftAlone, app.state.wakeEvents[0].charging, emdx.state.awake, powerOffs()], [true, true, true, 0]);
     emdx.state.pluggedIn = false;
-    // Check display doesn't ask for a thumbnail any more either.
+    // The NAS never asks the display for a thumbnail of its screen (the EM32DX only sends them
+    // over HTTPS, to a server it was given a certificate for).
     await app.displayInfo();
-    assert.equal(asks(), 3);
-    assert.equal(app.state.displayCheck.thumbnail, undefined);
+    assert.equal(asks(), 0);
 
     // "Deep sleep now": the Samsung app's way (its deep sleep mode setting again, then its Sleep
     // button), then the NAS watches whether it leaves the Wi-Fi. This one stays on it.
@@ -530,14 +497,14 @@ test('playlist mode: the display comes online after each change; the NAS reads t
 
 test('deep sleep mode: a display that stays on the Wi-Fi while asleep is put into deep sleep by the NAS; if it can\'t be, the page says so; on the charger it is left alone', { skip: !hasOpenssl && 'openssl not available', timeout: 180000 }, async () => {
   const { startFakeEmdx } = await import('./helpers/fakeEmdx.js');
-  const emdx = await startFakeEmdx({ pin: '636363', thumbnails: false });
+  const emdx = await startFakeEmdx({ pin: '636363' });
   emdx.state.sleepsAfterUpdateMs = 300;
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'frame-light-'));
   const photoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'frame-light-photos-'));
   for (let i = 0; i < 8; i++) fs.writeFileSync(path.join(photoDir, `p${i}.jpg`), await sharp(photoSvg(i)).jpeg({ quality: 85 }).toBuffer());
   Object.assign(process.env, {
     DATA_DIR: dataDir, ALBUM_URLS: '', PHOTO_DIR: photoDir, EMDX_HOST: '127.0.0.1', EMDX_PORT: String(emdx.port), EMDX_PIN: '636363',
-    SERVER_HOST: '127.0.0.1', HTTP_PORT: '18463', THUMBNAIL_PORT: '18473', PANEL_WIDTH: '640', PANEL_HEIGHT: '360', ORIENTATION: 'portrait',
+    SERVER_HOST: '127.0.0.1', HTTP_PORT: '18463', PANEL_WIDTH: '640', PANEL_HEIGHT: '360', ORIENTATION: 'portrait',
     FETCH_TIMEOUT_SEC: '20', CONNECT_ATTEMPTS: '2', EMDX_MAC: emdx.mac, WOL_BROADCAST: '127.0.0.1', WOL_PORT: String(emdx.wolPort),
     WAKE_WAIT_SEC: '0.1', SLEEP_MODE: 'deep', SLEEP_DELAY_SEC: '1', SLEEP_CHECK_MIN: '0',
     UPDATE_MODE: 'playlist', PLAYLIST_DAYS: '3', SCHEDULE: '0 6 * * *', TZ,
@@ -619,7 +586,7 @@ test('deep sleep mode: a display that stays on the Wi-Fi while asleep is put int
 
 test('a missed change: the NAS looks for the display every few seconds and sends a fresh playlist as soon as it is back; it keeps its hands off around the panel cleaning, whose time it reads from the display', { skip: !hasOpenssl && 'openssl not available', timeout: 180000 }, async () => {
   const { startFakeEmdx } = await import('./helpers/fakeEmdx.js');
-  const emdx = await startFakeEmdx({ pin: '646464', thumbnails: false });
+  const emdx = await startFakeEmdx({ pin: '646464' });
   emdx.state.sleepsAfterUpdateMs = 300;
   emdx.state.deepAfterUpdate = true;
   // The fake cleans its panel 12 hours from now (Brussels time), well away from this test.
@@ -631,7 +598,7 @@ test('a missed change: the NAS looks for the display every few seconds and sends
   for (let i = 0; i < 8; i++) fs.writeFileSync(path.join(photoDir, `p${i}.jpg`), await sharp(photoSvg(i)).jpeg({ quality: 85 }).toBuffer());
   Object.assign(process.env, {
     DATA_DIR: dataDir, ALBUM_URLS: '', PHOTO_DIR: photoDir, EMDX_HOST: '127.0.0.1', EMDX_PORT: String(emdx.port), EMDX_PIN: '646464',
-    SERVER_HOST: '127.0.0.1', HTTP_PORT: '18464', THUMBNAIL_PORT: '18474', PANEL_WIDTH: '640', PANEL_HEIGHT: '360', ORIENTATION: 'portrait',
+    SERVER_HOST: '127.0.0.1', HTTP_PORT: '18464', PANEL_WIDTH: '640', PANEL_HEIGHT: '360', ORIENTATION: 'portrait',
     FETCH_TIMEOUT_SEC: '20', CONNECT_ATTEMPTS: '2', EMDX_MAC: emdx.mac, WOL_BROADCAST: '127.0.0.1', WOL_PORT: String(emdx.wolPort),
     WAKE_WAIT_SEC: '0.1', SLEEP_MODE: 'deep', SLEEP_DELAY_SEC: '1', SLEEP_CHECK_MIN: '0', WAKE_WINDOW_MIN: '0.02', MISSED_CHECK_SEC: '0.3',
     UPDATE_MODE: 'playlist', PLAYLIST_DAYS: '3', SCHEDULE: '0 6 * * *', TZ,
@@ -754,91 +721,3 @@ test('a quick look at the display doesn\'t make a button on the page fail as bus
   await long;
 });
 
-test('after each change the NAS asks the display for its screen on the Samsung app\'s thumbnail port: a thumbnail of the new photo confirms the change; one that still shows the photo before (also when asked again) makes it a missed change, and a fresh playlist goes out right away', { skip: !hasOpenssl && 'openssl not available', timeout: 180000 }, async () => {
-  const { startFakeEmdx } = await import('./helpers/fakeEmdx.js');
-  const emdx = await startFakeEmdx({ pin: '656565' });
-  emdx.state.wakeOnChangeMs = 8000;
-  emdx.state.sleepsAfterUpdateMs = 1500;
-  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'frame-screen-'));
-  const photoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'frame-screen-photos-'));
-  for (let i = 0; i < 12; i++) fs.writeFileSync(path.join(photoDir, `p${String(i).padStart(2, '0')}.jpg`), await sharp(photoSvg(i)).jpeg({ quality: 85 }).toBuffer());
-  Object.assign(process.env, {
-    DATA_DIR: dataDir, ALBUM_URLS: '', PHOTO_DIR: photoDir, EMDX_HOST: '127.0.0.1', EMDX_PORT: String(emdx.port), EMDX_PIN: '656565',
-    SERVER_HOST: '127.0.0.1', HTTP_PORT: '18465', THUMBNAIL_PORT: '18475', PANEL_WIDTH: '640', PANEL_HEIGHT: '360', ORIENTATION: 'portrait',
-    FETCH_TIMEOUT_SEC: '20', CONNECT_ATTEMPTS: '2', EMDX_MAC: emdx.mac, WOL_BROADCAST: '127.0.0.1', WOL_PORT: String(emdx.wolPort),
-    WAKE_WAIT_SEC: '0.1', SLEEP_MODE: 'deep', SLEEP_DELAY_SEC: '1', WAKE_WINDOW_MIN: '0.1', SLEEP_CHECK_MIN: '0', MISSED_CHECK_SEC: '0',
-    UPDATE_MODE: 'playlist', PLAYLIST_DAYS: '3', PLAYLIST_TOPUP_DAYS: '1', SCHEDULE: '*/12 * * * * *', TZ,
-  });
-  try {
-    const { loadConfig, DEVICE_PALETTE } = await import('../src/config.js');
-    const { Store } = await import('../src/state.js');
-    const { buildPaletteModel } = await import('../src/color.js');
-    const { FrameApp } = await import('../src/app.js');
-    const { createServer } = await import('../src/server.js');
-    const cfg = loadConfig();
-    Object.assign(cfg.update, { minFirstSec: 1, minTailSec: 0.2, watchEverySec: 0.3, thumbTimeoutSec: 2, thumbRecheckSec: 1, quietSec: 0.5 });
-    Object.assign(cfg.sleep, { confirmSec: 2, confirmEverySec: 0.2, ownSleepSec: 0 });
-    Object.assign(cfg.display, { sleepWindowSec: 1, awakeWindowSec: 1 });
-    // Old state: three requests at port 8321 went unanswered. The new address starts over.
-    const store = new Store(dataDir);
-    store.state.thumbs = { asked: 3, received: 0 };
-    const app = new FrameApp(cfg, store, buildPaletteModel(cfg.image.measuredPalette, DEVICE_PALETTE));
-    const server = createServer(cfg, app);
-    app.server = server;
-    await server.listen();
-    cleanups.push(async () => { app.stopMissedWatch(); app.cancelSleep(); await server.close(); await emdx.close(); });
-    assert.equal(server.thumbnailUrl, 'http://127.0.0.1:18475/device-thumbnail');
-    assert.equal(app.thumbnailsWork(), null);
-    assert.equal(app.state.thumbs.url, server.thumbnailUrl);
-    // (Nothing but the display's endpoints on that port.)
-    assert.equal((await fetch('http://127.0.0.1:18475/')).status, 404);
-    const clock = app.daily.clock;
-    const pl = () => app.state.playlist;
-    const entry = (key) => app.state.history.find((h) => h.change === key);
-    const nextChange = async () => {
-      await sleepMs(clock.next(Date.now()) - Date.now() + 100);
-      await app.scheduled('schedule');
-    };
-
-    // The first playlist, sent when found awake.
-    await sleepMs(clock.next(Date.now()) - Date.now() + 600);
-    await app.daily.startup();
-    assert.equal(await app.checkAsleep(), true);
-    await until(() => !emdx.state.awake && emdx.received.length === 1);
-
-    // Change 1: it comes online, its thumbnail (POSTed to port 18475) shows the new photo.
-    await nextChange();
-    const c1 = pl().changes[0];
-    assert.ok(c1.online);
-    assert.deepEqual([c1.seen.changed, c1.seen.sure, c1.seen.key], [true, true, c1.seen.expected]);
-    assert.match(entry(c1.key).kind, /changed by the display \(its screen shows it; it came online \d+ s after the change\)/);
-    assert.equal(entry(c1.key).missed, undefined);
-    assert.equal(app.daily.missedOpen(), null);
-    assert.equal(app.thumbnailsWork(), true);
-    assert.ok(server.recentTraffic().some((t) => t.port === 18475 && t.path === '/device-thumbnail' && t.status === 200));
-    assert.equal(emdx.received.length, 1); // (no playlist due)
-    await until(() => !emdx.state.awake);
-
-    // Change 2: it comes online but keeps showing the photo before (like 21 Oct 2026). Asked
-    // again a moment later, same answer: a missed change, and since it is awake right then, a
-    // fresh playlist goes out at once.
-    const before = emdx.showing().index;
-    emdx.state.thumbnailShows = before;
-    await nextChange();
-    const c2 = pl().changes[0];
-    assert.ok(c2.online);
-    assert.deepEqual([c2.seen.changed, c2.seen.sure], [false, true]);
-    assert.equal(pl().seen.filter((e) => e.how.startsWith('after a change')).length >= 3, true); // (asked twice this time)
-    assert.equal(entry(c2.key).missed, true);
-    assert.match(entry(c2.key).kind, /not changed \(the display came online, but its screen shows .+'s photo\)/);
-    await until(() => emdx.received.length === 2);
-    emdx.state.thumbnailShows = null;
-    assert.ok(pl().missed.resolvedAt);
-    assert.equal(pl().missed.seen.changed, false);
-    assert.equal(app.state.wakeEvents[0].sent, 'playlist');
-    const page = await (await fetch('http://127.0.0.1:18465/api/status')).json();
-    assert.equal(page.playlist.changes[0].seen.changed, false);
-  } finally {
-    for (const k of ['PHOTO_DIR', 'UPDATE_MODE', 'PLAYLIST_DAYS', 'PLAYLIST_TOPUP_DAYS', 'SCHEDULE', 'PANEL_WIDTH', 'PANEL_HEIGHT', 'SLEEP_CHECK_MIN', 'WAKE_WINDOW_MIN', 'MISSED_CHECK_SEC', 'THUMBNAIL_PORT']) delete process.env[k];
-  }
-});

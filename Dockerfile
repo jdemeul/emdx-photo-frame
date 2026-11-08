@@ -17,8 +17,8 @@ RUN npm ci --omit=dev && npm cache clean --force
 COPY src ./src
 
 VOLUME /data
-# 8321: the web page and what the display downloads; 6868: thumbnails of its screen.
-EXPOSE 8321 6868
+# The web page and what the display downloads.
+EXPOSE 8321
 HEALTHCHECK --interval=5m --timeout=10s --start-period=30s \
   CMD node -e "fetch('http://127.0.0.1:'+(process.env.HTTP_PORT||8321)+'/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 

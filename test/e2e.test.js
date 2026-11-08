@@ -29,7 +29,6 @@ before(async () => {
     EMDX_PIN: '424242',
     SERVER_HOST: '127.0.0.1',
     HTTP_PORT: '18321',
-    THUMBNAIL_PORT: '18331',
     ORIENTATION: 'portrait',
     DITHER: 'local', // this test checks the NAS ditherer's palette-only output
     FETCH_TIMEOUT_SEC: '20',
@@ -155,10 +154,8 @@ test('a full day: album -> render -> display downloads a palette-only PNG', { sk
     const info = await (await fetch('http://127.0.0.1:18321/api/display-info', { method: 'POST' })).json();
     assert.equal(info.networkStandby, 'on');
     assert.equal(info.battery.batteryPercent, 87);
-    // ...the Samsung app's settings, and a thumbnail of its screen, which it POSTs back.
-    assert.deepEqual([info.sleepAfter, info.applySleep, info.lowPowerWifi, info.thumbnail], ['10 min', 'off', 'no', 'asked']);
-    await until(() => app.state.thumbnail?.file);
-    assert.equal(app.state.thumbnail.fields.content_player_type, 'MobileCMS');
+    // ...and the Samsung app's settings.
+    assert.deepEqual([info.sleepAfter, info.applySleep, info.lowPowerWifi], ['10 min', 'off', 'no']);
     const checked = await (await fetch('http://127.0.0.1:18321/api/status')).json();
     assert.equal(checked.displayCheck.networkStandby, 'on');
     await until(() => app.state.sleep?.asleep && !emdx.state.awake);
