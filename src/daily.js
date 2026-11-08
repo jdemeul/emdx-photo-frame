@@ -15,6 +15,9 @@
 //   pending  why a fresh playlist should go out at the next chance (or null)
 //   changes  the last changes: when the NAS looked for the display afterwards, and whether it
 //            came online
+//   missed   the last change the display missed (didn't come online after): { key, at, since,
+//            count, retryAt, resolvedAt, how }; until resolved, a fresh playlist is due and the
+//            NAS looks for the display every MISSED_CHECK_SEC
 //   seen     what thumbnails of the screen showed, matched against the photos
 import fs from 'node:fs';
 import path from 'node:path';
@@ -42,6 +45,7 @@ export class DailyPlaylist {
     p.pending ||= null;
     p.changes ||= [];
     p.seen ||= [];
+    p.missed ||= null;
     // Changes more than a day apart, or several a day: say the time too.
     const [a, b] = this.clock.upcoming(2, Date.now());
     this.withTime = !(b - a >= 20 * 3600000 && b - a <= 28 * 3600000);
@@ -156,6 +160,7 @@ export class DailyPlaylist {
     const p = this.st;
     if (p.pending) return p.pending;
     if (!p.batch) return 'the display has no playlist yet';
+    if (this.missedOpen()) return `the display missed the change of ${this.label(p.missed.at)} (a fresh playlist puts it back in step)`;
     if (p.batch.schedule !== this.cfg.schedule) return 'SCHEDULE changed';
     if (p.batch.days !== this.cfg.update.days) return 'PLAYLIST_DAYS changed';
     // At most one a change, and only once the display is running short.
@@ -216,6 +221,7 @@ export class DailyPlaylist {
       };
       this.st.pending = null;
       this.st.replaced = null;
+      this.resolveMissed(`playlist sent (${reason})`);
       app.noteBattery(battery);
       app.addHistory({ ok: true, kind: `playlist sent: ${batch.items.length} photos, until ${this.label(batch.endsAt)}`, ids: [], dates: [], battery: battery?.batteryPercent ?? null });
       app.state.lastError = null;
@@ -232,6 +238,35 @@ export class DailyPlaylist {
       app.store.save();
       throw e;
     }
+  }
+
+  // ---------- missed changes ----------
+  // The display didn't come online after a change: it probably slept through it (or hung, e.g.
+  // in its panel cleaning) and shows yesterday's photo, or a solid colour, until someone presses
+  // its power button. Then its playlist may be out of step, so a fresh one goes out as soon as
+  // the NAS finds it awake (it looks every MISSED_CHECK_SEC until then).
+  noteMissed(rec) {
+    const prev = this.missedOpen();
+    this.st.missed = { key: rec.key, at: rec.at, since: prev?.since ?? rec.at, count: (prev?.count ?? 0) + 1 };
+    this.app.store.save();
+    const every = this.cfg.sleep.missedCheckSec;
+    log.warn(`Playlist: the display missed the change${prev ? ` (${this.st.missed.count} in a row)` : ''}. A fresh playlist goes out as soon as it is back`
+      + (every ? ` (the NAS looks for it every ${every} s; a press on its power button brings it back).` : ' (press its power button).'));
+    this.app.startMissedWatch();
+  }
+
+  missedOpen() {
+    const m = this.st.missed;
+    return m && !m.resolvedAt ? m : null;
+  }
+
+  resolveMissed(how) {
+    const m = this.missedOpen();
+    if (!m) return;
+    Object.assign(m, { resolvedAt: Date.now(), how });
+    delete m.retryAt;
+    this.app.stopMissedWatch?.();
+    log.info(`Playlist: the display is back in step (${how}).`);
   }
 
   // ---------- what the display shows ----------
@@ -335,8 +370,8 @@ export class DailyPlaylist {
         // (Not while it is awake because of something the NAS did, e.g. a playlist just sent.)
         if (!app.busy && !app.sleepTimer) {
           let found = null;
-          try { found = await app.exclusive('Looking for the display after the change', () => app.look({ battery: true })); } catch { /* busy */ }
-          if (found?.awake) { rec.online = Date.now(); battery = found.battery; break; }
+          try { found = await app.exclusive('Looking for the display after the change', () => app.look({ battery: true, cleaning: app.cleaningDue() }), { probe: true }); } catch { /* busy */ }
+          if (found?.awake) { rec.online = Date.now(); battery = found.battery; app.noteCleaning(found.cleaning); break; }
         }
         await pause(cfg.update.watchEverySec * 1000);
       }
@@ -346,6 +381,7 @@ export class DailyPlaylist {
     app.store.save();
     if (!rec.online) {
       log.info(`Playlist: the display did not come online within ${cfg.sleep.wakeWindowMin} min of the change.`);
+      this.noteMissed(rec);
       return;
     }
     const event = app.noteWake({ afterChange: true });
@@ -471,6 +507,7 @@ export class DailyPlaylist {
   async startup({ send = false } = {}) {
     const app = this.app;
     this.serveAgain();
+    if (this.missedOpen()) app.startMissedWatch();
     try {
       await app.exclusive('Preparing the coming photos', async () => {
         this.advance();
@@ -518,6 +555,7 @@ export class DailyPlaylist {
         return { ...c, battery: c.battery ?? wake?.battery ?? null };
       }),
       seen: this.st.seen.slice(0, 5),
+      missed: this.st.missed,
       daysLeft: b ? this.daysLeft(now) : null,
       topUpDays: this.cfg.update.topUpDays,
     };

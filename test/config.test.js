@@ -69,3 +69,13 @@ test('device mode sends the toned photo at panel size, without palette quantisat
   assert.ok(colours.size > 50, `expected a full-colour image, got ${colours.size} colours`);
   assert.equal(out.inkShare, null);
 });
+
+test('CLEANING_TIME stands in for the panel cleaning time; MISSED_CHECK_SEC says how often to look for a display that missed a change', () => {
+  const unset = withEnv({ CLEANING_TIME: null, MISSED_CHECK_SEC: null }, loadConfig);
+  assert.equal(unset.display.cleaningTime, null);
+  assert.equal(unset.sleep.missedCheckSec, 60);
+  assert.deepEqual(withEnv({ CLEANING_TIME: '5:50' }, loadConfig).display.cleaningTime, { hour: 5, minute: 50 });
+  assert.throws(() => withEnv({ CLEANING_TIME: '25:00' }, loadConfig), /CLEANING_TIME/);
+  assert.throws(() => withEnv({ CLEANING_TIME: 'noon' }, loadConfig), /CLEANING_TIME/);
+  assert.equal(withEnv({ MISSED_CHECK_SEC: '0' }, loadConfig).sleep.missedCheckSec, 0);
+});

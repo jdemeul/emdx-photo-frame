@@ -235,7 +235,7 @@ test('playlist mode: plan, send when found awake, the display moves on by itself
     const server = createServer(cfg, app);
     app.server = server;
     await server.listen();
-    cleanups.push(async () => { app.cancelSleep(); await server.close(); await emdx.close(); });
+    cleanups.push(async () => { app.stopMissedWatch(); app.cancelSleep(); await server.close(); await emdx.close(); });
     const clock = app.daily.clock;
     const pl = () => app.state.playlist;
     const device = (dir) => fs.readFileSync(path.join(dataDir, 'playlist', dir, 'device.png'));
@@ -303,7 +303,12 @@ test('playlist mode: plan, send when found awake, the display moves on by itself
     assert.equal(pl().changes[0].online, null);
     assert.equal(pl().slots.length, 4);
     assert.ok(fs.existsSync(path.join(dataDir, 'playlist', b1.items[0].dir)), 'files of the playlist on the display are kept');
-    assert.equal(app.daily.due(), 'only 2 days of photos left on the display'); // fewer than PLAYLIST_TOPUP_DAYS (here 3)
+    // It didn't come online after the change, so the NAS counts it as missed: a fresh playlist is
+    // due for that alone (and it would be anyway: fewer than PLAYLIST_TOPUP_DAYS, here 3, left).
+    assert.match(app.daily.due(), /^the display missed the change of /);
+    app.stopMissedWatch(); // (this test looks for the display itself)
+    pl().missed = null;
+    assert.equal(app.daily.due(), 'only 2 days of photos left on the display');
 
     // Someone presses its button: the NAS asks what it shows (the right photo), then tops it up,
     // starting with the photo it shows now.
@@ -403,7 +408,7 @@ test('playlist mode: the display comes online after each change; the NAS reads t
     const server = createServer(cfg, app);
     app.server = server;
     await server.listen();
-    cleanups.push(async () => { app.cancelSleep(); await server.close(); await emdx.close(); });
+    cleanups.push(async () => { app.stopMissedWatch(); app.cancelSleep(); await server.close(); await emdx.close(); });
     const clock = app.daily.clock;
     const pl = () => app.state.playlist;
     const asks = () => emdx.events.filter((e) => e.startsWith('cmd:c7/54')).length;
@@ -544,7 +549,7 @@ test('deep sleep mode: a display that stays on the Wi-Fi while asleep is put int
     const server = createServer(cfg, app);
     app.server = server;
     await server.listen();
-    cleanups.push(async () => { app.cancelSleep(); await server.close(); await emdx.close(); });
+    cleanups.push(async () => { app.stopMissedWatch(); app.cancelSleep(); await server.close(); await emdx.close(); });
     // (A display off the Wi-Fi makes a connection attempt fail with "host unreachable", which
     // can't be had on this machine: the fake's offNetwork stands in for it.)
     const look = app.look.bind(app);
@@ -603,4 +608,137 @@ test('deep sleep mode: a display that stays on the Wi-Fi while asleep is put int
   } finally {
     for (const k of ['PHOTO_DIR', 'UPDATE_MODE', 'PLAYLIST_DAYS', 'SCHEDULE', 'PANEL_WIDTH', 'PANEL_HEIGHT', 'SLEEP_CHECK_MIN']) delete process.env[k];
   }
+});
+
+test('a missed change: the NAS looks for the display every few seconds and sends a fresh playlist as soon as it is back; it keeps its hands off around the panel cleaning, whose time it reads from the display', { skip: !hasOpenssl && 'openssl not available', timeout: 180000 }, async () => {
+  const { startFakeEmdx } = await import('./helpers/fakeEmdx.js');
+  const emdx = await startFakeEmdx({ pin: '646464', thumbnails: false });
+  emdx.state.sleepsAfterUpdateMs = 300;
+  emdx.state.deepAfterUpdate = true;
+  // The fake cleans its panel 12 hours from now (Brussels time), well away from this test.
+  const local = (t) => new Intl.DateTimeFormat('en-GB', { timeZone: TZ, hour: 'numeric', minute: 'numeric', hourCycle: 'h23' }).formatToParts(new Date(t));
+  const hhmm = (t) => { const p = local(t); return [Number(p.find((x) => x.type === 'hour').value), Number(p.find((x) => x.type === 'minute').value)]; };
+  emdx.state.cleaning = hhmm(Date.now() + 12 * H);
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'frame-missed-'));
+  const photoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'frame-missed-photos-'));
+  for (let i = 0; i < 8; i++) fs.writeFileSync(path.join(photoDir, `p${i}.jpg`), await sharp(photoSvg(i)).jpeg({ quality: 85 }).toBuffer());
+  Object.assign(process.env, {
+    DATA_DIR: dataDir, ALBUM_URLS: '', PHOTO_DIR: photoDir, EMDX_HOST: '127.0.0.1', EMDX_PORT: String(emdx.port), EMDX_PIN: '646464',
+    SERVER_HOST: '127.0.0.1', HTTP_PORT: '18464', PANEL_WIDTH: '640', PANEL_HEIGHT: '360', ORIENTATION: 'portrait',
+    FETCH_TIMEOUT_SEC: '20', CONNECT_ATTEMPTS: '2', EMDX_MAC: emdx.mac, WOL_BROADCAST: '127.0.0.1', WOL_PORT: String(emdx.wolPort),
+    WAKE_WAIT_SEC: '0.1', SLEEP_MODE: 'deep', SLEEP_DELAY_SEC: '1', SLEEP_CHECK_MIN: '0', WAKE_WINDOW_MIN: '0.02', MISSED_CHECK_SEC: '0.3',
+    UPDATE_MODE: 'playlist', PLAYLIST_DAYS: '3', SCHEDULE: '0 6 * * *', TZ,
+  });
+  try {
+    const { loadConfig, DEVICE_PALETTE } = await import('../src/config.js');
+    const { Store } = await import('../src/state.js');
+    const { buildPaletteModel } = await import('../src/color.js');
+    const { FrameApp } = await import('../src/app.js');
+    const { createServer } = await import('../src/server.js');
+    const cfg = loadConfig();
+    Object.assign(cfg.update, { minFirstSec: 1, minTailSec: 0.2, watchEverySec: 0.2, quietSec: 0.5 });
+    Object.assign(cfg.sleep, { confirmSec: 2, confirmEverySec: 0.2, ownSleepSec: 0 });
+    Object.assign(cfg.display, { sleepWindowSec: 1, awakeWindowSec: 1, probeTimeoutSec: 0.3 });
+    const app = new FrameApp(cfg, new Store(dataDir), buildPaletteModel(cfg.image.measuredPalette, DEVICE_PALETTE));
+    const server = createServer(cfg, app);
+    app.server = server;
+    await server.listen();
+    cleanups.push(async () => { app.stopMissedWatch(); app.cancelSleep(); await server.close(); await emdx.close(); });
+    const look = app.look.bind(app);
+    app.look = (opts) => (!emdx.state.awake && emdx.state.offNetwork ? Promise.resolve({ awake: false, battery: null, network: 'off' }) : look(opts));
+    const pl = () => app.state.playlist;
+
+    // The first playlist goes out when the display is found awake; the NAS reads the cleaning
+    // time on the way.
+    await app.daily.startup();
+    assert.equal(await app.checkAsleep(), true);
+    await until(() => emdx.received.length === 1 && !emdx.state.awake);
+    assert.deepEqual([app.state.cleaning.hour, app.state.cleaning.minute], emdx.state.cleaning);
+    assert.equal(app.cleaning().source, 'display');
+    assert.equal(app.nearCleaning(), false);
+    const shown = await (await fetch('http://127.0.0.1:18464/api/status')).json();
+    assert.equal(shown.cleaning.time, emdx.state.cleaning.map((x) => String(x).padStart(2, '0')).join(':'));
+    assert.equal(pl().due, undefined); // (status() has it; the state doesn't)
+    assert.equal(app.daily.due(), null);
+
+    // A change it sleeps through: it doesn't come online. The NAS notes the miss, a fresh
+    // playlist is due, and it looks for the display every MISSED_CHECK_SEC; while the display
+    // is off the Wi-Fi, nothing else happens (no Wake-on-LAN, no light-sleep strikes).
+    const wols = () => emdx.events.filter((e) => e.startsWith('wol')).length;
+    const w0 = wols();
+    await app.daily.watchAfterChange();
+    assert.equal(pl().changes[0].online, null);
+    assert.ok(app.daily.missedOpen());
+    assert.match(app.daily.due(), /missed the change/);
+    assert.ok(app.missedTimer);
+    await sleepMs(1200);
+    assert.deepEqual([emdx.received.length, wols(), app.state.lightSleep ?? null], [1, w0, null]);
+
+    // Missed again the next morning: still one open miss, counted.
+    await app.daily.watchAfterChange();
+    assert.equal(pl().missed.count, 2);
+
+    // Someone presses its power button: within a look or two the playlist goes out.
+    emdx.wake();
+    await until(() => emdx.received.length === 2);
+    await until(() => !app.missedTimer && !app.busy);
+    assert.ok(pl().missed.resolvedAt);
+    assert.match(pl().missed.how, /after a missed change/);
+    assert.deepEqual([app.state.wakeEvents[0].afterMiss, app.state.wakeEvents[0].sent], [true, 'playlist']);
+    assert.equal(app.daily.due(), null);
+    const after = await (await fetch('http://127.0.0.1:18464/api/status')).json();
+    assert.ok(after.playlist.missed.resolvedAt);
+    assert.equal(after.check, null); // (SLEEP_CHECK_MIN=0)
+
+    // A miss followed by a change it does come online for: the playlist goes out then.
+    await until(() => !emdx.state.awake);
+    await app.daily.watchAfterChange();
+    assert.ok(app.daily.missedOpen());
+    app.stopMissedWatch(); // (so that the after-change look finds it, not the missed watch)
+    emdx.state.offNetwork = false;
+    emdx.wake();
+    await app.daily.watchAfterChange();
+    assert.ok(pl().changes[0].online);
+    await until(() => emdx.received.length === 3); // (the fake notes it once its downloads are done)
+    assert.match(pl().missed.how, /after a change/);
+    await until(() => !emdx.state.awake && !app.busy);
+
+    // Around the panel cleaning the NAS keeps its hands off: no sleep checks, no missed-change
+    // looks, and no fixing of a light sleep within the hour before it.
+    const nowHm = hhmm(Date.now());
+    app.noteCleaning({ hour: nowHm[0], minute: nowHm[1] });
+    assert.equal(app.nearCleaning(), true);
+    emdx.wake();
+    const conns = emdx.events.filter((e) => e === 'auth').length;
+    assert.equal(await app.checkAsleep(), null);
+    app.daily.noteMissed({ key: 'test', at: Date.now() });
+    assert.equal(await app.checkMissed(), null);
+    assert.equal(emdx.events.filter((e) => e === 'auth').length, conns);
+    const soon = hhmm(Date.now() + 40 * 60000);
+    app.noteCleaning({ hour: soon[0], minute: soon[1] });
+    assert.deepEqual([app.nearCleaning(), app.cleaningSoon()], [false, true]);
+    // A display that doesn't say: CLEANING_TIME stands in.
+    app.noteCleaning({ error: 'NAK' });
+    assert.equal(app.cleaning(), null);
+    cfg.display.cleaningTime = { hour: nowHm[0], minute: nowHm[1] };
+    assert.deepEqual([app.cleaning().source, app.nearCleaning()], ['setting', true]);
+    const st2 = await (await fetch('http://127.0.0.1:18464/api/status')).json();
+    assert.deepEqual([st2.cleaning.source, st2.cleaning.error], ['setting', 'NAK']);
+    app.stopMissedWatch();
+  } finally {
+    for (const k of ['PHOTO_DIR', 'UPDATE_MODE', 'PLAYLIST_DAYS', 'SCHEDULE', 'PANEL_WIDTH', 'PANEL_HEIGHT', 'SLEEP_CHECK_MIN', 'WAKE_WINDOW_MIN', 'MISSED_CHECK_SEC']) delete process.env[k];
+  }
+});
+
+test('a quick look at the display doesn\'t make a button on the page fail as busy: it waits for the look', async () => {
+  const { FrameApp } = await import('../src/app.js');
+  const app = Object.create(FrameApp.prototype);
+  Object.assign(app, { busy: null, store: { state: {}, save() {} } });
+  const look = app.exclusive('Checking that the display is asleep', () => sleepMs(300).then(() => 'looked'), { probe: true });
+  const action = app.exclusive('Sending the playlist', async () => 'sent');
+  assert.deepEqual(await Promise.all([look, action]), ['looked', 'sent']);
+  // Anything else still makes it fail as busy.
+  const long = app.exclusive('Sending the playlist', () => sleepMs(200));
+  await assert.rejects(app.exclusive('Test pattern', async () => {}), /Busy/);
+  await long;
 });

@@ -10,7 +10,8 @@
 // EM32DX does briefly. On 0xC7/0x54 + URL it POSTs a thumbnail (the image it shows) to that URL;
 // with `thumbnails` false it takes the request and sends nothing, like the EM32DX. It keeps
 // Sleep After (0xC6/0x81) and "apply sleep mode after content update" (0xC7/0x53 type 0x01).
-// `state.battery` changes the battery level.
+// `state.battery` changes the battery level; `state.cleaning` [hour, minute] is its daily panel
+// cleaning time (0x1B/0xB0; null: it refuses the read).
 import dgram from 'node:dgram';
 import net from 'node:net';
 import tls from 'node:tls';
@@ -47,7 +48,7 @@ export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage =
   const state = {
     awake: true, networkStandby: true, hearsWol: true, ignoresPowerOff: 0, pluggedIn: false,
     sleepAfter: [0x07], applySleep: false, playing: null, thumbnailsPosted: 0, wakeOnChangeMs: 0, sleepsAfterUpdateMs: 0,
-    lightSleep: false, offNetwork: false, deepAfterUpdate: false,
+    lightSleep: false, offNetwork: false, deepAfterUpdate: false, cleaning: [2, 0],
   };
   const held = new Set();
   let updateTimer = null;
@@ -121,6 +122,11 @@ export async function startFakeEmdx({ pin = '123456', battery = 87, fetchImage =
         reply(sock, id, cmd, [0x54]);
         if (thumbnails) setTimeout(() => postThumbnail(url), 20);
         return;
+      }
+      if (cmd === 0x1b && payload[0] === 0xb0) {
+        if (!state.cleaning) return reply(sock, id, cmd, [0xb0], false);
+        const d = new Date(Date.now() + 86400000);
+        return reply(sock, id, cmd, [0xb0, 0x81, 0x04, ...state.cleaning, d.getDate(), d.getMonth() + 1]);
       }
       if (cmd === 0x1b) return reply(sock, id, cmd, [0x73, 0x00, 0x01, 0x00, state.battery ?? battery, 0x00, state.pluggedIn ? 0x02 : 0x00]);
       if (cmd === 0xb5 && !len) return reply(sock, id, cmd, [state.networkStandby ? 0x01 : 0x00]);

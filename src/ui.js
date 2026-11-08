@@ -172,9 +172,11 @@ function watchHtml(c) {
   if (!c) return '–';
   let h = esc('every ' + c.everyMin + ' min');
   if (c.last) h += ' · last ' + esc(fmt(c.last.at)) + ': ' + (c.last.awake ? 'awake' : 'asleep');
+  if (c.missedEverySec) h += '<br>' + esc('Looking for the display every ' + (c.missedEverySec >= 60 ? Math.round(c.missedEverySec / 60) + ' min' : c.missedEverySec + ' s') + ' (it missed a change)');
   const ev = (c.wakeEvents || []).filter((e) => !e.afterChange);
   if (ev.length) {
     h += '<br><span class="muted">Found awake:</span> ' + ev.slice(0, 4).map((e) => esc(fmt(e.at)
+      + (e.afterMiss ? ' after a missed change' : '')
       + (e.battery != null ? ' (' + e.battery + '%' + (e.charging ? ', charging' : '') + ')' : '')
       + (e.sent === 'playlist' ? ', sent the playlist' : e.sent ? ', sent the waiting photo' : e.putBack ? ', put back to sleep' : e.leftAlone ? ', left to go back to sleep by itself' : e.error ? ', ' + e.error : ''))).join('; ');
   }
@@ -185,7 +187,16 @@ function checkText(s) {
   if (!c) return '–';
   return esc(fmt(c.at) + ' · ' + c.name + ', firmware ' + c.software + ' · Network Standby ' + c.networkStandby
     + (c.sleepAfter ? ' · Sleep After ' + c.sleepAfter : '') + (c.applySleep ? ' · sleep after content update ' + c.applySleep : '')
-    + (c.lowPowerWifi ? ' · low-power Wi-Fi module ' + c.lowPowerWifi : '') + (s.thumbnails === false ? ' · sends no thumbnails' : ''));
+    + (c.lowPowerWifi ? ' · low-power Wi-Fi module ' + c.lowPowerWifi : '')
+    + (c.cleaning && c.cleaning.hour != null ? ' · panel cleaning ' + String(c.cleaning.hour).padStart(2, '0') + ':' + String(c.cleaning.minute).padStart(2, '0') : '')
+    + (s.thumbnails === false ? ' · sends no thumbnails' : ''));
+}
+// The display's daily panel cleaning, and the hands-off window the NAS keeps around it.
+function cleaningHtml(cl) {
+  if (!cl) return '<span class="muted">not known yet: the NAS reads it from the display the next time it talks to it</span>';
+  if (!cl.time) return '<span class="muted">' + esc('unknown: the display did not say (' + cl.error + '). Set CLEANING_TIME (e.g. 05:50) to the time in the Samsung app.') + '</span>';
+  return esc('daily at ' + cl.time + (cl.source === 'setting' ? ' (CLEANING_TIME)' : ' (read from the display ' + fmt(cl.readAt) + ')')
+    + ' · the NAS leaves the display alone from ' + hm(cl.quietFrom) + ' to ' + hm(cl.quietUntil));
 }
 function playlistHtml(pl) {
   let h = pl.batch
@@ -200,7 +211,9 @@ function changesHtml(pl) {
     const bat = c.battery != null ? ', battery ' + c.battery + '%' : '';
     if (c.online) return esc(fmt(c.at) + ': online ' + Math.round((c.online - c.at) / 1000) + ' s after the change' + bat);
     if (c.until > Date.now()) return esc(fmt(c.at) + ': looking for the display until ' + hm(c.until) + '…');
-    if (c === pl.changes[0]) return '<span class="err">' + esc(fmt(c.at) + ': the display did not come online, so it may not have changed the photo (empty battery? stuck?). Press its power button; if the frame doesn’t show today’s photo then, press Send playlist.') + '</span>';
+    const m = pl.missed && pl.missed.key === c.key ? pl.missed : null;
+    if (m && m.resolvedAt) return esc(fmt(c.at) + ': the display did not come online; back ' + fmt(m.resolvedAt) + ' (' + m.how + ')');
+    if (c === pl.changes[0]) return '<span class="err">' + esc(fmt(c.at) + ': the display did not come online, so it probably didn’t change the photo (asleep through it? stuck in its panel cleaning?). Press its power button: the NAS looks for it every minute and sends it a fresh playlist by itself.') + '</span>';
     return esc(fmt(c.at) + ': the display did not come online');
   });
   return rows.length ? rows.join('<br>') : '–';
@@ -217,7 +230,8 @@ function render(s) {
   last = s;
   $('#state').textContent = s.busy ? s.busy.what + '…' : 'idle';
   $('#state').className = 'chip' + (s.busy ? ' busy' : '');
-  document.querySelectorAll('.actions button').forEach((b) => b.disabled = !!s.busy);
+  // (A quick look at the display doesn't block the buttons: they wait for it.)
+  document.querySelectorAll('.actions button').forEach((b) => b.disabled = !!s.busy && !s.busy.probe);
   const pl = s.playlist;
   $('[data-act="next"]').textContent = pl ? 'New photo for today' : 'Next photo now';
   $('[data-act="next"]').title = pl ? 'Replaces the photo for now and sends the playlist again' : '';
@@ -246,6 +260,7 @@ function render(s) {
     ['Battery', batteryHtml(s)],
     ['Display', sleepHtml(s) + lightSleepHtml(s.lightSleep) + deepSleepHtml(s.deepSleep)],
     ['Sleep checks', watchHtml(s.check)],
+    ...(s.cleaning !== undefined && s.sleep ? [['Panel cleaning', cleaningHtml(s.cleaning)]] : []),
     ['Display check', checkText(s)],
     ['This round', s.cycle ? esc(s.cycle.shown + ' of ' + s.cycle.total + ' photos ' + (pl ? 'shown or planned' : 'shown') + ' (round ' + s.cycle.n + ')') : '–'],
     ['Album', s.library ? esc(s.library.titles.join(', ') + ' · ' + s.library.count + ' photos · read ' ) + fmt(s.library.fetchedAt) : '–'],

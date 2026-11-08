@@ -133,6 +133,12 @@ export function loadConfig() {
   //              display's own playlist, and the display changes the photo itself, also in
   //              deep sleep. It comes online briefly after each change, and the NAS sends a
   //              fresh playlist then when fewer than PLAYLIST_TOPUP_DAYS days are left.
+  // The time of the display's daily panel cleaning, for when it can't be read from the display.
+  const cleaningRaw = str('CLEANING_TIME');
+  const cm = cleaningRaw ? /^(\d{1,2}):(\d{2})$/.exec(cleaningRaw) : null;
+  if (cleaningRaw && !(cm && Number(cm[1]) < 24 && Number(cm[2]) < 60)) throw new Error(`CLEANING_TIME must be a time like 05:50 (got "${cleaningRaw}")`);
+  const cleaningTime = cm ? { hour: Number(cm[1]), minute: Number(cm[2]) } : null;
+
   const updateMode = oneOf('UPDATE_MODE', 'push', ['push', 'playlist']);
   const playlistDays = num('PLAYLIST_DAYS', 7);
   if (!Number.isInteger(playlistDays) || playlistDays < 1 || playlistDays > 60) {
@@ -165,6 +171,9 @@ export function loadConfig() {
       awakeWindowSec: 30,
       // How long the NAS keeps trying to reach the display to send it to sleep.
       sleepWindowSec: 60,
+      // The daily panel cleaning ("screen protection" in the Samsung app). The NAS reads its time
+      // from the display; CLEANING_TIME (hh:mm) stands in when the display doesn't say.
+      cleaningTime,
     },
 
     server: {
@@ -190,6 +199,9 @@ export function loadConfig() {
       // The sleep check leaves the display alone this long before and after each change: it
       // wakes up by itself then (to change the photo, maybe for its daily screen refresh).
       quietSec: 15 * 60,
+      // ... and from this long before its daily panel cleaning until this long after it starts
+      // (how long the cleaning takes is unknown; the router once saw the display online for 5 min).
+      cleaningQuietSec: [15 * 60, 30 * 60],
       thumbTimeoutSec: 10, // when the NAS asks the display what it shows
     },
     runOnStart: bool('RUN_ON_START', false),
@@ -219,6 +231,11 @@ export function loadConfig() {
       lightSleepChecks: 2,
       // Playlist mode: how long the NAS looks for the display after each change.
       wakeWindowMin: num('WAKE_WINDOW_MIN', 15),
+      // Playlist mode: after a change the display missed (it didn't come online), look for it
+      // this often (s; no Wake-on-LAN), to send it a fresh playlist as soon as it is back, e.g.
+      // after a press on its power button (it then stays awake for its Sleep After, 10 min).
+      // 0 = only at the regular sleep checks.
+      missedCheckSec: num('MISSED_CHECK_SEC', 60),
       confirmSec: 150, // after a sleep command, how long to wait for it to stop answering
       confirmEverySec: 15,
     },

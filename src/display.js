@@ -5,7 +5,8 @@
 // and 0xB5 (network standby, the Wi-Fi listener that Wake-on-LAN needs). The other commands here
 // come from Samsung's Android app (decompiled): 0xC7/0x53 type 0x01 "apply sleep mode after
 // content update", 0xC7/0x54 a thumbnail of the screen, 0xC6/0x81 "Sleep After", 0xCB optional
-// features. What the EM32DX does with them: docs/findings.md.
+// features, 0x1B/0xB0 the time of the daily panel cleaning ("screen protection"). What the
+// EM32DX does with them: docs/findings.md.
 import dgram from 'node:dgram';
 import { Device } from '@weejewel/samsung-mdc';
 import { log } from './log.js';
@@ -17,6 +18,7 @@ const CMD_NETWORK_STANDBY = 0xb5;
 const CMD_CONTENT = 0xc7; // sub 0x53: content download (type 0x80) / apply sleep after update (type 0x01); 0x54: thumbnail
 const CMD_SLEEP_AFTER = 0xc6; // sub 0x81
 const CMD_FEATURES = 0xcb;
+const CMD_PANEL = 0x1b; // sub 0x73: battery (the library reads it); 0xB0: panel cleaning time
 
 // "Sleep After" codes, as the Samsung app sets them (0xF0 = custom, followed by 2 bytes).
 const SLEEP_AFTER_TEXT = { 0x00: 'off', 0x06: '5 min', 0x07: '10 min', 0x08: '20 min', 0x09: '30 min', 0x0a: '60 min' };
@@ -147,7 +149,8 @@ export async function probeDisplay(cfg) {
 // The same, and with `battery`, read the battery while connected. Returns { awake, battery,
 // network }: for a display that doesn't answer, whether it is still on the network (see
 // networkState()).
-export async function lookForDisplay(cfg, { battery: readBattery = false } = {}) {
+// With `cleaning`, also read the time of its daily panel cleaning (see readCleaning()).
+export async function lookForDisplay(cfg, { battery: readBattery = false, cleaning: readCleaningTime = false } = {}) {
   const d = cfg.display;
   const device = new Device({ host: d.host, port: d.port, pin: d.pin });
   try {
@@ -165,11 +168,46 @@ export async function lookForDisplay(cfg, { battery: readBattery = false } = {})
         log.debug(`No battery info: ${err.message}`);
       }
     }
-    return { awake: true, battery };
+    let cleaning;
+    if (readCleaningTime) {
+      if (readBattery) await sleep(300); // (it drops answers to commands in quick succession)
+      cleaning = await readCleaning(device);
+    }
+    return { awake: true, battery, ...(readCleaningTime ? { cleaning } : {}) };
   } finally {
     await close(device);
   }
 }
+
+// The daily panel cleaning (the Samsung app's "screen protection" time: the panel cycles through
+// its colours to clear ghosting). The app sets it with 0x1B/0xB0 0x80 0x02 hh mm and reads it back
+// as 0x81 len hh mm day month (the next run). Returns { hour, minute, day, month } (day and month
+// when the display says), or { error } when it doesn't answer or the answer makes no sense.
+export async function readCleaning(device) {
+  try {
+    const r = await cmd(device, CMD_PANEL, [0xb0], 'Reading the panel cleaning time');
+    const c = parseCleaning(r);
+    return c || { error: `unexpected answer [${hex(r)}]` };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+// The answer to a 0x1B/0xB0 read (with or without the sub-command in front, and with or
+// without the 0x81 len header), or null.
+export function parseCleaning(bytes) {
+  let b = [...(bytes || [])];
+  if (b[0] === 0xb0) b = b.slice(1);
+  if (b[0] === 0x81 && b.length >= 4 && b[1] >= 2 && b[1] <= b.length - 2) b = b.slice(2, 2 + b[1]);
+  const [hour, minute, day, month] = b;
+  if (!(hour < 24 && minute < 60)) return null;
+  const c = { hour, minute };
+  if (day >= 1 && day <= 31 && month >= 1 && month <= 12) Object.assign(c, { day, month });
+  return c;
+}
+
+// "hh:mm" for a cleaning time (from the display or CLEANING_TIME).
+export const cleaningText = (c) => `${String(c.hour).padStart(2, '0')}:${String(c.minute).padStart(2, '0')}`;
 
 // Why a connection failed tells whether a sleeping display is still on the network: no answer
 // at all (EHOSTUNREACH: nothing answers its address) means its Wi-Fi is off, as in deep sleep;
@@ -385,6 +423,7 @@ export async function readDisplayInfo(cfg, { thumbnailUrl = null } = {}) {
       }],
       // Bit 0 of the second byte: a low-power (2.4 GHz) Wi-Fi module for remote wake-up (EMDX-A).
       ['lowPowerWifi', async () => { const r = await cmd(device, CMD_FEATURES, [], 'Reading features'); return r.length > 1 ? ((r[1] & 1) ? 'yes' : 'no') : `unknown [${hex(r)}]`; }],
+      ['cleaning', () => readCleaning(device)],
       ...(thumbnailUrl ? [['thumbnail', async () => { await requestThumbnail(device, thumbnailUrl); return 'asked'; }]] : []),
     ]) {
       try {
