@@ -49,3 +49,20 @@ export class Store {
     return path.join(this.dir, ...parts);
   }
 }
+
+// Going from one frame to several (FRAMES): the state the single frame kept in DATA_DIR becomes
+// the first frame's, in DATA_DIR/frames/<id>, so it keeps its round of the album, its plan and
+// its history. Once: only while the first frame has no state of its own.
+export function adoptLegacyData(baseDir, frameDir) {
+  const legacy = path.join(baseDir, 'state.json');
+  if (!fs.existsSync(legacy) || fs.existsSync(path.join(frameDir, 'state.json'))) return false;
+  fs.mkdirSync(frameDir, { recursive: true });
+  for (const name of ['state.json', 'state.json.bak', 'current', 'playlist', 'testpattern']) {
+    const from = path.join(baseDir, name);
+    if (!fs.existsSync(from)) continue;
+    fs.rmSync(path.join(frameDir, name), { recursive: true, force: true });
+    fs.renameSync(from, path.join(frameDir, name));
+  }
+  log.info(`Moved the state of the single frame from ${baseDir} to ${frameDir}: it is the first frame in FRAMES now.`);
+  return true;
+}

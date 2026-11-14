@@ -15,6 +15,13 @@ export const UI_HTML = `<!doctype html>
   h1 { font-size:22px; margin:0; font-weight:650; }
   .chip { font-size:13px; padding:2px 10px; border-radius:99px; border:1px solid var(--line); color:var(--muted); }
   .chip.busy { color:var(--accent); border-color:var(--accent); }
+  nav { display:flex; gap:6px; flex-wrap:wrap; margin-left:auto; }
+  nav a { font-size:14px; padding:4px 12px; border-radius:99px; border:1px solid var(--line); color:var(--ink); text-decoration:none; }
+  nav a.on { border-color:var(--accent); color:var(--accent); font-weight:600; }
+  nav a i, #health i { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:7px; background:var(--accent); }
+  nav a i.warn, #health.warn i { background:#c98a1b; } nav a i.bad, #health.bad i { background:var(--warn); }
+  #health { grid-column:1/-1; background:var(--card); border:1px solid var(--line); border-radius:12px; padding:10px 14px; }
+  #health.bad { border-color:var(--warn); color:var(--warn); font-weight:600; }
   .frame { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; }
   .frame img { width:100%; height:auto; display:block; border-radius:4px; background:#ccc; }
   .tabs { display:flex; gap:6px; margin-bottom:10px; flex-wrap:wrap; }
@@ -42,7 +49,8 @@ export const UI_HTML = `<!doctype html>
 </head>
 <body>
 <main>
-  <header><h1>Photo frame</h1><span id="state" class="chip">…</span></header>
+  <header><h1 id="title">Photo frame</h1><span id="state" class="chip">…</span><nav id="frames" hidden></nav></header>
+  <div id="health" hidden></div>
   <section class="frame">
     <div class="tabs">
       <button data-view="preview" class="on">Preview</button>
@@ -69,6 +77,9 @@ export const UI_HTML = `<!doctype html>
 </main>
 <script>
 let view = 'preview', last = null;
+// Several frames: ?frame=<id> says which one this page is about (default: the first).
+const frame = new URLSearchParams(location.search).get('frame');
+const u = (path) => frame ? path + (path.includes('?') ? '&' : '?') + 'frame=' + encodeURIComponent(frame) : path;
 const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
 const fmt = (t) => t ? new Date(t).toLocaleString([], { dateStyle:'medium', timeStyle:'short' }) : '–';
@@ -78,24 +89,24 @@ function renderView(s) {
   const v = Date.now();
   let html = '', note = '';
   if (view === 'preview') {
-    if (s.current) { html = '<a href="/img/current/preview.png?' + v + '" target="_blank"><img src="/img/current/preview.jpg?' + s.current.renderedAt + '" alt="preview"></a>';
+    if (s.current) { html = '<a href="' + u('/img/current/preview.png?' + v) + '" target="_blank"><img src="' + u('/img/current/preview.jpg?' + s.current.renderedAt) + '" alt="preview"></a>';
       note = s.dither === 'device'
         ? 'The photo as sent. The display dithers it itself, so on the panel the colours look softer. Click for full size.'
         : 'Simulated with the measured ink colours as your eye sees them, from a distance. Click for the full-size dither.'; }
     else html = '<p class="muted">Nothing rendered yet.</p>';
   } else if (view === 'sources') {
-    if (s.current) html = '<div id="sources">' + s.current.items.map((it, i) => '<img src="/img/current/source-' + (i+1) + '.jpg?' + s.current.renderedAt + '" alt="">').join('') + '</div>';
+    if (s.current) html = '<div id="sources">' + s.current.items.map((it, i) => '<img src="' + u('/img/current/source-' + (i+1) + '.jpg?' + s.current.renderedAt) + '" alt="">').join('') + '</div>';
   } else if (view === 'playlist') {
     const pl = s.playlist;
     if (!pl || !pl.slots.length) html = '<p class="muted">Preparing the photos…</p>';
     else {
-      html = '<div class="slots">' + pl.slots.map((x) => '<figure class="' + (x.now ? 'now' : '') + '"><a href="/img/playlist/' + x.dir + '/preview.png" target="_blank">'
-        + '<img loading="lazy" src="/img/playlist/' + x.dir + '/thumb.jpg" data-fallback="/img/playlist/' + x.dir + '/preview.jpg" onerror="this.onerror=null;this.src=this.dataset.fallback" alt=""></a><figcaption>' + esc(x.label) + (x.now ? ' · now' : '')
+      html = '<div class="slots">' + pl.slots.map((x) => '<figure class="' + (x.now ? 'now' : '') + '"><a href="' + u('/img/playlist/' + x.dir + '/preview.png') + '" target="_blank">'
+        + '<img loading="lazy" src="' + u('/img/playlist/' + x.dir + '/thumb.jpg') + '" data-fallback="' + u('/img/playlist/' + x.dir + '/preview.jpg') + '" onerror="this.onerror=null;this.src=this.dataset.fallback" alt=""></a><figcaption>' + esc(x.label) + (x.now ? ' · now' : '')
         + (x.sent ? '' : ' · not sent yet') + '</figcaption></figure>').join('') + '</div>';
       note = 'One photo per change, from the one for now. The display changes to the next one by itself; the outlined one should be on the frame now. Click for full size.';
     }
   } else {
-    html = s.testPattern ? '<img src="/img/testpattern/preview.png?' + s.testPattern.at + '" alt="test pattern">' : '<p class="muted">Press “Show test pattern” to send one.</p>';
+    html = s.testPattern ? '<img src="' + u('/img/testpattern/preview.png?' + s.testPattern.at) + '" alt="test pattern">' : '<p class="muted">Press “Show test pattern” to send one.</p>';
     note = 'Use it once to check orientation (TOP at the top), colours and whether the display re-processes the image.';
   }
   $('#view').innerHTML = html; $('#viewnote').textContent = note;
@@ -199,7 +210,8 @@ function cleaningHtml(cl) {
 }
 function playlistHtml(pl) {
   let h = pl.batch
-    ? esc(pl.batch.photos + ' photos sent ' + fmt(pl.batch.sentAt) + ', until ' + fmt(pl.batch.endsAt) + ' (' + pl.daysLeft + ' to come; a fresh one when fewer than ' + pl.topUpDays + ' are left)')
+    ? esc(pl.batch.photos + ' photos sent ' + fmt(pl.batch.sentAt) + ', until ' + fmt(pl.batch.endsAt) + ' (' + pl.daysLeft + ' to come; a fresh one '
+      + (pl.resend === 'every-change' ? 'after every change' : 'when fewer than ' + pl.topUpDays + ' are left') + ')')
       + (pl.batch.ranOut ? ' · <span class="err">used up: the display repeats it until it gets a fresh one</span>' : '')
     : '<span class="err">not on the display yet</span>';
   if (pl.due) h += '<br><span class="muted">' + esc('Fresh playlist due (' + pl.due + '). It goes out when the display is next online (after its next change, or press its power button).') + '</span>';
@@ -216,10 +228,20 @@ function changesHtml(pl) {
     if (c === pl.changes[0]) return '<span class="err">' + esc(fmt(c.at) + ': the display did not come online, so it probably didn’t change the photo (asleep through it? stuck in its panel cleaning?). Press its power button: the NAS looks for it every minute and sends it a fresh playlist by itself.') + '</span>';
     return esc(fmt(c.at) + ': the display did not come online');
   });
+  const st = pl.changeStats;
+  if (st && st.watched > 1) rows.push('<span class="muted">' + esc('The display came online after ' + st.online + ' of the last ' + st.watched + ' changes.') + '</span>');
   return rows.length ? rows.join('<br>') : '–';
 }
 function render(s) {
   last = s;
+  const name = s.frame && s.frame.name || 'Photo frame';
+  $('#title').textContent = name; document.title = name;
+  const fr = s.frames || [];
+  $('#frames').hidden = fr.length < 2;
+  $('#frames').innerHTML = fr.map((f) => '<a href="?frame=' + encodeURIComponent(f.id) + '" class="' + (s.frame && f.id === s.frame.id ? 'on' : '') + '" title="' + esc(f.health ? f.health.text : '') + '"><i class="' + esc(f.health ? f.health.level : '') + '"></i>' + esc(f.name) + '</a>').join('');
+  const hl = s.health;
+  $('#health').hidden = !hl;
+  if (hl) { $('#health').className = hl.level; $('#health').innerHTML = '<i></i>' + esc(hl.text); }
   $('#state').textContent = s.busy ? s.busy.what + '…' : 'idle';
   $('#state').className = 'chip' + (s.busy ? ' busy' : '');
   // (A quick look at the display doesn't block the buttons: they wait for it.)
@@ -265,13 +287,13 @@ function render(s) {
     ['Album', s.library ? esc(s.library.titles.join(', ') + ' · ' + s.library.count + ' photos · read ' ) + fmt(s.library.fetchedAt) : '–'],
   ];
   $('#info').innerHTML = rows.map(([k, v]) => '<dt>' + k + '</dt><dd>' + v + '</dd>').join('');
-  const dup = s.lastError && s.sleep && s.sleep.error === s.lastError.message; // already shown under Display
+  const dup = s.lastError && ((s.sleep && s.sleep.error === s.lastError.message) || (hl && hl.text === s.lastError.message)); // already shown under Display, or at the top
   $('#error').textContent = s.lastError && !dup ? 'Last problem (' + fmt(s.lastError.at) + '): ' + s.lastError.message : '';
   $('#history').innerHTML = (s.history || []).slice(0, 8).map((h) => '<dt>' + fmt(h.at) + '</dt><dd>' + (h.ok ? (h.missed ? '<span class="err">' + esc(h.kind) + '</span>' : esc(h.kind)) + (h.dates && h.dates.length ? ' · ' + h.dates.map(day).join(' + ') : '') + (h.battery != null ? ' · battery ' + h.battery + '%' : '') + (h.waited ? ' · waited ' + h.waited + ' s for the display' : '') : '<span class="err">' + esc(h.error) + '</span>') + '</dd>').join('');
   renderView(s);
 }
 async function refresh() {
-  try { const r = await fetch('/api/status'); render(await r.json()); } catch (e) { $('#state').textContent = 'offline'; }
+  try { const r = await fetch(u('/api/status')); if (r.status === 404) throw 0; render(await r.json()); } catch (e) { $('#state').textContent = 'offline'; }
   setTimeout(refresh, last && last.busy ? 2500 : 15000);
 }
 document.querySelectorAll('.tabs button').forEach((b) => b.onclick = () => {
@@ -279,10 +301,10 @@ document.querySelectorAll('.tabs button').forEach((b) => b.onclick = () => {
 });
 document.querySelectorAll('.actions button').forEach((b) => b.onclick = async () => {
   b.disabled = true;
-  const r = await fetch('/api/' + b.dataset.act, { method:'POST' });
+  const r = await fetch(u('/api/' + b.dataset.act), { method:'POST' });
   if (!r.ok) { const j = await r.json().catch(() => ({})); alert(j.error || 'Failed'); }
   if (b.dataset.act === 'test-pattern') { view = 'test'; document.querySelectorAll('.tabs button').forEach((x) => x.classList.toggle('on', x.dataset.view === 'test')); }
-  setTimeout(async () => { const r2 = await fetch('/api/status'); render(await r2.json()); }, 600);
+  setTimeout(async () => { const r2 = await fetch(u('/api/status')); render(await r2.json()); }, 600);
 });
 refresh();
 </script>

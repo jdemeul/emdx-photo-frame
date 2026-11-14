@@ -1,5 +1,6 @@
 // Configuration, read from environment variables (see .env.example).
 import os from 'node:os';
+import path from 'node:path';
 
 // Native (landscape) resolutions of the Samsung EMDX panels.
 export const PANELS = {
@@ -32,38 +33,45 @@ export const DEVICE_PALETTE = {
 
 export const INK_NAMES = ['black', 'white', 'red', 'yellow', 'green', 'blue'];
 
-function str(name, def = undefined) {
-  const v = process.env[name];
-  if (v === undefined || v === null || String(v).trim() === '') return def;
-  return String(v).trim();
-}
-
-// A number; `min`/`max`/`int` bound it (timers and ports: a negative interval would make Node
-// fire it every millisecond, knocking on the display nonstop).
-function num(name, def, { min = -Infinity, max = Infinity, int = false } = {}) {
-  const v = str(name);
-  if (v === undefined) return def;
-  const n = Number(v);
-  if (!Number.isFinite(n)) throw new Error(`${name} must be a number (got "${v}")`);
-  if (n < min || n > max || (int && !Number.isInteger(n))) {
-    const range = max === Infinity ? `at least ${min}` : `from ${min} to ${max}`;
-    throw new Error(`${name} must be ${int ? 'a whole number' : 'a number'} ${range} (got "${v}")`);
+// Readers for one set of settings (the environment, or one frame's share of it). `asked`
+// collects the names read, so loadFrames() can tell a setting from a typo.
+function readers(env, asked) {
+  function str(name, def = undefined) {
+    asked?.add(name);
+    const v = env[name];
+    if (v === undefined || v === null || String(v).trim() === '') return def;
+    return String(v).trim();
   }
-  return n;
+
+  // A number; `min`/`max`/`int` bound it (timers and ports: a negative interval would make Node
+  // fire it every millisecond, knocking on the display nonstop).
+  function num(name, def, { min = -Infinity, max = Infinity, int = false } = {}) {
+    const v = str(name);
+    if (v === undefined) return def;
+    const n = Number(v);
+    if (!Number.isFinite(n)) throw new Error(`${name} must be a number (got "${v}")`);
+    if (n < min || n > max || (int && !Number.isInteger(n))) {
+      const range = max === Infinity ? `at least ${min}` : `from ${min} to ${max}`;
+      throw new Error(`${name} must be ${int ? 'a whole number' : 'a number'} ${range} (got "${v}")`);
+    }
+    return n;
+  }
+
+  function bool(name, def) {
+    const v = str(name);
+    if (v === undefined) return def;
+    return ['1', 'true', 'yes', 'on'].includes(v.toLowerCase());
+  }
+
+  function oneOf(name, def, allowed) {
+    const v = (str(name, def) || '').toLowerCase();
+    if (!allowed.includes(v)) throw new Error(`${name} must be one of ${allowed.join(', ')} (got "${v}")`);
+    return v;
+  }
+
+  return { str, num, bool, oneOf };
 }
 const PORT = { min: 1, max: 65535, int: true };
-
-function bool(name, def) {
-  const v = str(name);
-  if (v === undefined) return def;
-  return ['1', 'true', 'yes', 'on'].includes(v.toLowerCase());
-}
-
-function oneOf(name, def, allowed) {
-  const v = (str(name, def) || '').toLowerCase();
-  if (!allowed.includes(v)) throw new Error(`${name} must be one of ${allowed.join(', ')} (got "${v}")`);
-  return v;
-}
 
 function parsePalette(json) {
   if (!json) return { ...DEFAULT_MEASURED_PALETTE };
@@ -100,7 +108,10 @@ export function guessLocalIp(displayHost) {
   return priv || candidates[0] || '127.0.0.1';
 }
 
-export function loadConfig() {
+// The settings of one frame. `env`: where to read them (default: the environment); `asked`: a Set
+// that collects the names of the settings read.
+export function loadConfig(env = process.env, asked = null) {
+  const { str, num, bool, oneOf } = readers(env, asked);
   const panelName = (str('PANEL', 'EM32DX') || '').toUpperCase();
   const preset = PANELS[panelName];
   let nativeW = num('PANEL_WIDTH', preset?.width, { min: 1, int: true });
@@ -147,6 +158,15 @@ export function loadConfig() {
   const cleaningTime = cm ? { hour: Number(cm[1]), minute: Number(cm[2]) } : null;
 
   const updateMode = oneOf('UPDATE_MODE', 'push', ['push', 'playlist']);
+  // Playlist mode, when a fresh playlist goes out:
+  //   every-change - after every change, while the display is briefly online (the default). An
+  //                  EM32DX on battery made the first change after a playlist every time, and then
+  //                  got stuck in its panel cleaning before the second (8 to 14 Nov 2026); with a
+  //                  fresh playlist after every change it changed every morning (17 to 23 Oct).
+  //   when-short   - only once fewer than PLAYLIST_TOPUP_DAYS days are left on the display.
+  const resend = oneOf('PLAYLIST_RESEND', 'every-change', ['every-change', 'when-short']);
+  const notifyUrl = str('NOTIFY_URL');
+  if (notifyUrl && !/^https?:\/\//i.test(notifyUrl)) throw new Error(`NOTIFY_URL must be an http(s) address (got "${notifyUrl}")`);
   const playlistDays = num('PLAYLIST_DAYS', 7);
   if (!Number.isInteger(playlistDays) || playlistDays < 1 || playlistDays > 60) {
     throw new Error(`PLAYLIST_DAYS must be a whole number from 1 to 60 (got "${playlistDays}")`);
@@ -159,7 +179,11 @@ export function loadConfig() {
   }
 
   const cfg = {
+    // Which frame this is (several frames: see loadFrames()).
+    frame: { id: 'main', name: str('FRAME_NAME', 'Photo frame') },
     dataDir: str('DATA_DIR', '/data'),
+    // Where to POST a line of text when the frame needs a hand (ntfy.sh style), or nothing.
+    notifyUrl,
     albumUrls,
     photoDir: str('PHOTO_DIR'),
 
@@ -201,6 +225,7 @@ export function loadConfig() {
     update: {
       mode: updateMode,
       days: playlistDays,
+      resend,
       topUpDays: Math.min(topUpDays, playlistDays),
       // Below this, the photo for now isn't sent: the next one shows a little early instead.
       minFirstSec: 600,
@@ -238,8 +263,9 @@ export function loadConfig() {
       // "Deep sleep now": once asleep, look whether it is off the Wi-Fi after these pauses (s).
       offWifiChecksSec: [15, 15, 30, 60, 120, 240],
       // SLEEP_MODE=deep: asleep but still on the Wi-Fi at this many sleep checks in a row is a
-      // light sleep, and the NAS puts the display into deep sleep.
-      lightSleepChecks: 2,
+      // light sleep, and the NAS puts the display into deep sleep. (Three: after an update the
+      // EM32DX stays on the Wi-Fi for half an hour to an hour before it drops off by itself.)
+      lightSleepChecks: 3,
       // Playlist mode: how long the NAS looks for the display after each change.
       wakeWindowMin: num('WAKE_WINDOW_MIN', 15, { min: 0.01 }),
       // Playlist mode: after a change the display missed (it didn't come online), look for it
@@ -288,14 +314,55 @@ export function loadConfig() {
 export function describeConfig(cfg) {
   const d = cfg.display;
   return [
+    `frame: ${cfg.frame.name}, data in ${cfg.dataDir}`,
     `albums: ${cfg.albumUrls.length}${cfg.photoDir ? `, folder: ${cfg.photoDir}` : ''}`,
     `display: ${d.host || '(EMDX_HOST not set)'}:${d.port}${d.mac ? `, WoL ${d.mac}` : ''}`,
     `panel: ${cfg.panel.name} ${cfg.panel.width}x${cfg.panel.height} (${cfg.panel.orientation}, rotate ${cfg.panel.rotate})`,
     `server: http://${cfg.server.publicHost}:${cfg.server.port}`,
     `schedule: "${cfg.schedule}" (${cfg.timezone}), sleep: ${cfg.sleep.mode}`,
     cfg.update.mode === 'playlist'
-      ? `updates: playlist of ${cfg.update.days} day${cfg.update.days === 1 ? '' : 's'} (fresh one when fewer than ${cfg.update.topUpDays} are left), the display changes the photo at each SCHEDULE time`
+      ? `updates: playlist of ${cfg.update.days} day${cfg.update.days === 1 ? '' : 's'} (a fresh one ${cfg.update.resend === 'every-change' ? 'after every change' : `when fewer than ${cfg.update.topUpDays} are left`}), the display changes the photo at each SCHEDULE time`
       : 'updates: the NAS sends a photo at each SCHEDULE time',
     `image: dither=${cfg.image.dither} method=${cfg.image.method} kernel=${cfg.image.kernel} sat=${cfg.image.saturation} contrast=${cfg.image.contrast}`,
   ].join('\n  ');
+}
+
+// Settings that belong to the service, not to one frame: a frame can't have its own.
+const SHARED = ['HTTP_PORT', 'SERVER_HOST', 'UI_PASSWORD', 'TZ', 'FRAMES', 'DEBUG'];
+
+// The frames this service looks after: [{ id, name, cfg }].
+//
+// One frame (no FRAMES): the settings as they are, state in DATA_DIR.
+// Several: FRAMES=hall,kitchen names them, and any setting can be given per frame with the
+// frame's name in front (HALL_EMDX_HOST, HALL_EMDX_PIN, KITCHEN_ORIENTATION, HALL_NAME for the
+// page...); a setting without a prefix holds for every frame. Each frame keeps its own state,
+// in DATA_DIR/frames/<id>, and its own round of the album.
+export function loadFrames(env = process.env) {
+  const asked = new Set();
+  const base = loadConfig(env, asked);
+  const ids = String(env.FRAMES || '').split(/[\s,]+/).map((s) => s.trim().toLowerCase()).filter(Boolean);
+  if (!ids.length) return [{ id: base.frame.id, name: base.frame.name, cfg: base }];
+  const frames = [];
+  for (const id of ids) {
+    if (!/^[a-z][a-z0-9]*$/.test(id)) throw new Error(`FRAMES: "${id}" is not a usable name (letters and digits, starting with a letter)`);
+    if (frames.some((f) => f.id === id)) throw new Error(`FRAMES names "${id}" twice`);
+    const prefix = `${id.toUpperCase()}_`;
+    const clash = [...asked].find((name) => name.startsWith(prefix));
+    if (clash) throw new Error(`FRAMES: "${id}" can't be a frame's name, as ${prefix}… would be mistaken for the setting ${clash}`);
+    const own = Object.fromEntries(Object.entries(env).filter(([k]) => k.startsWith(prefix)).map(([k, v]) => [k.slice(prefix.length), v]));
+    for (const k of Object.keys(own)) {
+      if (SHARED.includes(k)) throw new Error(`${prefix}${k}: ${k} is shared by all frames; set it without the prefix`);
+      if (k !== 'NAME' && !asked.has(k)) throw new Error(`${prefix}${k}: there is no setting called ${k}`);
+    }
+    const cfg = loadConfig({ ...env, DATA_DIR: path.join(base.dataDir, 'frames', id), ...own });
+    cfg.frame = { id, name: String(own.NAME || '').trim() || id[0].toUpperCase() + id.slice(1) };
+    frames.push({ id, name: cfg.frame.name, cfg });
+  }
+  const hosts = frames.map((f) => f.cfg.display.host).filter(Boolean);
+  const twice = hosts.find((h, i) => hosts.indexOf(h) !== i);
+  if (twice) throw new Error(`Two frames have the same display address (${twice}): give each its own <NAME>_EMDX_HOST`);
+  // One web server for all: every frame downloads from the same address.
+  const server = { ...base.server, publicHost: readers(env).str('SERVER_HOST') || guessLocalIp(hosts[0]) };
+  for (const f of frames) f.cfg.server = server;
+  return frames;
 }

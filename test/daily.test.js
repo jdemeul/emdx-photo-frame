@@ -156,6 +156,11 @@ test('a long playlist gets a fresh one only once it runs short (PLAYLIST_TOPUP_D
   assert.equal(daily.due(at('2026-11-09T06:00:00Z')), null); // 7 to come
   assert.equal(daily.due(at('2026-11-10T06:00:00Z')), 'only 6 days of photos left on the display');
   assert.equal(daily.due(b.endsAt + H), 'the playlist on the display has run out');
+  // PLAYLIST_RESEND=every-change (the default): due after every change, not before the first.
+  app.cfg.update.resend = 'every-change';
+  assert.equal(daily.due(now + 60000), null);
+  assert.match(daily.due(at('2026-10-18T05:00:00Z')), /^the display changed the photo/);
+  assert.equal(daily.due(b.endsAt + H), 'the playlist on the display has run out');
   app.state.playlist.pending = 'a new photo for now';
   assert.equal(daily.due(now + 60000), 'a new photo for now');
 });
@@ -198,7 +203,7 @@ test('playlist mode: plan, send when found awake, the display moves on by itself
     SERVER_HOST: '127.0.0.1', HTTP_PORT: '18461', PANEL_WIDTH: '640', PANEL_HEIGHT: '360', ORIENTATION: 'portrait',
     FETCH_TIMEOUT_SEC: '20', CONNECT_ATTEMPTS: '2', EMDX_MAC: emdx.mac, WOL_BROADCAST: '127.0.0.1', WOL_PORT: String(emdx.wolPort),
     WAKE_WAIT_SEC: '0.1', SLEEP_MODE: 'deep', SLEEP_DELAY_SEC: '1', WAKE_WINDOW_MIN: '0.05', SLEEP_CHECK_MIN: '0',
-    UPDATE_MODE: 'playlist', PLAYLIST_DAYS: '3', SCHEDULE: '*/12 * * * * *', TZ,
+    UPDATE_MODE: 'playlist', PLAYLIST_DAYS: '3', PLAYLIST_RESEND: 'when-short', SCHEDULE: '*/12 * * * * *', TZ,
   });
   try {
     const { loadConfig, DEVICE_PALETTE } = await import('../src/config.js');
@@ -355,7 +360,7 @@ test('playlist mode: plan, send when found awake, the display moves on by itself
     app.state.playlist.pending = null;
     assert.equal(app.daily.due(), 'SCHEDULE changed');
   } finally {
-    for (const k of ['PHOTO_DIR', 'UPDATE_MODE', 'PLAYLIST_DAYS', 'SCHEDULE', 'PANEL_WIDTH', 'PANEL_HEIGHT', 'WAKE_WINDOW_MIN', 'SLEEP_CHECK_MIN']) delete process.env[k];
+    for (const k of ['PHOTO_DIR', 'UPDATE_MODE', 'PLAYLIST_RESEND', 'PLAYLIST_DAYS', 'SCHEDULE', 'PANEL_WIDTH', 'PANEL_HEIGHT', 'WAKE_WINDOW_MIN', 'SLEEP_CHECK_MIN']) delete process.env[k];
   }
 });
 
@@ -372,7 +377,7 @@ test('playlist mode: the display comes online after each change; the NAS reads t
     SERVER_HOST: '127.0.0.1', HTTP_PORT: '18462', PANEL_WIDTH: '640', PANEL_HEIGHT: '360', ORIENTATION: 'portrait',
     FETCH_TIMEOUT_SEC: '20', CONNECT_ATTEMPTS: '2', EMDX_MAC: emdx.mac, WOL_BROADCAST: '127.0.0.1', WOL_PORT: String(emdx.wolPort),
     WAKE_WAIT_SEC: '0.1', SLEEP_MODE: 'deep', SLEEP_DELAY_SEC: '1', WAKE_WINDOW_MIN: '0.1', SLEEP_CHECK_MIN: '0',
-    UPDATE_MODE: 'playlist', PLAYLIST_DAYS: '3', PLAYLIST_TOPUP_DAYS: '2', SCHEDULE: '*/10 * * * * *', TZ,
+    UPDATE_MODE: 'playlist', PLAYLIST_DAYS: '3', PLAYLIST_TOPUP_DAYS: '2', PLAYLIST_RESEND: 'when-short', SCHEDULE: '*/10 * * * * *', TZ,
   });
   try {
     const { loadConfig, DEVICE_PALETTE } = await import('../src/config.js');
@@ -491,9 +496,115 @@ test('playlist mode: the display comes online after each change; the NAS reads t
     assert.equal(img.status, 200);
     assert.ok(Buffer.from(await img.arrayBuffer()).equals(last.images[1]));
   } finally {
-    for (const k of ['PHOTO_DIR', 'UPDATE_MODE', 'PLAYLIST_DAYS', 'PLAYLIST_TOPUP_DAYS', 'SCHEDULE', 'PANEL_WIDTH', 'PANEL_HEIGHT', 'WAKE_WINDOW_MIN', 'SLEEP_CHECK_MIN']) delete process.env[k];
+    for (const k of ['PHOTO_DIR', 'UPDATE_MODE', 'PLAYLIST_RESEND', 'PLAYLIST_DAYS', 'PLAYLIST_TOPUP_DAYS', 'SCHEDULE', 'PANEL_WIDTH', 'PANEL_HEIGHT', 'WAKE_WINDOW_MIN', 'SLEEP_CHECK_MIN']) delete process.env[k];
   }
 });
+
+test('every change gets a fresh playlist while the display is briefly online, sent at once from the photos that are ready (PLAYLIST_RESEND=every-change)', { skip: !hasOpenssl && 'openssl not available', timeout: 120000 }, async () => {
+  const { startFakeEmdx } = await import('./helpers/fakeEmdx.js');
+  const emdx = await startFakeEmdx({ pin: '737373' });
+  emdx.state.wakeOnChangeMs = 4000;
+  emdx.state.sleepsAfterUpdateMs = 1000;
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'frame-every-'));
+  const photoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'frame-every-photos-'));
+  for (let i = 0; i < 12; i++) fs.writeFileSync(path.join(photoDir, `p${String(i).padStart(2, '0')}.jpg`), await sharp(photoSvg(i)).jpeg({ quality: 85 }).toBuffer());
+  const notes = [];
+  const hook = (await import('node:http')).createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => { body += c; }).on('end', () => { notes.push(`${req.headers.title} | ${body}`); res.end('ok'); });
+  });
+  await new Promise((r) => hook.listen(0, '127.0.0.1', r));
+  Object.assign(process.env, {
+    DATA_DIR: dataDir, ALBUM_URLS: '', PHOTO_DIR: photoDir, EMDX_HOST: '127.0.0.1', EMDX_PORT: String(emdx.port), EMDX_PIN: '737373',
+    SERVER_HOST: '127.0.0.1', HTTP_PORT: '18466', PANEL_WIDTH: '640', PANEL_HEIGHT: '360', ORIENTATION: 'portrait',
+    FETCH_TIMEOUT_SEC: '20', CONNECT_ATTEMPTS: '2', EMDX_MAC: emdx.mac, WOL_BROADCAST: '127.0.0.1', WOL_PORT: String(emdx.wolPort),
+    WAKE_WAIT_SEC: '0.1', SLEEP_MODE: 'deep', SLEEP_DELAY_SEC: '1', WAKE_WINDOW_MIN: '0.1', SLEEP_CHECK_MIN: '0', MISSED_CHECK_SEC: '0',
+    UPDATE_MODE: 'playlist', PLAYLIST_DAYS: '3', SCHEDULE: '*/10 * * * * *', TZ, NOTIFY_URL: `http://127.0.0.1:${hook.address().port}/frame`,
+  });
+  try {
+    const { loadConfig, DEVICE_PALETTE } = await import('../src/config.js');
+    const { Store } = await import('../src/state.js');
+    const { buildPaletteModel } = await import('../src/color.js');
+    const { FrameApp } = await import('../src/app.js');
+    const { createServer } = await import('../src/server.js');
+    const cfg = loadConfig();
+    assert.equal(cfg.update.resend, 'every-change');
+    Object.assign(cfg.update, { minFirstSec: 1, minTailSec: 0.2, watchEverySec: 0.3, quietSec: 0.5 });
+    Object.assign(cfg.sleep, { confirmSec: 2, confirmEverySec: 0.2, ownSleepSec: 0 });
+    Object.assign(cfg.display, { sleepWindowSec: 1, awakeWindowSec: 1 });
+    const app = new FrameApp(cfg, new Store(dataDir), buildPaletteModel(cfg.image.measuredPalette, DEVICE_PALETTE));
+    const server = createServer(cfg, app);
+    app.server = server;
+    await server.listen();
+    cleanups.push(async () => { app.stopMissedWatch(); app.cancelSleep(); await server.close(); await emdx.close(); await new Promise((r) => hook.close(r)); });
+    const clock = app.daily.clock;
+    const pl = () => app.state.playlist;
+    const nextChange = async () => {
+      await sleepMs(clock.next(Date.now()) - Date.now() + 100);
+      await app.scheduled('schedule');
+    };
+
+    await sleepMs(clock.next(Date.now()) - Date.now() + 600);
+    await app.daily.startup();
+    assert.equal(await app.checkAsleep(), true);
+    await until(() => !emdx.state.awake);
+    let last = pl().batch.sentAt;
+    assert.equal(app.health().level, 'ok');
+
+    // Two changes: after each the display comes online and gets a fresh playlist, although plenty
+    // of days are left on the one it has. The photos that were ready go out first; the album is
+    // read and the new last day rendered only afterwards.
+    for (let n = 1; n <= 2; n++) {
+      const order = [];
+      const realRender = app.renderPhoto.bind(app);
+      app.renderPhoto = (...a) => { order.push('render'); return realRender(...a); };
+      const realSend = app.daily.send.bind(app.daily);
+      app.daily.send = async (...a) => { const r = await realSend(...a); order.push('push'); return r; };
+      await nextChange();
+      app.daily.send = realSend;
+      app.renderPhoto = realRender;
+      const c = pl().changes[0];
+      assert.ok(c.online && c.sent, `change ${n}: online, and sent a playlist`);
+      assert.ok(pl().batch.sentAt > last, `change ${n}: a fresh playlist`);
+      assert.deepEqual(order, ['push', 'render'], `change ${n}: sent before anything was rendered`);
+      assert.equal(pl().batch.reason, 'after a change');
+      assert.equal(pl().slots.length, 4); // the photo for now and three days to come, again
+      last = pl().batch.sentAt;
+      await until(() => !emdx.state.awake);
+    }
+    assert.equal(emdx.events.filter((e) => e === 'cmd:11:0').length, 0, 'no power-off command: it goes to sleep by itself');
+
+    // A change the display sleeps through: the page says what to do, and NOTIFY_URL gets a line;
+    // when the display is back (a press on its button), it gets its playlist and the all-clear.
+    emdx.state.wakeOnChangeMs = 0;
+    await nextChange();
+    assert.equal(pl().changes[0].online, null);
+    assert.equal(app.health().level, 'bad');
+    assert.match(app.health().text, /did not change.*Press its power button/);
+    const status = await (await fetch('http://127.0.0.1:18466/api/status')).json();
+    assert.deepEqual([status.health.level, status.frame.name, status.frames.length, status.playlist.resend], ['bad', 'Photo frame', 1, 'every-change']);
+    assert.deepEqual(status.playlist.changeStats, { watched: 3, online: 2 });
+    await until(() => notes.length === 1);
+    assert.match(notes[0], /^Photo frame: missed a change \| The photo did not change at .*Press its power button/);
+    emdx.wake();
+    assert.equal(await app.checkMissed(), true);
+    assert.equal(app.health().level, 'ok');
+    await until(() => notes.length === 2);
+    assert.match(notes[1], /^Photo frame: back to normal \| The display is back/);
+    // A low battery is reported once, and cleared on the charger.
+    app.noteBattery({ batteryPercent: 12, pluggedIn: false });
+    app.noteBattery({ batteryPercent: 11, pluggedIn: false });
+    assert.equal(app.health().level, 'bad');
+    app.noteBattery({ batteryPercent: 13, pluggedIn: true });
+    await until(() => notes.length === 4);
+    const late = notes.slice(2).sort(); // (sent a moment apart: they may arrive in either order)
+    assert.match(late[0], /back to normal \| The battery is at 13%, charging/);
+    assert.match(late[1], /battery low \| The battery is at 12%/);
+  } finally {
+    for (const k of ['PHOTO_DIR', 'UPDATE_MODE', 'PLAYLIST_DAYS', 'SCHEDULE', 'PANEL_WIDTH', 'PANEL_HEIGHT', 'WAKE_WINDOW_MIN', 'SLEEP_CHECK_MIN', 'MISSED_CHECK_SEC', 'NOTIFY_URL']) delete process.env[k];
+  }
+});
+
 
 test('deep sleep mode: a display that stays on the Wi-Fi while asleep is put into deep sleep by the NAS; if it can\'t be, the page says so; on the charger it is left alone', { skip: !hasOpenssl && 'openssl not available', timeout: 180000 }, async () => {
   const { startFakeEmdx } = await import('./helpers/fakeEmdx.js');
@@ -516,6 +627,7 @@ test('deep sleep mode: a display that stays on the Wi-Fi while asleep is put int
     const { FrameApp } = await import('../src/app.js');
     const { createServer } = await import('../src/server.js');
     const cfg = loadConfig();
+    cfg.sleep.lightSleepChecks = 2;
     Object.assign(cfg.update, { minFirstSec: 1, minTailSec: 0.2, quietSec: 0.5 });
     Object.assign(cfg.sleep, { confirmSec: 2, confirmEverySec: 0.2, ownSleepSec: 0, offWifiChecksSec: [0.3, 0.3, 0.3, 0.3] });
     Object.assign(cfg.display, { sleepWindowSec: 1, awakeWindowSec: 1, probeTimeoutSec: 0.3 });
@@ -580,7 +692,7 @@ test('deep sleep mode: a display that stays on the Wi-Fi while asleep is put int
     assert.ok(ls().charging);
     assert.deepEqual([ls().tries.map((t) => t.result), powerOffs()], [['charging'], offs]);
   } finally {
-    for (const k of ['PHOTO_DIR', 'UPDATE_MODE', 'PLAYLIST_DAYS', 'SCHEDULE', 'PANEL_WIDTH', 'PANEL_HEIGHT', 'SLEEP_CHECK_MIN']) delete process.env[k];
+    for (const k of ['PHOTO_DIR', 'UPDATE_MODE', 'PLAYLIST_RESEND', 'PLAYLIST_DAYS', 'SCHEDULE', 'PANEL_WIDTH', 'PANEL_HEIGHT', 'SLEEP_CHECK_MIN']) delete process.env[k];
   }
 });
 
@@ -704,7 +816,7 @@ test('a missed change: the NAS looks for the display every few seconds and sends
     assert.deepEqual([st2.cleaning.source, st2.cleaning.error], ['setting', 'NAK']);
     app.stopMissedWatch();
   } finally {
-    for (const k of ['PHOTO_DIR', 'UPDATE_MODE', 'PLAYLIST_DAYS', 'SCHEDULE', 'PANEL_WIDTH', 'PANEL_HEIGHT', 'SLEEP_CHECK_MIN', 'WAKE_WINDOW_MIN', 'MISSED_CHECK_SEC']) delete process.env[k];
+    for (const k of ['PHOTO_DIR', 'UPDATE_MODE', 'PLAYLIST_RESEND', 'PLAYLIST_DAYS', 'SCHEDULE', 'PANEL_WIDTH', 'PANEL_HEIGHT', 'SLEEP_CHECK_MIN', 'WAKE_WINDOW_MIN', 'MISSED_CHECK_SEC']) delete process.env[k];
   }
 });
 

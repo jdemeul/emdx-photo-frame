@@ -59,14 +59,15 @@ test('a torn state file costs one save, not the whole state', () => {
   assert.equal(new Store(dir).state.cycle, 0); // nothing usable: a fresh state, as before
 });
 
-test('a display found awake between two light-sleep strikes starts the count over', () => {
+test('a display found awake between light-sleep strikes starts the count over', () => {
   const cfg = withEnv({ SLEEP_MODE: 'deep' }, loadConfig);
   const app = bareApp(cfg, { history: [] });
   assert.equal(app.lightSleepSeen('on'), false); // strike 1
   app.noteWake();                                 // awake (a change, a button press)
   assert.equal(app.state.lightSleep, null);
   assert.equal(app.lightSleepSeen('on'), false); // strike 1 again, not 2
-  assert.equal(app.lightSleepSeen('on'), true);  // two in a row
+  assert.equal(app.lightSleepSeen('on'), false); // (after an update it stays on the Wi-Fi for a while)
+  assert.equal(app.lightSleepSeen('on'), true);  // three in a row
   // One the NAS already tried to fix stays, with its tries, for the page.
   app.state.lightSleep.tries.push({ at: Date.now(), how: 'deep sleep command', result: 'not reached' });
   app.noteWake();
@@ -192,4 +193,74 @@ test('a network outage while downloading benches no photos; a photo that is gone
   photoProblem = true;
   await assert.rejects(app.renderPhoto('/nonexistent', { say() {} }), /No usable photos|Could not download any photo/);
   assert.equal(Object.keys(app.state.excluded).length, 3);
+});
+
+// ---------- several frames ----------
+test('several frames: each has its own settings, state folder and page; a single frame keeps working as before', async () => {
+  const { loadFrames } = await import('../src/config.js');
+  const { adoptLegacyData } = await import('../src/state.js');
+  const dir = tmp('frames');
+  const env = {
+    DATA_DIR: dir, SERVER_HOST: '127.0.0.1', HTTP_PORT: '18471', UPDATE_MODE: 'playlist', SLEEP_MODE: 'deep', EMDX_PIN: '111111',
+    FRAMES: 'hall, kitchen', HALL_EMDX_HOST: '10.9.9.1', KITCHEN_EMDX_HOST: '10.9.9.2', KITCHEN_EMDX_PIN: '222222',
+    KITCHEN_NAME: 'Kitchen frame', KITCHEN_ORIENTATION: 'portrait', KITCHEN_SCHEDULE: '30 7 * * *',
+  };
+  const frames = loadFrames(env);
+  assert.deepEqual(frames.map((f) => [f.id, f.name, f.cfg.display.host, f.cfg.display.pin, f.cfg.panel.orientation, f.cfg.schedule]), [
+    ['hall', 'Hall', '10.9.9.1', '111111', 'landscape', '0 6 * * *'],
+    ['kitchen', 'Kitchen frame', '10.9.9.2', '222222', 'portrait', '30 7 * * *'],
+  ]);
+  assert.deepEqual(frames.map((f) => f.cfg.dataDir), [path.join(dir, 'frames', 'hall'), path.join(dir, 'frames', 'kitchen')]);
+  assert.equal(frames[0].cfg.server, frames[1].cfg.server); // one web server for all
+  // Typos and clashes are caught when the config loads.
+  assert.throws(() => loadFrames({ ...env, HALL_EMDX_HOTS: 'x' }), /HALL_EMDX_HOTS: there is no setting called EMDX_HOTS/);
+  assert.throws(() => loadFrames({ ...env, HALL_HTTP_PORT: '1' }), /shared by all frames/);
+  assert.throws(() => loadFrames({ ...env, FRAMES: 'emdx' }), /can't be a frame's name/);
+  assert.throws(() => loadFrames({ ...env, KITCHEN_EMDX_HOST: '10.9.9.1' }), /same display address/);
+  // Without FRAMES: one frame, with its state where it always was.
+  const one = loadFrames({ DATA_DIR: dir, EMDX_HOST: '10.9.9.1' });
+  assert.deepEqual(one.map((f) => [f.id, f.name, f.cfg.dataDir]), [['main', 'Photo frame', dir]]);
+
+  // Going from one frame to several: the single frame's state becomes the first frame's, once.
+  fs.writeFileSync(path.join(dir, 'state.json'), JSON.stringify({ cycle: 7, history: [] }));
+  fs.mkdirSync(path.join(dir, 'current'));
+  fs.writeFileSync(path.join(dir, 'current', 'device.png'), 'x');
+  assert.equal(adoptLegacyData(dir, frames[0].cfg.dataDir), true);
+  assert.equal(adoptLegacyData(dir, frames[0].cfg.dataDir), false);
+  assert.equal(fs.existsSync(path.join(dir, 'state.json')), false);
+
+  const apps = frames.map((f) => new FrameApp(f.cfg, new Store(f.cfg.dataDir), null));
+  assert.deepEqual(apps.map((a) => a.state.cycle), [7, 0]);
+  assert.ok(fs.existsSync(apps[0].store.path('current', 'device.png')));
+  const server = createServer(frames[0].cfg, apps);
+  for (const a of apps) a.server = server;
+  await server.listen();
+  cleanups.push(() => server.close());
+  const get = async (p) => { const r = await fetch(`http://127.0.0.1:18471${p}`); return [r.status, await r.json()]; };
+  const [, first] = await get('/api/status');
+  const [, kitchen] = await get('/api/status?frame=kitchen');
+  assert.deepEqual([first.frame, kitchen.frame], [{ id: 'hall', name: 'Hall' }, { id: 'kitchen', name: 'Kitchen frame' }]);
+  assert.deepEqual(kitchen.frames.map((f) => [f.id, f.name, f.health.level]), [['hall', 'Hall', 'warn'], ['kitchen', 'Kitchen frame', 'warn']]); // (no playlist yet)
+  assert.equal((await get('/api/status?frame=attic'))[0], 404);
+  assert.equal((await get('/api/frames'))[1].length, 2);
+  // A button press goes to the frame it was pressed for.
+  apps[1].busy = { what: 'Sending the playlist' };
+  const press = (q) => fetch(`http://127.0.0.1:18471/api/refresh-album${q}`, { method: 'POST' }).then((r) => r.status);
+  assert.equal(await press('?frame=kitchen'), 409);
+  apps[1].busy = null;
+});
+
+test('log lines say which frame they are about, also from timers started for it', async () => {
+  const { log } = await import('../src/log.js');
+  const lines = [];
+  const real = console.log;
+  console.log = (l) => lines.push(l);
+  try {
+    log.info('one frame');
+    await log.scope('Hall', async () => {
+      log.info('now');
+      await new Promise((r) => setTimeout(() => { log.info('later'); r(); }, 5));
+    });
+  } finally { console.log = real; }
+  assert.deepEqual(lines.map((l) => l.replace(/^\S+ \S+ INFO {2}/, '')), ['one frame', '[Hall] now', '[Hall] later']);
 });

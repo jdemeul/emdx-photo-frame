@@ -9,12 +9,15 @@
 //   node src/index.js sleep            put the display to sleep now (network standby as SLEEP_MODE says, power off)
 //   node src/index.js sleep-test [min] put the display to sleep, wait [min] more minutes, check Wake-on-LAN wakes it
 //   node src/index.js render <img...>  render local image files to <DATA_DIR>/render-test (no display needed)
+//
+// With several frames (FRAMES=hall,kitchen), `--frame <name>` says which one a command is for
+// (default: the first); `serve` looks after all of them.
 import fs from 'node:fs';
 import path from 'node:path';
 import { Cron } from 'croner';
-import { loadConfig, describeConfig, DEVICE_PALETTE } from './config.js';
+import { loadFrames, describeConfig, DEVICE_PALETTE } from './config.js';
 import { log } from './log.js';
-import { Store } from './state.js';
+import { Store, adoptLegacyData } from './state.js';
 import { buildPaletteModel } from './color.js';
 import { FrameApp } from './app.js';
 import { createServer } from './server.js';
@@ -31,8 +34,15 @@ function asleepHint(err) {
 }
 
 async function main() {
-  const [cmd = 'serve', ...args] = process.argv.slice(2);
-  const cfg = loadConfig();
+  const argv = process.argv.slice(2);
+  const flag = argv.indexOf('--frame');
+  const which = flag >= 0 ? String(argv.splice(flag, 2)[1] || '').toLowerCase() : null;
+  const [cmd = 'serve', ...args] = argv;
+  const frames = loadFrames();
+  const several = frames.length > 1;
+  const frame = which ? frames.find((f) => f.id === which) : frames[0];
+  if (!frame) throw new Error(`--frame: no frame called "${which}" (FRAMES has ${frames.map((f) => f.id).join(', ')})`);
+  const cfg = frame.cfg;
   const model = buildPaletteModel(cfg.image.measuredPalette, DEVICE_PALETTE);
 
   if (cmd === 'check-album') {
@@ -119,10 +129,12 @@ async function main() {
     return;
   }
 
-  const store = new Store(cfg.dataDir);
-  const app = new FrameApp(cfg, store, model);
-  const server = createServer(cfg, app);
-  app.server = server;
+  // The service: one app per frame (its own state, lock and schedule), one web server for all.
+  const scoped = (f, fn) => log.scope(several ? f.name : null, fn);
+  if (several) adoptLegacyData(path.dirname(path.dirname(frames[0].cfg.dataDir)), frames[0].cfg.dataDir);
+  for (const f of frames) f.app = scoped(f, () => new FrameApp(f.cfg, new Store(f.cfg.dataDir), model));
+  const server = createServer(cfg, frames.map((f) => f.app));
+  for (const f of frames) f.app.server = server;
   try {
     await server.listen();
   } catch (err) {
@@ -134,11 +146,16 @@ async function main() {
           : ', probably by the running photo frame service. Use its web page for this, or stop the service first.'),
     );
   }
-  log.info(`Config:\n  ${describeConfig(cfg)}`);
-  if (!cfg.display.host) log.warn('EMDX_HOST is not set: dry run, photos will be rendered but not sent.');
-  if (!cfg.albumUrls.length && !cfg.photoDir) log.warn('Neither ALBUM_URLS nor PHOTO_DIR is set: there is nothing to show yet.');
+  for (const f of frames) {
+    scoped(f, () => {
+      log.info(`Config:\n  ${describeConfig(f.cfg)}`);
+      if (!f.cfg.display.host) log.warn('EMDX_HOST is not set: dry run, photos will be rendered but not sent.');
+      if (!f.cfg.albumUrls.length && !f.cfg.photoDir) log.warn('Neither ALBUM_URLS nor PHOTO_DIR is set: there is nothing to show yet.');
+    });
+  }
 
   if (cmd === 'once' || cmd === 'test-pattern') {
+    const { app } = frame;
     try {
       if (cmd === 'once') await (app.daily ? app.resend() : app.next('manual'));
       else await app.testPattern();
@@ -150,17 +167,25 @@ async function main() {
   }
 
   if (cmd !== 'serve') throw new Error(`Unknown command "${cmd}"`);
-  const job = new Cron(cfg.schedule, { timezone: cfg.timezone, protect: true }, () => app.scheduled());
-  app.cron = job;
-  app.startSleepWatch();
-  log.info(`Next ${app.daily ? 'change' : 'update'}: ${job.nextRun()?.toISOString()} (UI: http://${cfg.server.publicHost}:${cfg.server.port}/)`);
-  if (app.daily) app.daily.startup({ send: cfg.runOnStart }).catch((err) => log.error('Playlist:', err));
-  else if (cfg.runOnStart) app.scheduled('start');
+  for (const f of frames) {
+    scoped(f, () => {
+      const { app } = f;
+      f.job = new Cron(f.cfg.schedule, { timezone: f.cfg.timezone, protect: true }, () => app.scheduled());
+      app.cron = f.job;
+      app.startSleepWatch();
+      log.info(`Next ${app.daily ? 'change' : 'update'}: ${f.job.nextRun()?.toISOString()} (UI: http://${cfg.server.publicHost}:${cfg.server.port}/${several ? `?frame=${f.id}` : ''})`);
+      if (app.daily) app.daily.startup({ send: f.cfg.runOnStart }).catch((err) => log.error('Playlist:', err));
+      else if (f.cfg.runOnStart) app.scheduled('start');
+    });
+  }
 
   const stop = async (sig) => {
     log.info(`${sig} received, shutting down`);
-    job.stop();
-    app.stopSleepWatch();
+    for (const f of frames) {
+      f.job.stop();
+      f.app.stopSleepWatch();
+      f.app.stopMissedWatch();
+    }
     await server.close();
     process.exit(0);
   };

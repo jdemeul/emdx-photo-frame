@@ -2,10 +2,12 @@
 // the display's own playlist, and the display changes the photo by itself at every SCHEDULE
 // time, while it sleeps. The NAS renders the photos ahead (one per change: a "slot"). The EM32DX
 // comes online briefly after each change: the NAS looks for it then, reads its battery and
-// sends it back to sleep, or sends a fresh playlist when fewer than PLAYLIST_TOPUP_DAYS days
-// are left (or something changed). A display found awake otherwise (button, charger, Check
-// display) is handled the same way. Each fresh playlist starts with the photo for now, so the
-// frame keeps its photo until the next change. Timing: playlist.js.
+// sends it a fresh playlist (PLAYLIST_RESEND=every-change, the default: an EM32DX on battery
+// got stuck before the second change after a playlist, see docs/findings.md), or with
+// PLAYLIST_RESEND=when-short only once fewer than PLAYLIST_TOPUP_DAYS days are left. A display
+// found awake otherwise (button, charger, Check display) is handled the same way. Each fresh
+// playlist starts with the photo for now, so the frame keeps its photo until the next change.
+// Timing: playlist.js.
 //
 // State (state.playlist):
 //   slots    the plan: [{ key, at, dir, kind, ids, items, renderedAt, inkShare }], one per
@@ -161,10 +163,14 @@ export class DailyPlaylist {
     if (this.missedOpen()) return `the display missed the change of ${this.label(p.missed.at)} (a fresh playlist puts it back in step)`;
     if (p.batch.schedule !== this.cfg.schedule) return 'SCHEDULE changed';
     if (p.batch.days !== this.cfg.update.days) return 'PLAYLIST_DAYS changed';
-    // At most one a change, and only once the display is running short.
+    // At most one a change: after every change, or only once the display is running short.
     const curAt = this.clock.prev(now);
     const left = this.daysLeft(now);
-    if (curAt != null && curAt > p.batch.items[0].at && left < this.cfg.update.topUpDays) {
+    const changed = curAt != null && curAt > p.batch.items[0].at;
+    if (changed && this.cfg.update.resend === 'every-change' && left) {
+      return 'the display changed the photo (a fresh playlist after every change keeps it changing on time)';
+    }
+    if (changed && left < this.cfg.update.topUpDays) {
       return left ? `only ${left} day${left === 1 ? '' : 's'} of photos left on the display` : 'the playlist on the display has run out';
     }
     return null;
@@ -175,12 +181,23 @@ export class DailyPlaylist {
     return (this.st.batch?.items || []).filter((it) => it.at > now).length;
   }
 
+  // Are the photo for now and the one for the next change planned and rendered? (Enough to send
+  // a playlist that keeps the display going until the NAS has prepared the rest.)
+  planned(now = Date.now()) {
+    const ready = (s) => fs.existsSync(this.file(s, 'device.png'));
+    const cur = this.st.slots.find((s) => s.at <= now && this.clock.next(s.at) > now && ready(s));
+    return !!cur && this.st.slots.some((s) => s.at === this.clock.next(cur.at) && ready(s));
+  }
+
   // Send the playlist: the photo for now until the next change, then one photo per change for
-  // PLAYLIST_DAYS days. Runs inside the caller's lock (app.run).
-  async send(reason = 'manual') {
+  // PLAYLIST_DAYS days. Runs inside the caller's lock (app.run). `quick`: the display is online
+  // for a short while only (after a change, after a press on its button), so send the photos
+  // that are ready instead of reading the album and rendering first. (On 10 Nov 2026 the display
+  // was back for a minute and a half; the NAS spent it waiting for Google, and missed it.)
+  async send(reason = 'manual', { quick = false } = {}) {
     const app = this.app;
     const cfg = this.cfg;
-    await this.ensurePlan();
+    if (!(quick && this.planned())) await this.ensurePlan();
     if (!cfg.display.host) {
       log.info('EMDX_HOST not set: dry run, no playlist sent.');
       this.advance(Date.now(), { planOnly: true });
@@ -253,6 +270,8 @@ export class DailyPlaylist {
     const every = this.cfg.sleep.missedCheckSec;
     log.warn(`Playlist: the display missed the change${prev ? ` (${this.st.missed.count} in a row)` : ''}. A fresh playlist goes out as soon as it is back`
       + (every ? ` (the NAS looks for it every ${every} s; a press on its power button brings it back).` : ' (press its power button).'));
+    this.app.alert?.('missed', 'missed a change', `The photo did not change at ${dayLabel(rec.at, this.cfg.timezone, true)} (the display did not come online after the change${this.st.missed.count > 1 ? `; ${this.st.missed.count} in a row` : ''}). `
+      + 'Press its power button: it then gets a fresh playlist by itself.');
     this.app.startMissedWatch();
   }
 
@@ -284,6 +303,7 @@ export class DailyPlaylist {
     Object.assign(m, { resolvedAt: Date.now(), how });
     delete m.retryAt;
     this.app.stopMissedWatch?.();
+    this.app.clearAlert?.('missed', 'The display is back and has a fresh playlist.');
     log.info(`Playlist: the display is back in step (${how}).`);
   }
 
@@ -428,7 +448,7 @@ export class DailyPlaylist {
       this.verdict(rec);
       let sent = false;
       try { sent = await this.onAwake('after a change'); } catch (err) { log.warn(`Playlist: ${err.message}`); }
-      if (sent) event.sent = 'playlist';
+      if (sent) { event.sent = 'playlist'; rec.sent = true; }
       else log.info('Playlist: nothing to send; the display goes back to sleep by itself.');
     } finally {
       app.finishWake(event);
@@ -476,7 +496,7 @@ export class DailyPlaylist {
     const why = this.due();
     if (!why) return false;
     log.info(`Playlist: the display is awake (${how}); sending a fresh playlist (${why}).`);
-    await this.app.run('Sending the playlist', () => this.send(how));
+    await this.app.run('Sending the playlist', () => this.send(how, { quick: true }));
     return true;
   }
 
@@ -507,6 +527,7 @@ export class DailyPlaylist {
       await app.exclusive('Preparing the coming photos', async () => {
         this.advance();
         await this.ensurePlan();
+        if (!this.cfg.display.host) this.advance(Date.now(), { planOnly: true }); // (dry run: show the photo for now on the page)
       });
     } catch (err) {
       log.warn(`Playlist: could not prepare the coming photos: ${err.message}`);
@@ -550,6 +571,12 @@ export class DailyPlaylist {
         return { ...c, battery: c.battery ?? wake?.battery ?? null };
       }),
       missed: this.st.missed,
+      // Of the last changes the NAS watched (30 at most): how many the display came online after.
+      changeStats: (() => {
+        const done = this.st.changes.filter((c) => c.online || c.until <= now);
+        return { watched: done.length, online: done.filter((c) => c.online).length };
+      })(),
+      resend: this.cfg.update.resend,
       daysLeft: b ? this.daysLeft(now) : null,
       topUpDays: this.cfg.update.topUpDays,
     };

@@ -1,4 +1,5 @@
-// HTTP server: (1) what the display downloads, (2) a small status page with buttons.
+// HTTP server: (1) what the displays download, (2) a small status page with buttons. One server
+// for all frames: the page and its API take ?frame=<id> (default: the first frame).
 import http from 'node:http';
 import net from 'node:net';
 import crypto from 'node:crypto';
@@ -10,7 +11,14 @@ const MAX_PUSHES = 6;
 const EPD_CONTENT_DIR = '/home/owner/content/Downloads/vxtplayer/epaper/mobile/contents';
 const MAX_POST_BYTES = 1024 * 1024; // what the display may POST to us (download progress)
 
-export function createServer(cfg, app) {
+// `cfg`: the settings (its `server` part is shared by all frames). `frames`: one app, or a list
+// of them.
+export function createServer(cfg, frames) {
+  const list = [frames].flat();
+  const idOf = (a) => a.cfg?.frame?.id ?? 'main';
+  const apps = new Map(list.map((a) => [idOf(a), a]));
+  const hostOf = (a) => (a.cfg ?? cfg).display?.host || '';
+  const several = apps.size > 1;
   const pushes = new Map();
   // The last requests from the display (and to the endpoints it uses), in /api/status.
   const traffic = [];
@@ -125,12 +133,14 @@ export function createServer(cfg, app) {
   // What only the display may POST (download progress): with EMDX_HOST an IP address, from that
   // address only, so that nothing else on the network can pass for the display. (A host name
   // isn't resolved here: then anyone may.)
-  const displayIp = net.isIP(cfg.display.host || '') ? cfg.display.host : null;
+  const displayHosts = new Set(list.map(hostOf).filter(Boolean));
+  const displayIps = [...displayHosts].every((h) => net.isIP(h)) ? displayHosts : new Set();
+  const peer = (req) => (req.socket.remoteAddress || '').replace(/^::ffff:/, '');
   function refuseStranger(req, res, note) {
-    const from = (req.socket.remoteAddress || '').replace(/^::ffff:/, '');
-    if (!displayIp || from === displayIp) return false;
+    const from = peer(req);
+    if (!displayIps.size || displayIps.has(from)) return false;
     note.result = 'refused: not from the display';
-    log.warn(`Refused a ${req.method} to ${req.url.slice(0, 80)} from ${from}: only the display (${displayIp}) may send that.`);
+    log.warn(`Refused a ${req.method} to ${req.url.slice(0, 80)} from ${from}: only the display (${[...displayIps].join(', ')}) may send that.`);
     req.resume(); // (drain the body)
     res.writeHead(403, { 'Content-Type': 'text/plain' }).end('Only the display may send this');
     return true;
@@ -142,7 +152,12 @@ export function createServer(cfg, app) {
     try {
       const text = (await readBody(req)).toString('utf8').slice(0, 2000);
       note.result = text.slice(0, 160);
-      log.info(`Display reported progress (${req.url}): ${text.replace(/\s+/g, ' ')}`);
+      // One report per image: only the ones that say something went wrong are worth a log line.
+      let report = null;
+      try { report = JSON.parse(text); } catch { /* not JSON: log it as it is */ }
+      const problem = !report || report.error_message || report.current_image_status?.error_message
+        || ![report.status, report.current_image_status?.status].every((x) => x == null || /^(Downloading|Successful)$/i.test(x));
+      log[problem ? 'warn' : 'debug'](`Display reported ${problem ? 'a problem with the download' : 'progress'} (${req.url}): ${text.replace(/\s+/g, ' ')}`);
       res.writeHead(200, { 'Content-Type': 'application/json' }).end(text.startsWith('{') ? text : '{}');
     } catch (err) {
       res.writeHead(err.status || 400).end();
@@ -176,14 +191,15 @@ export function createServer(cfg, app) {
 
   // Note what the display asks for, and anything sent to the endpoints it uses.
   function noteRequest(req, res, p) {
-    const fromDisplay = (req.socket.remoteAddress || '').replace(/^::ffff:/, '') === cfg.display.host;
+    const ip = peer(req);
+    const fromDisplay = displayHosts.has(ip);
     const displayPath = p.startsWith('/emdx/') || p.endsWith('/content-transfer-progress');
-    const note = { at: Date.now(), method: req.method, path: req.url.slice(0, 160), from: fromDisplay ? 'display' : (req.socket.remoteAddress || '').replace(/^::ffff:/, '') };
+    const note = { at: Date.now(), method: req.method, path: req.url.slice(0, 160), from: fromDisplay ? 'display' : ip, ip };
     if (fromDisplay || (displayPath && req.method === 'POST')) {
       if (req.headers['content-type']) note.type = req.headers['content-type'].slice(0, 100);
       if (req.headers['user-agent']) note.agent = req.headers['user-agent'].slice(0, 80);
       traffic.unshift(note);
-      traffic.length = Math.min(traffic.length, 40);
+      traffic.length = Math.min(traffic.length, 40 * apps.size);
       res.on('finish', () => { note.status = res.statusCode; });
     }
     return { note, fromDisplay };
@@ -214,7 +230,7 @@ export function createServer(cfg, app) {
         if (req.method === 'HEAD') { res.end(); return; }
         res.on('finish', () => {
           const n = entry.files.length;
-          log.info(`Display downloaded the image${n > 1 ? ` (${file.i + 1} of ${n})` : ''} (${(file.size / 1e6).toFixed(1)} MB)`);
+          log[n > 1 ? 'debug' : 'info'](`Display downloaded the image${n > 1 ? ` (${file.i + 1} of ${n})` : ''} (${(file.size / 1e6).toFixed(1)} MB)`);
           file.fetched = true;
           for (const w of [...entry.waiters]) w(true);
         });
@@ -242,7 +258,13 @@ export function createServer(cfg, app) {
       res.end(UI_HTML);
       return;
     }
-    if (p === '/api/status' && req.method === 'GET') return json(res, 200, app.status());
+    // Which frame: ?frame=<id>, or the first one.
+    const wanted = url.searchParams.get('frame');
+    const app = wanted ? apps.get(wanted) : list[0];
+    if (!app) return json(res, 404, { error: `No frame called "${wanted}"` });
+    const frameList = () => list.map((a) => ({ id: idOf(a), name: a.cfg?.frame?.name ?? 'Photo frame', health: a.health?.() ?? null }));
+    if (p === '/api/frames' && req.method === 'GET') return json(res, 200, frameList());
+    if (p === '/api/status' && req.method === 'GET') return json(res, 200, { ...app.status(), frames: frameList() });
     const img = /^\/img\/(current|testpattern)\/(preview\.jpg|preview\.png|device\.png|source-[12]\.jpg)$/.exec(p);
     if (img && req.method === 'GET') {
       const type = img[2].endsWith('.png') ? 'image/png' : 'image/jpeg';
@@ -269,12 +291,13 @@ export function createServer(cfg, app) {
       if (!sameHost) return json(res, 403, { error: 'Cross-origin request refused' });
       // (A quick look at the display doesn't count: the action waits for it, see exclusive().)
       if (app.busy && !app.busy.probe) return json(res, 409, { error: `Busy: ${app.busy.what}` });
+      const scope = several ? app.cfg?.frame?.name : null; // (whose log lines these are)
       if (p === '/api/display-info') {
         // Wakes the display and reads it; answers when done.
-        app.displayInfo().then((info) => json(res, 200, info), (err) => json(res, 502, { error: err.message }));
+        log.scope(scope, () => app.displayInfo()).then((info) => json(res, 200, info), (err) => json(res, 502, { error: err.message }));
         return;
       }
-      actions[p]().catch((err) => log.error(`${p} failed:`, err));
+      log.scope(scope, () => actions[p]()).catch((err) => log.error(`${p} failed:`, err));
       return json(res, 202, { ok: true });
     }
     res.writeHead(404).end('not found');
@@ -285,7 +308,8 @@ export function createServer(cfg, app) {
     registerContent,
     registerPush,
     restoreContent,
-    recentTraffic: () => traffic.map((t) => ({ ...t })),
+    // The last requests (with `host`: those from that display's address).
+    recentTraffic: (host) => traffic.filter((t) => !host || !several || t.ip === host).map(({ ip, ...t }) => t),
     listen() {
       return new Promise((resolve, reject) => {
         server.once('error', reject);
